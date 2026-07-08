@@ -17,8 +17,13 @@ import {
   MarketsFetchingCooldownMechanism,
   PositionLiquidationCooldownMechanism,
 } from "./utils/cooldownMechanisms";
+import type { WebhookServer } from "./webhook";
 
-export const launchBot = (config: ChainConfig, dataProvider: DataProvider) => {
+export const launchBot = (
+  config: ChainConfig,
+  dataProvider: DataProvider,
+  webhookServer?: WebhookServer,
+) => {
   const logTag = `[${config.chain.name} client]: `;
   console.log(`${logTag}Starting up`);
 
@@ -92,6 +97,11 @@ export const launchBot = (config: ChainConfig, dataProvider: DataProvider) => {
 
   const bot = new LiquidationBot(inputs);
 
+  // Register bot with webhook server for event-driven triggering
+  if (webhookServer) {
+    webhookServer.registerBot(bot, logTag);
+  }
+
   const blockInterval = config.blockInterval ?? 1;
 
   const startWatching = () => {
@@ -116,4 +126,6 @@ export const launchBot = (config: ChainConfig, dataProvider: DataProvider) => {
   };
 
   startWatching();
+
+  return bot;
 };

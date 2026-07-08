@@ -9,6 +9,7 @@ import {
 } from "@morpho-blue-liquidation-bot/data-providers";
 
 import { startHealthServer } from "./health";
+import { WebhookServer } from "./webhook";
 
 import { launchBot } from ".";
 
@@ -54,6 +55,15 @@ async function run() {
     console.error("Failed to start health server:", err);
   }
 
+  // Webhook server for Alchemy event-driven triggering
+  const webhookPort = Number.parseInt(process.env.WEBHOOK_PORT ?? "3001", 10);
+  const webhookServer = new WebhookServer(webhookPort);
+  try {
+    await webhookServer.start();
+  } catch (err) {
+    console.error("Failed to start webhook server:", err);
+  }
+
   for (const config of configs) {
     const dataProvider = providersByChain.get(config.chainId);
     if (!dataProvider) {
@@ -61,7 +71,7 @@ async function run() {
       continue;
     }
     try {
-      launchBot(config, dataProvider);
+      launchBot(config, dataProvider, webhookServer);
     } catch (err) {
       console.error(`Failed to launch bot for chain ${config.chainId}:`, err);
     }
