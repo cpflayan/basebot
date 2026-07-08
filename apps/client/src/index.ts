@@ -62,6 +62,14 @@ export const launchBot = (config: ChainConfig, dataProvider: DataProvider) => {
     MARKETS_FETCHING_COOLDOWN_PERIOD,
   );
 
+  // SECURITY (M7): 如果未配置 treasury，盈利直接發送到 EOA，存在安全風險
+  const treasuryAddress = config.treasuryAddress ?? client.account.address;
+  if (!config.treasuryAddress) {
+    console.warn(
+      `${logTag}⚠️ 未配置 treasuryAddress，盈利將發送到清算 EOA (${client.account.address})。` +
+        `建議配置獨立的多簽 treasury 地址以降低私鑰暴露風險。`,
+    );
+  }
   const inputs: LiquidationBotInputs = {
     logTag,
     chainId: config.chainId,
@@ -70,7 +78,7 @@ export const launchBot = (config: ChainConfig, dataProvider: DataProvider) => {
     vaultWhitelist: config.vaultWhitelist,
     additionalMarketsWhitelist: config.additionalMarketsWhitelist,
     executorAddress: config.executorAddress,
-    treasuryAddress: config.treasuryAddress ?? client.account.address,
+    treasuryAddress,
     dataProvider,
     liquidityVenues,
     pricers,
@@ -78,18 +86,22 @@ export const launchBot = (config: ChainConfig, dataProvider: DataProvider) => {
     positionLiquidationCooldownMechanism,
     flashbotAccount,
     alwaysRealizeBadDebt: ALWAYS_REALIZE_BAD_DEBT,
+    useFlashLoan: config.useFlashLoan,
+    flashLoanProvider: config.flashLoanProvider,
   };
 
   const bot = new LiquidationBot(inputs);
 
   const blockInterval = config.blockInterval ?? 1;
-  let count = 0;
 
   const startWatching = () => {
+    // SECURITY (NM4): 重啟時重置 count，避免重啟後立即觸發 bot.run()
+    let count = 0;
+
     watchBlocks(client, {
       onBlock: () => {
         if (count % blockInterval === 0) {
-          bot.run().catch((e) => {
+          bot.run().catch((e: unknown) => {
             console.error(`${logTag} uncaught error in bot.run():`, e);
           });
         }
@@ -97,10 +109,7 @@ export const launchBot = (config: ChainConfig, dataProvider: DataProvider) => {
       },
       onError: (error) => {
         const retryDelay = config.watchBlocksRetryDelayMs ?? 5_000;
-        console.error(
-          `${logTag} watchBlocks error, restarting watcher in ${retryDelay}ms:`,
-          error,
-        );
+        console.error(`${logTag} watchBlocks error, restarting watcher in ${retryDelay}ms:`, error);
         setTimeout(startWatching, retryDelay);
       },
     });

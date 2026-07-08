@@ -1,7 +1,44 @@
+import fs from "node:fs";
+import path from "node:path";
+
 import { arbitrum, base, katana, mainnet, tempo, unichain, worldchain } from "viem/chains";
 
 import { hyperevm, monad } from "./chains";
 import type { Config } from "./types";
+
+/// Discovery layer integration — load approved markets from morpho-liquidation-discovery
+
+const DISCOVERY_DATA_DIR = process.env.WHITELIST_DATA_DIR ?? "";
+
+// SECURITY (NM5): 驗證 marketId 格式為 0x + 64 hex chars
+const MARKET_ID_REGEX = /^0x[0-9a-fA-F]{64}$/;
+
+export function loadApprovedMarketIds(chainId: number): `0x${string}`[] {
+  if (!DISCOVERY_DATA_DIR) return [];
+  const filePath = path.join(DISCOVERY_DATA_DIR, `discovered-markets.${chainId}.json`);
+  if (!fs.existsSync(filePath)) return [];
+  try {
+    const raw = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+    if (!Array.isArray(raw)) {
+      console.warn(`[config] discovered-markets.${chainId}.json 格式異常，忽略`);
+      return [];
+    }
+    return raw
+      .filter((m: { marketId: string; approved: boolean }) => {
+        // NM5: schema validation — 只接受格式正確的 marketId
+        if (!m.approved) return false;
+        if (!m.marketId || !MARKET_ID_REGEX.test(m.marketId)) {
+          console.warn(`[config] 忽略無效 marketId: ${m.marketId}`);
+          return false;
+        }
+        return true;
+      })
+      .map((m: { marketId: string }) => m.marketId as `0x${string}`);
+  } catch (e) {
+    console.warn(`[config] 讀取 discovered-markets.${chainId}.json 失敗:`, e);
+    return [];
+  }
+}
 
 /// Bad debt realization
 
@@ -50,20 +87,24 @@ export const chainConfigs: Record<number, Config> = {
     options: {
       dataProvider: "morphoApi",
       vaultWhitelist: ["0xbeeF010f9cb27031ad51e3333f9aF9C6B1228183"],
-      additionalMarketsWhitelist: [],
+      additionalMarketsWhitelist: loadApprovedMarketIds(base.id),
       liquidityVenues: [
         "pendlePT",
         "midas",
         "1inch",
         "erc20Wrapper",
         "erc4626",
+        "aerodrome",
         "uniswapV3",
         "uniswapV4",
       ],
       pricers: ["defillama", "chainlink", "uniswapV3"],
       liquidationBufferBps: 50,
-      useFlashbots: false,
+      useFlashbots: false, // SECURITY (M6): Base 不支持 Flashbots，交易進入公開 mempool，存在三明治攻擊風險
       blockInterval: 10,
+      useFlashLoan: true, // SECURITY (M6): Flash loan 在公開 mempool 中可被 sandwich，已於 bot.ts 添加模擬利潤安全邊際
+      flashLoanProvider: "balancer",
+      treasuryAddress: "0x5faB997dd358c75680fF2b33E403aB81530fE30a",
     },
   },
   [unichain.id]: {

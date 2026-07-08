@@ -18,11 +18,11 @@ export class PositionLiquidationCooldownMechanism {
       this.positionReadyAt[marketId][account] = 0;
     }
 
-    if (this.positionReadyAt[marketId][account] > Date.now() / 1000) {
+    if (this.positionReadyAt[marketId][account] > Math.floor(Date.now() / 1000)) {
       return false;
     }
 
-    this.positionReadyAt[marketId][account] = Date.now() / 1000 + this.cooldownPeriod;
+    this.positionReadyAt[marketId][account] = Math.floor(Date.now() / 1000) + this.cooldownPeriod;
     return true;
   }
 }
@@ -37,10 +37,10 @@ export class MarketsFetchingCooldownMechanism {
   }
 
   isFetchingReady() {
-    if (this.readyAt > Date.now() / 1000) {
+    if (this.readyAt > Math.floor(Date.now() / 1000)) {
       return false;
     }
-    this.readyAt = Date.now() / 1000 + this.cooldownPeriod;
+    this.readyAt = Math.floor(Date.now() / 1000) + this.cooldownPeriod;
     return true;
   }
 }

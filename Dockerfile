@@ -29,10 +29,11 @@ COPY . .
 # - RAILWAY_DEPLOYMENT_ID
 
 # Declare the chain IDs we support as an environment variable for looping
-ENV CHAIN_IDS="1 130 137 8453 747474"
+ENV CHAIN_IDS="1 130 137 480 8453 1135 747474 999 143"
 
 # Declare the non-dynamic vars so they are available at runtime
 ENV LIQUIDATION_PRIVATE_KEY=${LIQUIDATION_PRIVATE_KEY}
+ENV WHITELIST_DATA_DIR=${WHITELIST_DATA_DIR}
 ENV RAILWAY_DEPLOYMENT_ID=${RAILWAY_DEPLOYMENT_ID}
 
 # Create cache directory and declare it as a volume to persist between runs
@@ -46,5 +47,6 @@ CMD ["sh", "-lc", "{ \
     echo \"EXECUTOR_ADDRESS_${CHAIN}=$(printenv EXECUTOR_ADDRESS_$CHAIN)\"; \
     echo \"LIQUIDATION_PRIVATE_KEY_${CHAIN}=$(printenv LIQUIDATION_PRIVATE_KEY)\"; \
   done; \
+  echo \"WHITELIST_DATA_DIR=$(printenv WHITELIST_DATA_DIR)\"; \
   echo \"RAILWAY_DEPLOYMENT_ID=$(printenv RAILWAY_DEPLOYMENT_ID)\"; \
 } > .env && pnpm run liquidate"]

@@ -2,6 +2,7 @@ import type { Address, Chain, Hex } from "viem";
 
 export type LiquidityVenueName =
   | "1inch"
+  | "aerodrome"
   | "erc20Wrapper"
   | "erc4626"
   | "lifi"
@@ -22,6 +23,8 @@ export interface Config {
   options: Options;
 }
 
+export type FlashLoanProvider = "balancer" | "aave";
+
 export interface Options {
   dataProvider: DataProviderName;
   vaultWhitelist: Address[] | "morpho-api";
@@ -33,6 +36,8 @@ export interface Options {
   useFlashbots: boolean;
   blockInterval?: number;
   watchBlocksRetryDelayMs?: number;
+  useFlashLoan?: boolean;
+  flashLoanProvider?: FlashLoanProvider;
 }
 
 export type ChainConfig = Omit<Config, "options"> &

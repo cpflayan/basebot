@@ -1,6 +1,6 @@
 import { chainConfigs } from "@morpho-blue-liquidation-bot/config";
 import dotenv from "dotenv";
-import { type Address, createWalletClient, type Hex, http } from "viem";
+import { type Address, createWalletClient, type Hex, http, getAddress, isAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import yargs from "yargs";
 import { hideBin } from "yargs/helpers";
@@ -28,7 +28,11 @@ async function run() {
     })
     .parseSync();
 
-  const token = argv.token as Address;
+  // SECURITY (NL4): 驗證 token 地址格式
+  if (!isAddress(argv.token)) {
+    throw new Error(`Invalid token address: ${argv.token}`);
+  }
+  const token = getAddress(argv.token);
   const chainId = argv.chainId;
 
   const rpcUrl = process.env[`RPC_URL_${chainId}`];
@@ -56,7 +60,17 @@ async function run() {
     account: privateKeyToAccount(privateKey as Hex),
   });
 
-  const recipient = (argv.recipient as Address) ?? client.account.address;
+  // SECURITY (NL4): 驗證 recipient 地址格式和 checksum
+  const rawRecipient = argv.recipient;
+  let recipient: Address;
+  if (rawRecipient) {
+    if (!isAddress(rawRecipient)) {
+      throw new Error(`Invalid recipient address: ${rawRecipient}`);
+    }
+    recipient = getAddress(rawRecipient); // checksum 驗證
+  } else {
+    recipient = client.account.address;
+  }
 
   await skim(client, token, executorAddress as Address, recipient);
 }
