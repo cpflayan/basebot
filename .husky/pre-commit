@@ -1,2 +1,1 @@
 cd morpho-blue-liquidation-bot && pnpm exec lint-staged
-pnpm exec lint-staged
