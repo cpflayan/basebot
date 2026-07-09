@@ -9,7 +9,9 @@ import {
   type IMarketParams,
   MarketUtils,
   PreLiquidationPosition,
+  MarketId,
 } from "@morpho-org/blue-sdk";
+import { fetchMarket } from "@morpho-org/blue-sdk-viem";
 import { executorAbi } from "executooor-viem";
 import {
   erc20Abi,
@@ -34,6 +36,8 @@ import {
 } from "viem/actions";
 
 import { BALANCER_FLASH_LOAN_FEE_BPS, BALANCER_VAULT_ADDRESS } from "./abis/BalancerVault.js";
+import { oracleAbi } from "./abis/morpho/oracle.js";
+import { PositionCache, type CachedMarketState, type CachedPosition } from "./positionCache.js";
 import {
   MarketsFetchingCooldownMechanism,
   PositionLiquidationCooldownMechanism,
@@ -42,6 +46,8 @@ import { fetchWhitelistedVaults } from "./utils/fetch-whitelisted-vaults.js";
 import { Flashbots } from "./utils/flashbots.js";
 import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
 import { DEFAULT_LIQUIDATION_BUFFER_BPS, WAD, wMulDown } from "./utils/maths.js";
+import type { DecodedMorphoEvent } from "./webhook.js";
+import "@morpho-org/blue-sdk-viem/lib/augment";
 
 /**
  * Slippage tolerance for DEX swaps within flash loan path.
@@ -49,6 +55,14 @@ import { DEFAULT_LIQUIDATION_BUFFER_BPS, WAD, wMulDown } from "./utils/maths.js"
  */
 const FLASH_LOAN_SLIPPAGE_BPS = 100n; // 1%
 const BPS_DENOMINATOR = 10_000n;
+
+/**
+ * SECURITY: Token blacklist — markets involving these tokens are skipped entirely.
+ * Prevents liquidation of positions with depegged/risky tokens (e.g. USR).
+ */
+const TOKEN_BLACKLIST = new Set<string>([
+  "0x35e5db674d8e93a03d814fa0ada70731efe8a4b9", // USR (Resolv USD) on Base — depegged
+]);
 
 export interface LiquidationBotInputs {
   logTag: string;
@@ -90,6 +104,10 @@ export class LiquidationBot {
   private alwaysRealizeBadDebt: boolean;
   private useFlashLoan: boolean;
   private flashLoanProvider: "balancer" | "aave";
+  private positionCache: PositionCache;
+  /** Interval for slow-path full refresh (ms). Default: 5 minutes */
+  private cacheRefreshInterval: number;
+  private cacheRefreshTimer?: ReturnType<typeof setInterval>;
 
   constructor(inputs: LiquidationBotInputs) {
     this.logTag = inputs.logTag;
@@ -111,13 +129,369 @@ export class LiquidationBot {
     this.alwaysRealizeBadDebt = inputs.alwaysRealizeBadDebt;
     this.useFlashLoan = inputs.useFlashLoan ?? false;
     this.flashLoanProvider = inputs.flashLoanProvider ?? "balancer";
+    this.positionCache = new PositionCache();
+    this.cacheRefreshInterval = Number(process.env.CACHE_REFRESH_INTERVAL_MS ?? "300000"); // 5 min
   }
+
+  // ─── Cache lifecycle ───
+
+  /**
+   * Initialize cache: fetch all liquidatable positions + market data from API.
+   * Called once at startup, then periodically via slow-path refresh.
+   */
+  async initializeCache(): Promise<void> {
+    await this.fetchMarkets();
+
+    const { liquidatablePositions } = await this.dataProvider.fetchLiquidatablePositions(
+      this.client,
+      this.coveredMarkets,
+    );
+
+    // Cache market state for each covered market
+    const marketResults = await Promise.allSettled(
+      this.coveredMarkets.map(async (marketId) => {
+        const market = await fetchMarket(marketId as MarketId, this.client, {
+          chainId: this.chainId,
+          deployless: false,
+        });
+        const now = BigInt(Math.floor(Date.now() / 1000));
+        const timestamp = now > market.lastUpdate ? now : market.lastUpdate;
+        return [marketId, market.accrueInterest(timestamp)] as const;
+      }),
+    );
+
+    let marketCount = 0;
+    for (const result of marketResults) {
+      if (result.status === "fulfilled") {
+        const [marketId, market] = result.value;
+        const state: CachedMarketState = {
+          marketId,
+          params: {
+            loanToken: market.params.loanToken,
+            collateralToken: market.params.collateralToken,
+            oracle: market.params.oracle,
+            irm: market.params.irm,
+            lltv: market.params.lltv,
+          },
+          totalSupplyAssets: market.totalSupplyAssets,
+          totalSupplyShares: market.totalSupplyShares,
+          totalBorrowAssets: market.totalBorrowAssets,
+          totalBorrowShares: market.totalBorrowShares,
+          lastUpdate: market.lastUpdate ?? 0n,
+          fee: market.fee ?? 0n,
+          rateAtTarget: market.rateAtTarget ?? 0n,
+          price: market.price ?? 0n,
+          fetchedAt: Date.now(),
+        };
+        this.positionCache.setMarket(state);
+        marketCount++;
+      }
+    }
+
+    // Cache positions
+    let posCount = 0;
+    for (const pos of liquidatablePositions) {
+      const marketId = MarketUtils.getMarketId(pos.market.params);
+      const cached: CachedPosition = {
+        user: pos.user,
+        marketId,
+        collateral: pos.collateral,
+        borrowShares: pos.borrowShares,
+        supplyShares: pos.supplyShares,
+        updatedAt: Date.now(),
+      };
+      this.positionCache.set(cached);
+      posCount++;
+    }
+
+    console.log(
+      `${this.logTag}🗄️ Cache initialized: ${posCount} positions, ${marketCount} markets`,
+    );
+  }
+
+  /**
+   * Start periodic slow-path cache refresh.
+   */
+  startPeriodicRefresh(): void {
+    if (this.cacheRefreshTimer) return;
+    this.cacheRefreshTimer = setInterval(() => {
+      void (async () => {
+        try {
+          console.log(`${this.logTag}🔄 Periodic cache refresh...`);
+          await this.initializeCache();
+        } catch (e) {
+          console.error(`${this.logTag}Cache refresh failed:`, e);
+        }
+      })();
+    }, this.cacheRefreshInterval);
+  }
+
+  stopPeriodicRefresh(): void {
+    if (this.cacheRefreshTimer) {
+      clearInterval(this.cacheRefreshTimer);
+      this.cacheRefreshTimer = undefined;
+    }
+  }
+
+  // ─── Fast path: event-driven ───
+
+  /**
+   * Handle decoded MorphoBlue events from webhook.
+   * Updates cache, fetches fresh oracle prices, recalculates HF,
+   * and triggers liquidation for positions with HF < 1.
+   */
+  async handleEvents(events: DecodedMorphoEvent[]): Promise<void> {
+    // Ensure markets are loaded
+    if (this.coveredMarkets.length === 0) {
+      await this.fetchMarkets();
+    }
+
+    // Group events by market for efficient processing
+    const affectedMarkets = new Set<Hex>();
+
+    for (const event of events) {
+      const marketId = event.marketId;
+      const user = event.user;
+
+      // Skip blacklisted tokens
+      const cachedMarket = this.positionCache.getMarket(marketId);
+      if (cachedMarket) {
+        if (
+          TOKEN_BLACKLIST.has(cachedMarket.params.loanToken.toLowerCase()) ||
+          TOKEN_BLACKLIST.has(cachedMarket.params.collateralToken.toLowerCase())
+        ) {
+          continue;
+        }
+      }
+
+      switch (event.eventName) {
+        case "Borrow":
+          // Debt increased → update borrowShares
+          if (event.shares !== undefined) {
+            this.positionCache.upsert(marketId, user, {
+              borrowShares:
+                (this.positionCache.get(marketId, user)?.borrowShares ?? 0n) + event.shares,
+            });
+            affectedMarkets.add(marketId);
+          }
+          break;
+
+        case "WithdrawCollateral":
+          // Collateral decreased → update collateral
+          if (event.assets !== undefined) {
+            const current = this.positionCache.get(marketId, user);
+            if (current) {
+              const newCollateral =
+                current.collateral > event.assets ? current.collateral - event.assets : 0n;
+              this.positionCache.upsert(marketId, user, { collateral: newCollateral });
+              affectedMarkets.add(marketId);
+            }
+          }
+          break;
+
+        case "Repay":
+          // Debt decreased → update borrowShares
+          if (event.shares !== undefined) {
+            const current = this.positionCache.get(marketId, user);
+            if (current) {
+              const newShares =
+                current.borrowShares > event.shares ? current.borrowShares - event.shares : 0n;
+              this.positionCache.upsert(marketId, user, { borrowShares: newShares });
+              affectedMarkets.add(marketId);
+            }
+          }
+          break;
+
+        case "SupplyCollateral":
+          // Collateral increased → update collateral
+          if (event.assets !== undefined) {
+            this.positionCache.upsert(marketId, user, {
+              collateral: (this.positionCache.get(marketId, user)?.collateral ?? 0n) + event.assets,
+            });
+            // New collateral = higher HF, no liquidation opportunity, but still track
+            affectedMarkets.add(marketId);
+          }
+          break;
+
+        case "Withdraw":
+          // Supply-side withdrawal — may affect market state but not directly position HF
+          affectedMarkets.add(marketId);
+          break;
+
+        case "Liquidate":
+          // Position was liquidated (by us or someone else) → remove from cache
+          this.positionCache.remove(marketId, user);
+          break;
+      }
+    }
+
+    if (affectedMarkets.size === 0) return;
+
+    console.log(
+      `${this.logTag}⚡ ${events.length} event(s) → ${affectedMarkets.size} market(s) affected, checking HF...`,
+    );
+
+    // For each affected market, fetch fresh oracle price and check HF
+    for (const marketId of affectedMarkets) {
+      try {
+        const cachedMarket = this.positionCache.getMarket(marketId);
+        if (!cachedMarket) {
+          // Market not in cache — might be new. Do a full fetch.
+          await this.refreshMarketInCache(marketId);
+          continue;
+        }
+
+        // Fetch fresh oracle price (single on-chain read)
+        const freshPrice = await readContract(this.client, {
+          address: cachedMarket.params.oracle,
+          abi: oracleAbi,
+          functionName: "price",
+        });
+        this.positionCache.updateOraclePrice(marketId, freshPrice);
+
+        // Sync any unknown positions from chain before checking HF
+        const eventsForMarket = events.filter((e) => e.marketId === marketId);
+        for (const event of eventsForMarket) {
+          const cached = this.positionCache.get(marketId, event.user);
+          if (!cached || cached.collateral === 0n) {
+            // Position not in cache — read from chain
+            try {
+              const position = await this.readPositionFromChain(marketId, event.user);
+              if (position) {
+                this.positionCache.upsert(marketId, event.user, position);
+                console.log(
+                  `${this.logTag}  📥 Synced ${event.user} from chain: collateral=${position.collateral}, borrowShares=${position.borrowShares}`,
+                );
+              }
+            } catch {
+              // Ignore chain read errors
+            }
+          }
+        }
+
+        // Check all positions in this market for HF < 1
+        const atRisk = this.positionCache.findAtRiskPositions(marketId, 1, freshPrice);
+
+        if (atRisk.length === 0) {
+          console.log(`${this.logTag}  Market ${marketId.slice(0, 10)}... — no at-risk positions`);
+          continue;
+        }
+
+        console.log(
+          `${this.logTag}  Market ${marketId.slice(0, 10)}... — ${atRisk.length} at-risk position(s)!`,
+        );
+
+        // For each at-risk position, build a full AccrualPosition and attempt liquidation
+        for (const { position: cachedPos, hf } of atRisk) {
+          const accrualPos = this.positionCache.buildAccrualPosition(
+            marketId,
+            cachedPos.user,
+            freshPrice,
+          );
+          if (!accrualPos) continue;
+
+          console.log(
+            `${this.logTag}  🎯 ${cachedPos.user} HF=${hf.toFixed(4)} — attempting liquidation`,
+          );
+
+          // Use existing liquidation path (with full profit checks)
+          await this.liquidate(accrualPos);
+        }
+      } catch (e) {
+        console.error(`${this.logTag}Error processing market ${marketId.slice(0, 10)}...:`, e);
+      }
+    }
+  }
+
+  /**
+   * Read a position directly from chain (for positions not in cache).
+   */
+  private async readPositionFromChain(
+    marketId: Hex,
+    user: Address,
+  ): Promise<{ collateral: bigint; borrowShares: bigint; supplyShares: bigint } | null> {
+    const morphoAddress = this.chainAddresses.morpho;
+    const positionAbi = [
+      {
+        inputs: [
+          { name: "id", type: "bytes32" },
+          { name: "user", type: "address" },
+        ],
+        name: "position",
+        outputs: [{ type: "uint256" }, { type: "uint128" }, { type: "uint128" }],
+        stateMutability: "view",
+        type: "function",
+      },
+    ] as const;
+
+    const result = await readContract(this.client, {
+      address: morphoAddress,
+      abi: positionAbi,
+      functionName: "position",
+      args: [marketId, user],
+    });
+
+    return {
+      supplyShares: result[0],
+      borrowShares: result[1],
+      collateral: result[2],
+    };
+  }
+
+  private async refreshMarketInCache(marketId: Hex): Promise<void> {
+    try {
+      const market = await fetchMarket(marketId as MarketId, this.client, {
+        chainId: this.chainId,
+        deployless: false,
+      });
+      const now = BigInt(Math.floor(Date.now() / 1000));
+      const timestamp = now > market.lastUpdate ? now : market.lastUpdate;
+      const accrued = market.accrueInterest(timestamp);
+
+      this.positionCache.setMarket({
+        marketId,
+        params: {
+          loanToken: accrued.params.loanToken,
+          collateralToken: accrued.params.collateralToken,
+          oracle: accrued.params.oracle,
+          irm: accrued.params.irm,
+          lltv: accrued.params.lltv,
+        },
+        totalSupplyAssets: accrued.totalSupplyAssets,
+        totalSupplyShares: accrued.totalSupplyShares,
+        totalBorrowAssets: accrued.totalBorrowAssets,
+        totalBorrowShares: accrued.totalBorrowShares,
+        lastUpdate: accrued.lastUpdate ?? 0n,
+        fee: accrued.fee ?? 0n,
+        rateAtTarget: accrued.rateAtTarget ?? 0n,
+        price: accrued.price ?? 0n,
+        fetchedAt: Date.now(),
+      });
+    } catch (e) {
+      console.error(`${this.logTag}Failed to refresh market ${marketId.slice(0, 10)}...:`, e);
+    }
+  }
+
+  // ─── Slow path: full API refresh (original behavior) ───
 
   async run() {
     await this.fetchMarkets();
 
     const { liquidatablePositions, preLiquidatablePositions } =
       await this.dataProvider.fetchLiquidatablePositions(this.client, this.coveredMarkets);
+
+    // Update cache with fresh data
+    for (const pos of liquidatablePositions) {
+      const marketId = MarketUtils.getMarketId(pos.market.params);
+      this.positionCache.set({
+        user: pos.user,
+        marketId,
+        collateral: pos.collateral,
+        borrowShares: pos.borrowShares,
+        supplyShares: pos.supplyShares,
+        updatedAt: Date.now(),
+      });
+    }
 
     await Promise.all([
       ...liquidatablePositions.map((position) => this.liquidate(position)),
@@ -127,6 +501,18 @@ export class LiquidationBot {
 
   private async liquidate(position: AccrualPosition) {
     const marketParams = position.market.params;
+
+    // SECURITY: Skip markets involving blacklisted tokens
+    if (
+      TOKEN_BLACKLIST.has(marketParams.loanToken.toLowerCase()) ||
+      TOKEN_BLACKLIST.has(marketParams.collateralToken.toLowerCase())
+    ) {
+      console.log(
+        `${this.logTag}⛔ Skip ${position.user}: blacklisted token in market ${MarketUtils.getMarketId(marketParams).slice(0, 10)}...`,
+      );
+      return;
+    }
+
     const seizableCollateral = position.seizableCollateral ?? 0n;
     const badDebtPosition = seizableCollateral === position.collateral;
 
@@ -159,7 +545,7 @@ export class LiquidationBot {
         collateralToken: marketParams.collateralToken,
         oracle: marketParams.oracle,
         irm: marketParams.irm,
-        lltv: BigInt(marketParams.lltv),
+        lltv: marketParams.lltv,
       },
       position.user,
       seizableCollateral,
@@ -278,7 +664,7 @@ export class LiquidationBot {
         collateralToken: marketParams.collateralToken,
         oracle: marketParams.oracle,
         irm: marketParams.irm,
-        lltv: BigInt(marketParams.lltv),
+        lltv: marketParams.lltv,
       },
       position.user,
       seizableCollateral,
@@ -340,6 +726,18 @@ export class LiquidationBot {
 
   private async preLiquidate(position: PreLiquidationPosition) {
     const marketParams = position.market.params;
+
+    // SECURITY: Skip markets involving blacklisted tokens
+    if (
+      TOKEN_BLACKLIST.has(marketParams.loanToken.toLowerCase()) ||
+      TOKEN_BLACKLIST.has(marketParams.collateralToken.toLowerCase())
+    ) {
+      console.log(
+        `${this.logTag}⛔ Skip pre-liquidate ${position.user}: blacklisted token in market ${MarketUtils.getMarketId(marketParams).slice(0, 10)}...`,
+      );
+      return;
+    }
+
     const seizableCollateral = this.decreaseSeizableCollateral(
       position.seizableCollateral ?? 0n,
       false,
@@ -745,5 +1143,9 @@ export class LiquidationBot {
     ];
 
     this.coveredMarkets = [...whitelistedMarketsFromVaults, ...allAdditional];
+
+    console.log(
+      `${this.logTag}📝 Covered markets: ${this.coveredMarkets.length} (vault: ${whitelistedMarketsFromVaults.length}, additional: ${allAdditional.length})`,
+    );
   }
 }

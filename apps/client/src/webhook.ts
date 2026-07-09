@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import Fastify from "fastify";
-import { toEventSelector } from "viem";
+import { decodeEventLog, type Hex, toEventSelector } from "viem";
 
 import type { LiquidationBot } from "./bot.js";
 
@@ -14,7 +14,131 @@ const MORPHO_EVENT_SIGNATURES = [
   "Borrow(bytes32,address,address,address,uint256,uint256)",
   "WithdrawCollateral(bytes32,address,address,address,uint256)",
   "Withdraw(bytes32,address,address,address,uint256,uint256)",
+  "SupplyCollateral(bytes32,address,address,uint256)",
+  "Repay(bytes32,address,address,address,uint256,uint256)",
+  "Liquidate(bytes32,address,address,address,uint256,uint256,uint256,uint256)",
 ] as const;
+
+/**
+ * Minimal MorphoBlue ABI for event decoding.
+ */
+const morphoEventAbi = [
+  {
+    anonymous: false,
+    inputs: [
+      { indexed: true, name: "id", type: "bytes32" },
+      { indexed: false, name: "caller", type: "address" },
+      { indexed: true, name: "onBehalf", type: "address" },
+      { indexed: true, name: "receiver", type: "address" },
+      { indexed: false, name: "assets", type: "uint256" },
+      { indexed: false, name: "shares", type: "uint256" },
+    ],
+    name: "Borrow",
+    type: "event",
+  },
+  {
+    anonymous: false,
+    inputs: [
+      { indexed: true, name: "id", type: "bytes32" },
+      { indexed: false, name: "caller", type: "address" },
+      { indexed: true, name: "onBehalf", type: "address" },
+      { indexed: true, name: "receiver", type: "address" },
+      { indexed: false, name: "assets", type: "uint256" },
+    ],
+    name: "WithdrawCollateral",
+    type: "event",
+  },
+  {
+    anonymous: false,
+    inputs: [
+      { indexed: true, name: "id", type: "bytes32" },
+      { indexed: false, name: "caller", type: "address" },
+      { indexed: true, name: "onBehalf", type: "address" },
+      { indexed: true, name: "receiver", type: "address" },
+      { indexed: false, name: "assets", type: "uint256" },
+      { indexed: false, name: "shares", type: "uint256" },
+    ],
+    name: "Withdraw",
+    type: "event",
+  },
+  {
+    anonymous: false,
+    inputs: [
+      { indexed: true, name: "id", type: "bytes32" },
+      { indexed: true, name: "caller", type: "address" },
+      { indexed: true, name: "onBehalf", type: "address" },
+      { indexed: false, name: "assets", type: "uint256" },
+    ],
+    name: "SupplyCollateral",
+    type: "event",
+  },
+  {
+    anonymous: false,
+    inputs: [
+      { indexed: true, name: "id", type: "bytes32" },
+      { indexed: false, name: "caller", type: "address" },
+      { indexed: true, name: "onBehalf", type: "address" },
+      { indexed: true, name: "receiver", type: "address" },
+      { indexed: false, name: "assets", type: "uint256" },
+      { indexed: false, name: "shares", type: "uint256" },
+    ],
+    name: "Repay",
+    type: "event",
+  },
+  {
+    anonymous: false,
+    inputs: [
+      { indexed: true, name: "id", type: "bytes32" },
+      { indexed: true, name: "liquidator", type: "address" },
+      { indexed: false, name: "user", type: "address" },
+      { indexed: false, name: "repayAssets", type: "uint256" },
+      { indexed: false, name: "repayShares", type: "uint256" },
+      { indexed: false, name: "seizedAssets", type: "uint256" },
+      { indexed: false, name: "seizedShares", type: "uint256" },
+    ],
+    name: "Liquidate",
+    type: "event",
+  },
+] as const;
+
+/** Decoded MorphoBlue event passed to the bot */
+export interface DecodedMorphoEvent {
+  eventName: string;
+  marketId: Hex;
+  user: Hex;
+  assets?: bigint;
+  shares?: bigint;
+}
+
+/**
+ * Decode a raw log entry from the webhook into a structured event.
+ */
+export function decodeMorphoLog(log: {
+  topics: [Hex, ...Hex[]];
+  data: Hex;
+}): DecodedMorphoEvent | undefined {
+  try {
+    const decoded = decodeEventLog({
+      abi: morphoEventAbi,
+      topics: log.topics,
+      data: log.data,
+    });
+
+    const args = decoded.args as Record<string, unknown>;
+    const marketId = args.id as Hex;
+    const user = (args.onBehalf ?? args.user) as Hex;
+
+    return {
+      eventName: decoded.eventName,
+      marketId,
+      user,
+      assets: args.assets as bigint | undefined,
+      shares: args.shares as bigint | undefined,
+    };
+  } catch {
+    return undefined;
+  }
+}
 
 interface RegisteredBot {
   bot: LiquidationBot;
@@ -71,6 +195,21 @@ export class WebhookServer {
             .send({ status: "ok", triggered: false, reason: "no matching events" });
         }
 
+        // Decode all matching events
+        const decodedEvents: DecodedMorphoEvent[] = [];
+        for (const log of matchingLogs) {
+          const topics = log.topics as [Hex, ...Hex[]];
+          const data = log.data as Hex;
+          const decoded = decodeMorphoLog({ topics, data });
+          if (decoded) decodedEvents.push(decoded);
+        }
+
+        if (decodedEvents.length === 0) {
+          return await reply
+            .code(200)
+            .send({ status: "ok", triggered: false, reason: "no decodable events" });
+        }
+
         // Cooldown: avoid triggering multiple times within cooldownMs
         const now = Date.now();
         if (now - this.lastTriggerTime < this.cooldownMs) {
@@ -78,26 +217,26 @@ export class WebhookServer {
             status: "ok",
             triggered: false,
             reason: "cooldown",
-            matchingEvents: matchingLogs.length,
+            matchingEvents: decodedEvents.length,
           });
         }
         this.lastTriggerTime = now;
 
-        // Trigger all registered bots (fire-and-forget)
         console.log(
-          `[Webhook] ${matchingLogs.length} Morpho event(s) detected, triggering ${this.bots.length} bot(s)`,
+          `[Webhook] ${decodedEvents.length} Morpho event(s) decoded, triggering ${this.bots.length} bot(s)`,
         );
 
+        // Trigger all registered bots with decoded events (fire-and-forget)
         for (const { bot, logTag } of this.bots) {
-          bot.run().catch((e: unknown) => {
-            console.error(`${logTag} webhook-triggered run failed:`, e);
+          bot.handleEvents(decodedEvents).catch((e: unknown) => {
+            console.error(`${logTag} event-driven handling failed:`, e);
           });
         }
 
         return await reply.code(200).send({
           status: "ok",
           triggered: true,
-          matchingEvents: matchingLogs.length,
+          matchingEvents: decodedEvents.length,
         });
       } catch (error) {
         console.error("[Webhook] Error processing payload:", error);

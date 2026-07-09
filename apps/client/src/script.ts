@@ -71,7 +71,7 @@ async function run() {
       continue;
     }
     try {
-      launchBot(config, dataProvider, webhookServer);
+      await launchBot(config, dataProvider, webhookServer);
     } catch (err) {
       console.error(`Failed to launch bot for chain ${config.chainId}:`, err);
     }

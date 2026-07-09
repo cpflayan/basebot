@@ -19,7 +19,7 @@ import {
 } from "./utils/cooldownMechanisms";
 import type { WebhookServer } from "./webhook";
 
-export const launchBot = (
+export const launchBot = async (
   config: ChainConfig,
   dataProvider: DataProvider,
   webhookServer?: WebhookServer,
@@ -96,6 +96,14 @@ export const launchBot = (
   };
 
   const bot = new LiquidationBot(inputs);
+
+  // Initialize cache with full market state + positions before starting
+  try {
+    await bot.initializeCache();
+    bot.startPeriodicRefresh();
+  } catch (e) {
+    console.error(`${logTag}Cache initialization failed, continuing with lazy-load:`, e);
+  }
 
   // Register bot with webhook server for event-driven triggering
   if (webhookServer) {

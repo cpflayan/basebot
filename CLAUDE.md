@@ -19,17 +19,24 @@ Workspace monorepo with six packages:
 - **`LiquidityVenue`** (`apps/liquidity-venues/src/liquidityVenue.ts`) — Interface for converting collateral to loan token. Venues are tried in order defined by config. Each venue implements `supportsRoute` and `convert`.
 - **`Pricer`** (`apps/pricers/src/pricer.ts`) — Interface for pricing assets in USD. Used for profitability checks. Pricers are tried in order defined by config.
 - **Factories** (`apps/data-providers/src/factory.ts`, `apps/liquidity-venues/src/factory.ts`, `apps/pricers/src/factory.ts`) — Map config string identifiers to class instances. The config package exports only string names; the implementation packages own the classes. The data provider factory (`createDataProviders`) takes chain IDs and returns a `Map<number, DataProvider>` with a shared instance.
-- **`LiquidationBot`** (`apps/client/src/bot.ts`) — Core orchestrator. Fetches markets, finds liquidatable positions, encodes liquidation calldata, simulates, checks profitability, and executes.
-- **`LiquidationEncoder`** (`apps/client/src/utils/LiquidationEncoder.ts`) — Builds batched calldata for the on-chain executor contract.
+- **`LiquidationBot`** (`apps/client/src/bot.ts`) — Core orchestrator. Fetches markets, finds liquidatable positions, encodes liquidation calldata, simulates, checks profitability, and executes. Supports both direct and flash-loan-backed liquidation paths, and an event-driven fast path via webhook events.
+- **`LiquidationEncoder`** (`apps/client/src/utils/LiquidationEncoder.ts`) — Builds batched calldata for the on-chain executor contract. Extends `ExecutorEncoder` with pre-liquidation support.
+- **`PositionCache`** (`apps/client/src/positionCache.ts`) — In-memory cache for positions and market state. Enables the event-driven fast path: events update cache incrementally, fresh oracle prices are fetched on demand, and HF is recalculated to identify at-risk positions without a full API round-trip.
+- **`WebhookServer`** (`apps/client/src/webhook.ts`) — Fastify HTTP server that receives Alchemy webhook POST payloads, decodes MorphoBlue events from logs, and triggers `handleEvents()` on all registered bots for event-driven liquidation.
+- **`HealthServer`** (`apps/client/src/health.ts`) — Singleton Fastify server exposing a `/health` endpoint for container orchestration and monitoring.
 
 ### Flow
 
 1. Config defines which chains, data provider, vaults, venues, and pricers to use
-2. `script.ts` reads all chain configs, groups chains by data provider, creates shared providers (awaiting `init()` for backfill), then launches one bot per chain
-3. Each bot uses its data provider to fetch whitelisted markets and find liquidatable positions
-4. For each position: try liquidity venues in order to convert collateral → loan token
-5. Simulate the full liquidation, check profitability via pricers
-6. Execute (optionally via Flashbots on mainnet)
+2. `script.ts` starts the `HealthServer` (liveness probe) and `WebhookServer` (Alchemy event-driven triggering)
+3. `script.ts` reads all chain configs, groups chains by data provider, creates shared providers (awaiting `init()` for backfill), then launches one bot per chain
+4. Each bot initializes its `PositionCache`: fetches covered markets (vault whitelist + discovery-layer approved markets) and caches liquidatable positions + market state from the data provider
+5. **Slow path** (block-watcher loop): `watchBlocks` triggers `bot.run()` at configured `blockInterval` — fetches fresh liquidatable positions from the data provider, updates cache, and attempts liquidation
+6. **Fast path** (event-driven): Alchemy webhook → `WebhookServer` decodes MorphoBlue events → `handleEvents()` updates cache incrementally, fetches fresh oracle prices, recalculates HF, and triggers liquidation for newly at-risk positions
+7. For each liquidatable position: try liquidity venues in order to convert collateral → loan token (with encoder state snapshot/restore on failure)
+8. Simulate the full liquidation via `simulateCalls`, check profitability via pricers (profit must exceed gas costs)
+9. Execute via `writeContract` or Flashbots bundle (mainnet only)
+10. **Flash loan path** (optional): when `useFlashLoan` is enabled, the bot uses a Balancer V2 flash loan (0% fee) to borrow loan tokens, liquidate the position, swap seized collateral via DEX, repay the flash loan, and skim profit to treasury — all within a single executor transaction. A slippage safety margin protects against sandwich attacks between simulation and execution.
 
 ## Non-Negotiables
 
@@ -37,7 +44,7 @@ Workspace monorepo with six packages:
 - **All configuration lives in the config package.** The client, liquidity-venues, pricers, and data-providers packages must not define or hardcode any configuration within their own packages. All configuration (parameters, addresses, venue/pricer ordering, chain settings) lives in `apps/config`. These packages may access config values by importing directly from `@morpho-blue-liquidation-bot/config` — this is the intended pattern, not a violation. If you need a new parameter, add it to the config types in `apps/config`. These packages may also read secrets (e.g. RPC URLs, API keys) directly from environment variables.
 - **Never push directly to `main`.** Always use feature branches and PRs.
 - **Always run tests after code changes.** Run the relevant test suite before considering work complete.
-- **Preserve venue/pricer ordering semantics.** The order of `liquidityVenues` and `pricers` arrays in config is significant — venues are tried sequentially and the first successful conversion wins. Pricers are tried in order and the first price found is used. `pricers` is optional — omitting it disables profitability checks for that chain.
+- **Preserve venue/pricer ordering semantics.** The order of `liquidityVenues` and `pricers` arrays in config is significant — venues are tried sequentially and the first successful conversion wins. Pricers are tried in order and the first price found is used. **Pricers are mandatory** — if no pricers are configured, the bot refuses to execute any trade (cannot verify profitability). Set `ALWAYS_REALIZE_BAD_DEBT=true` only if you explicitly want to bypass profit checks for bad-debt positions.
 
 ## Code Standards
 
@@ -64,7 +71,7 @@ Workspace monorepo with six packages:
 
 - **Liquidity venue tests**: `pnpm test:liquidity-venues` — test each venue's `supportsRoute` and `convert`
 - **Pricer tests**: `pnpm test:pricers` — test each pricer's `price` method
-- **Bot tests**: `pnpm test:bot` — test bot orchestration (health, execution)
+- **Client Tests**: `pnpm test:client` — test bot orchestration (health, webhook, execution, cache)
 - Tests use vitest with 45s timeout (some tests hit live RPCs)
 - When adding a new venue or pricer, always add corresponding tests
 
@@ -81,7 +88,7 @@ Workspace monorepo with six packages:
 
 3. **Tests**:
    - Add tests for the new data provider
-   - Run `pnpm test:bot` to validate integration
+   - Run `pnpm test:client` to validate integration
 
 ## How to Add a New Liquidity Venue
 
@@ -135,7 +142,9 @@ Workspace monorepo with six packages:
 - `pnpm build:config` — Build the config package only
 - `pnpm test:liquidity-venues` — Run liquidity venue tests
 - `pnpm test:pricers` — Run pricer tests
-- `pnpm test:bot` — Run bot tests
+- `pnpm test:client` — Run client/bot tests
+- `pnpm test:hyperindex` — Run HyperIndex indexer tests
 - `pnpm liquidate` — Run the bot (requires `.env`)
+- `pnpm skim` — Rescue stuck tokens from executor contract (requires `--chainId`, `--token`, optional `--recipient`)
 - `pnpm deploy:executor` — Deploy executor contract
 - `pnpm lint` — Lint all packages
