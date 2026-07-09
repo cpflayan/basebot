@@ -10,9 +10,8 @@ vendor/
 .ponder
 
 # Env
-**/.env
-**/.env*.local
-**/.env.fork
+.env
+.env*.local
 
 # Logs
 npm-debug.log*
@@ -25,11 +24,4 @@ yarn-error.log*
 
 # Tools
 .claude/settings.local.json
-
-# Backup files
-**/*.bak
-**/*.bk
-
-# Data files (generated at runtime)
-**/data/*.json
-!data/*.example.json
+.dockerignore.env.fork

@@ -1,0 +1,32 @@
+{
+  "name": "morpho-liquidation-discovery",
+  "version": "0.1.0",
+  "description": "獨立的多鏈 Morpho Blue 新市場自動發現 + 安全過濾 + 熔斷通知層，與官方 morpho-blue-liquidation-bot 透過共用 JSON 白名單檔案對接。",
+  "type": "module",
+  "scripts": {
+    "discover": "tsx src/discovery/run.ts",
+    "backfill": "tsx scripts/backfill-markets.ts",
+    "circuit-breaker": "tsx src/circuit-breaker/run.ts",
+    "dev": "concurrently \"pnpm discover\" \"pnpm circuit-breaker\"",
+    "postinstall": "node scripts/fix-viem-tsconfig.mjs"
+  },
+  "dependencies": {
+    "viem": "^2.21.0",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "concurrently": "^9.0.0",
+    "@types/node": "^22.7.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "morpho-liquidation-discovery"
+    ]
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true
+  }
+}
