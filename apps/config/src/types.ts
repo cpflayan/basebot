@@ -38,6 +38,17 @@ export interface Options {
   watchBlocksRetryDelayMs?: number;
   useFlashLoan?: boolean;
   flashLoanProvider?: FlashLoanProvider;
+  cometWatchlist?: CometWatchlistConfig;
+}
+
+export interface CometWatchlistConfig {
+  enabled: boolean;
+  comets: {
+    address: Address;
+    baseAsset: Address;
+    deployBlock: number;
+  }[];
+  pollIntervalBlocks?: number;
 }
 
 export type ChainConfig = Omit<Config, "options"> &

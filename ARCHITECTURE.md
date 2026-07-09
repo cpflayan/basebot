@@ -1,6 +1,9 @@
-# Morpho Blue Liquidation Bot
+# Base Liquidation Bot — Architecture
 
-Multi-chain liquidation bot for the Morpho Blue lending protocol. Monitors positions across all chains where Morpho is deployed and executes profitable liquidations via on-chain executor contracts.
+Multi-chain liquidation system for **Morpho Blue** and **Compound V3 (Comet)** lending protocols. Consists of two projects:
+
+1. **`morpho-blue-liquidation-bot`** — Executes profitable liquidations via on-chain executor contracts
+2. **`morpho-liquidation-discovery`** — Scans and validates markets, generates whitelist for the bot
 
 ## Architecture
 
@@ -19,7 +22,9 @@ Workspace monorepo with six packages:
 - **`LiquidityVenue`** (`apps/liquidity-venues/src/liquidityVenue.ts`) — Interface for converting collateral to loan token. Venues are tried in order defined by config. Each venue implements `supportsRoute` and `convert`.
 - **`Pricer`** (`apps/pricers/src/pricer.ts`) — Interface for pricing assets in USD. Used for profitability checks. Pricers are tried in order defined by config.
 - **Factories** (`apps/data-providers/src/factory.ts`, `apps/liquidity-venues/src/factory.ts`, `apps/pricers/src/factory.ts`) — Map config string identifiers to class instances. The config package exports only string names; the implementation packages own the classes. The data provider factory (`createDataProviders`) takes chain IDs and returns a `Map<number, DataProvider>` with a shared instance.
-- **`LiquidationBot`** (`apps/client/src/bot.ts`) — Core orchestrator. Fetches markets, finds liquidatable positions, encodes liquidation calldata, simulates, checks profitability, and executes. Supports both direct and flash-loan-backed liquidation paths, and an event-driven fast path via webhook events.
+- **`LiquidationBot`** (`apps/client/src/bot.ts`) — Core Morpho Blue orchestrator. Fetches markets, finds liquidatable positions, encodes liquidation calldata, simulates, checks profitability, and executes. Supports both direct and flash-loan-backed liquidation paths, and an event-driven fast path via webhook events.
+- **`CometLiquidationBot`** (`apps/client/src/cometBot.ts`) — Compound V3 orchestrator. Runs in parallel with `LiquidationBot`. Uses `Comet.isLiquidatable()` to check accounts, executes via `absorb` + `buyCollateral` with optional flash loan support. Shares liquidity venues, pricers, and execution utilities with the Morpho bot.
+- **`CometAccountRegistry`** (`apps/client/src/cometAccountRegistry.ts`) — Account discovery module for Compound V3. Scans `SupplyCollateral`/`WithdrawCollateral` events to build a deduplicated account list per Comet. Persists state to JSON for incremental scanning across restarts.
 - **`LiquidationEncoder`** (`apps/client/src/utils/LiquidationEncoder.ts`) — Builds batched calldata for the on-chain executor contract. Extends `ExecutorEncoder` with pre-liquidation support.
 - **`PositionCache`** (`apps/client/src/positionCache.ts`) — In-memory cache for positions and market state. Enables the event-driven fast path: events update cache incrementally, fresh oracle prices are fetched on demand, and HF is recalculated to identify at-risk positions without a full API round-trip.
 - **`WebhookServer`** (`apps/client/src/webhook.ts`) — Fastify HTTP server that receives Alchemy webhook POST payloads, decodes MorphoBlue events from logs, and triggers `handleEvents()` on all registered bots for event-driven liquidation.
@@ -38,11 +43,90 @@ Workspace monorepo with six packages:
 9. Execute via `writeContract` or Flashbots bundle (mainnet only)
 10. **Flash loan path** (optional): when `useFlashLoan` is enabled, the bot uses a Balancer V2 flash loan (0% fee) to borrow loan tokens, liquidate the position, swap seized collateral via DEX, repay the flash loan, and skim profit to treasury — all within a single executor transaction. A slippage safety margin protects against sandwich attacks between simulation and execution.
 
+### Compound V3 (Comet) Flow
+
+The `CometLiquidationBot` runs in parallel with the Morpho `LiquidationBot`, sharing infrastructure (liquidity venues, pricers, executor, treasury).
+
+1. **Account Discovery** (`CometAccountRegistry`):
+   - On first startup: exponential search + binary search via `eth_getCode` to find exact Comet deploy blocks
+   - Historical scan: scans `SupplyCollateral`/`WithdrawCollateral` events from deploy block to current, using Base public RPC (10k blocks per batch)
+   - Persists accounts + `lastScannedBlock` to `./data/comet-accounts.<chainId>.json`
+   - On restart: loads JSON, only scans new blocks (incremental)
+
+2. **Polling Loop**:
+   - `watchBlocks` triggers periodic checks at configured `pollIntervalBlocks` (default: 5 blocks)
+   - Each cycle: incremental event scan → batch `isLiquidatable()` checks → trigger liquidations
+
+3. **Liquidation Execution**:
+   - For each liquidatable account: estimate debt via `userBasic` + `totalsBasic`
+   - **Flash loan path**: Balancer flash loan → ERC20 approve → `Comet.absorb(executor, [accounts])` → `Comet.buyCollateral(asset, minAmount, baseAmount, executor)` → DEX swap seized collateral → repay flash loan → skim profit
+   - **Direct path**: when flash loan is disabled or debt is too small
+   - Profit check: collateral value must exceed debt + gas + slippage margin
+   - Execution via `simulateAndExecFlashLoan` (shared with Morpho bot)
+
+4. **Dual-RPC Architecture**:
+   - **Historical scanning**: Base public RPC (`https://mainnet.base.org`) — supports 10k block `eth_getLogs`, free, no API key
+   - **Trading + incremental**: Alchemy RPC (configured via `RPC_URL_8453`) — reliable for writes and small-range queries
+
+## Compound V3 Configuration
+
+Comet markets are configured in `apps/config/src/config.ts` under `options.cometWatchlist`:
+
+```typescript
+cometWatchlist: {
+  enabled: boolean;
+  comets: {
+    address: Address;      // Comet contract address
+    baseAsset: Address;    // Base token (e.g., USDC, WETH)
+    deployBlock: number;   // Verified deployment block
+  }[];
+  pollIntervalBlocks?: number;  // Polling frequency (default: 5)
+}
+```
+
+### Base Chain Comets (Verified)
+
+| Comet | Address | Base Asset | Deploy Block |
+|-------|---------|------------|--------------|
+| USDC | `0xb125E6687d4313864e53df431d5425969c15Eb2F` | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` | 11,699,480 |
+| WETH | `0x46e6b214b524310239732D51387075E0e70970bf` | `0x4200000000000000000000000000000000000006` | 2,495,303 |
+| USDbC | `0x9c4ec768c28520B50860ea7a15bd7213a9fF58bf` | `0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA` | 2,197,588 |
+| AERO | `0x784efeB622244d2348d4F2522f8860B96fbEcE89` | `0x940181a94A35A4569E4529A3CDfB74e38FD98631` | 20,852,405 |
+
+Deploy blocks are verified via binary search on startup. If the configured value is incorrect, the bot automatically finds the exact block using exponential search + `eth_getCode`.
+
+## Discovery Layer
+
+The `morpho-liquidation-discovery` project is a separate service that scans Base chain for approved Morpho markets and maintains a whitelist. The bot reads this whitelist at startup to know which markets are safe to liquidate.
+
+### Purpose
+
+- **Market Discovery**: Scans Morpho Blue for active markets with sufficient liquidity
+- **Safety Checks**: Validates markets against security criteria (proxy verification, token blacklist)
+- **Whitelist Generation**: Outputs `data/discovered-markets.8453.json` consumed by the bot
+
+### Key Components
+
+- **`src/discovery/run.ts`** — Main discovery script that scans markets
+- **`src/safety/checks.ts`** — Security validation (proxy detection, token blacklist)
+- **`src/shared/whitelist-store.ts`** — Reads/writes the whitelist JSON
+- **`scripts/scan-liquidations.ts`** — CLI tool for manual scanning
+
+### Integration
+
+The bot loads the whitelist via `WHITELIST_DATA_DIR` environment variable:
+
+```bash
+WHITELIST_DATA_DIR=/path/to/morpho-liquidation-discovery/data
+```
+
+At startup, `apps/config/src/config.ts` reads `discovered-markets.8453.json` and filters markets to only those approved by the discovery layer.
+
 ## Non-Negotiables
 
 - **Never commit secrets or private keys.** Secrets (RPC URLs, private keys, API keys) must come from environment variables. Never hardcode them anywhere.
 - **All configuration lives in the config package.** The client, liquidity-venues, pricers, and data-providers packages must not define or hardcode any configuration within their own packages. All configuration (parameters, addresses, venue/pricer ordering, chain settings) lives in `apps/config`. These packages may access config values by importing directly from `@morpho-blue-liquidation-bot/config` — this is the intended pattern, not a violation. If you need a new parameter, add it to the config types in `apps/config`. These packages may also read secrets (e.g. RPC URLs, API keys) directly from environment variables.
-- **Never push directly to `main`.** Always use feature branches and PRs.
+- **Use feature branches for major changes.** Create feature branches (e.g., `add-Compound-V3`) for significant features, then merge to `main`. For small fixes, direct pushes to `main` are acceptable.
 - **Always run tests after code changes.** Run the relevant test suite before considering work complete.
 - **Preserve venue/pricer ordering semantics.** The order of `liquidityVenues` and `pricers` arrays in config is significant — venues are tried sequentially and the first successful conversion wins. Pricers are tried in order and the first price found is used. **Pricers are mandatory** — if no pricers are configured, the bot refuses to execute any trade (cannot verify profitability). Set `ALWAYS_REALIZE_BAD_DEBT=true` only if you explicitly want to bypass profit checks for bad-debt positions.
 

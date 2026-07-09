@@ -1,6 +1,10 @@
+import { createRequire } from "node:module";
+
 import { DEPLOYMENTS } from "@morpho-blue-liquidation-bot/config";
 import { CommandType, RoutePlanner } from "@uniswap/universal-router-sdk";
-import { Actions, type PoolKey, V4Planner } from "@uniswap/v4-sdk";
+const require = createRequire(import.meta.url);
+const { Actions, V4Planner } = require("@uniswap/v4-sdk") as typeof import("@uniswap/v4-sdk");
+import type { PoolKey } from "@uniswap/v4-sdk";
 import type { ExecutorEncoder } from "executooor-viem";
 import {
   type Address,

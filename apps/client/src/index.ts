@@ -13,6 +13,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { watchBlocks } from "viem/actions";
 
 import { LiquidationBot, type LiquidationBotInputs } from "./bot";
+import { CometLiquidationBot } from "./cometBot";
 import {
   MarketsFetchingCooldownMechanism,
   PositionLiquidationCooldownMechanism,
@@ -134,6 +135,35 @@ export const launchBot = async (
   };
 
   startWatching();
+
+  // ─── Compound V3 Comet Bot (parallel to Morpho) ───
+
+  if (config.cometWatchlist?.enabled) {
+    try {
+      const cometBot = new CometLiquidationBot({
+        logTag: `[${config.chain.name} comet]: `,
+        client,
+        cometWatchlist: config.cometWatchlist,
+        executorAddress: config.executorAddress,
+        treasuryAddress,
+        liquidityVenues,
+        pricers,
+        wNative: config.wNative,
+        chainId: config.chainId,
+        positionLiquidationCooldownMechanism,
+        flashbotAccount,
+        useFlashLoan: config.useFlashLoan,
+        flashLoanProvider: config.flashLoanProvider,
+        alwaysRealizeBadDebt: ALWAYS_REALIZE_BAD_DEBT,
+      });
+
+      await cometBot.initialize();
+      cometBot.startPolling();
+      console.log(`${logTag}✅ Comet liquidation bot started`);
+    } catch (e) {
+      console.error(`${logTag}Failed to start Comet bot:`, e);
+    }
+  }
 
   return bot;
 };

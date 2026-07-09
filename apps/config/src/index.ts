@@ -2,7 +2,13 @@ import dotenv from "dotenv";
 import type { Address, Chain, Hex } from "viem";
 
 import { chainConfigs } from "./config";
-import type { ChainConfig, DataProviderName, LiquidityVenueName, PricerName } from "./types";
+import type {
+  ChainConfig,
+  CometWatchlistConfig,
+  DataProviderName,
+  LiquidityVenueName,
+  PricerName,
+} from "./types";
 
 dotenv.config();
 
@@ -57,6 +63,7 @@ export * from "./chains";
 export {
   chainConfigs,
   type ChainConfig,
+  type CometWatchlistConfig,
   type DataProviderName,
   type LiquidityVenueName,
   type PricerName,

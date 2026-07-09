@@ -105,6 +105,32 @@ export const chainConfigs: Record<number, Config> = {
       useFlashLoan: true, // SECURITY (M6): Flash loan 在公開 mempool 中可被 sandwich，已於 bot.ts 添加模擬利潤安全邊際
       flashLoanProvider: "balancer",
       treasuryAddress: "0x5faB997dd358c75680fF2b33E403aB81530fE30a",
+      cometWatchlist: {
+        enabled: true,
+        comets: [
+          {
+            address: "0xb125E6687d4313864e53df431d5425969c15Eb2F",
+            baseAsset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", // USDC
+            deployBlock: 11699480, // verified via binary search
+          },
+          {
+            address: "0x46e6b214b524310239732D51387075E0e70970bf",
+            baseAsset: "0x4200000000000000000000000000000000000006", // WETH
+            deployBlock: 2495303, // verified via binary search
+          },
+          {
+            address: "0x9c4ec768c28520B50860ea7a15bd7213a9fF58bf",
+            baseAsset: "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA", // USDbC
+            deployBlock: 2197588, // verified via binary search
+          },
+          {
+            address: "0x784efeB622244d2348d4F2522f8860B96fbEcE89",
+            baseAsset: "0x940181a94A35A4569E4529A3CDfB74e38FD98631", // AERO
+            deployBlock: 20852405, // verified via binary search
+          },
+        ],
+        pollIntervalBlocks: 5,
+      },
     },
   },
   [unichain.id]: {
