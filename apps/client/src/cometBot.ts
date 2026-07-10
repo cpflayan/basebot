@@ -27,7 +27,7 @@ import { readContract, watchBlocks, getBlockNumber, getCode } from "viem/actions
 import { base } from "viem/chains";
 
 import { BALANCER_VAULT_ADDRESS } from "./abis/BalancerVault.js";
-import { cometViewAbi } from "./abis/Comet.js";
+import { cometViewAbi, COMET_COLLATERAL_ASSETS } from "./abis/Comet.js";
 import { CometAccountRegistry } from "./cometAccountRegistry.js";
 import { PositionLiquidationCooldownMechanism } from "./utils/cooldownMechanisms.js";
 import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
@@ -284,6 +284,7 @@ export class CometLiquidationBot {
 
   /**
    * Cache the collateral assets for a Comet by reading numCollateralAssets + getCollateralAsset.
+   * Falls back to hardcoded list if on-chain call fails.
    */
   private async cacheCollateralAssets(comet: CometInfo): Promise<void> {
     try {
@@ -306,14 +307,23 @@ export class CometLiquidationBot {
 
       comet.collateralAssets = assets;
       console.log(
-        `${this.logTag}📋 ${comet.address.slice(0, 10)}... has ${assets.length} collateral asset(s)`,
+        `${this.logTag}📋 ${comet.address.slice(0, 10)}... has ${assets.length} collateral asset(s) (on-chain)`,
       );
     } catch (e) {
-      console.error(
-        `${this.logTag}Failed to cache collateral assets for ${comet.address.slice(0, 10)}...:`,
-        e,
-      );
-      comet.collateralAssets = [];
+      // Fallback to hardcoded list
+      const fallback = COMET_COLLATERAL_ASSETS[comet.address];
+      if (fallback && fallback.length > 0) {
+        comet.collateralAssets = fallback;
+        console.log(
+          `${this.logTag}⚠️ On-chain call failed, using hardcoded collateral list for ${comet.address.slice(0, 10)}... (${fallback.length} assets)`,
+        );
+      } else {
+        console.error(
+          `${this.logTag}Failed to cache collateral assets for ${comet.address.slice(0, 10)}...:`,
+          e,
+        );
+        comet.collateralAssets = [];
+      }
     }
   }
 
