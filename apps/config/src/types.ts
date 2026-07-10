@@ -40,6 +40,7 @@ export interface Options {
   flashLoanProvider?: FlashLoanProvider;
   cometWatchlist?: CometWatchlistConfig;
   moonwellWatchlist?: MoonwellWatchlistConfig;
+  aaveWatchlist?: AaveWatchlistConfig;
 }
 
 export interface CometWatchlistConfig {
@@ -64,6 +65,26 @@ export interface MoonwellWatchlistConfig {
     deployBlock: number;
   }[];
   pollIntervalBlocks?: number;
+  /** Safety margin above 1e18 to start evaluating — avoids wasting RPC calls on nearly-healthy accounts */
+  minHealthFactorBuffer?: bigint;
+  /** Slippage tolerance for DEX swaps in bps (default: 100 = 1%) */
+  slippageBps?: number;
+  /** Token addresses to skip during liquidation (blacklisted/depegged assets) */
+  tokenBlacklist?: Address[];
+}
+
+export interface AaveWatchlistConfig {
+  enabled: boolean;
+  poolAddress: Address;
+  poolDeployBlock: number;
+  reserves: Address[];
+  pollIntervalBlocks?: number;
+  /** Safety margin above 1e18 to start evaluating — avoids wasting RPC calls on nearly-healthy accounts */
+  minHealthFactorBuffer?: bigint;
+  /** Slippage tolerance for DEX swaps in bps (default: 100 = 1%) */
+  slippageBps?: number;
+  /** Token addresses to skip during liquidation (blacklisted/depegged assets) */
+  tokenBlacklist?: Address[];
 }
 
 export type ChainConfig = Omit<Config, "options"> &

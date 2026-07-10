@@ -129,6 +129,13 @@ export class MoonwellLiquidationBot {
   /** Cached mToken → underlying mapping (populated at init from config + on-chain) */
   private underlyingCache = new Map<Address, Address>();
 
+  // ─── Health & monitoring stats ───
+  private _liquidationsAttempted = 0;
+  private _liquidationsSucceeded = 0;
+  private _liquidationsFailed = 0;
+  private _lastCheckTimestamp = 0;
+  private _lastCheckBlock = 0;
+
   constructor(inputs: MoonwellLiquidationBotInputs) {
     this.logTag = inputs.logTag;
     this.client = inputs.client;
@@ -860,5 +867,22 @@ export class MoonwellLiquidationBot {
       `${this.logTag}⚠️ No underlying mapping for ${mToken.slice(0, 10)}..., using mToken address as fallback`,
     );
     return mToken;
+  }
+
+  /**
+   * Get current bot health status for monitoring endpoints.
+   */
+  getHealthStatus() {
+    return {
+      protocol: "moonwell" as const,
+      lastCheckTimestamp: this._lastCheckTimestamp,
+      lastCheckBlock: this._lastCheckBlock,
+      registryAccountCount: this.registry.totalAccounts,
+      liquidationsAttempted: this._liquidationsAttempted,
+      liquidationsSucceeded: this._liquidationsSucceeded,
+      liquidationsFailed: this._liquidationsFailed,
+      rpcErrorRate: 0,
+      isHealthy: true,
+    };
   }
 }

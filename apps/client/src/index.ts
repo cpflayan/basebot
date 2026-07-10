@@ -12,8 +12,10 @@ import { createWalletClient, Hex, http } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { watchBlocks } from "viem/actions";
 
+import { AaveLiquidationBot } from "./aaveBot";
 import { LiquidationBot, type LiquidationBotInputs } from "./bot";
 import { CometLiquidationBot } from "./cometBot";
+import { getHealthServer } from "./health";
 import { MoonwellLiquidationBot } from "./moonwellBot";
 import {
   MarketsFetchingCooldownMechanism,
@@ -190,8 +192,45 @@ export const launchBot = async (
       await moonwellBot.initialize();
       moonwellBot.startPolling();
       console.log(`${logTag}✅ Moonwell liquidation bot started`);
+
+      // Register Moonwell bot with health server
+      const healthServerMoonwell = getHealthServer();
+      healthServerMoonwell.registerBot("moonwell", () => moonwellBot.getHealthStatus());
     } catch (e) {
       console.error(`${logTag}Failed to start Moonwell bot:`, e);
+    }
+  }
+
+  // ─── Aave V3 Bot (parallel to Morpho + Comet + Moonwell) ───
+
+  if (config.aaveWatchlist?.enabled) {
+    try {
+      const aaveBot = new AaveLiquidationBot({
+        logTag: `[${config.chain.name} aave]: `,
+        client,
+        aaveWatchlist: config.aaveWatchlist,
+        executorAddress: config.executorAddress,
+        treasuryAddress,
+        liquidityVenues,
+        pricers,
+        wNative: config.wNative,
+        chainId: config.chainId,
+        positionLiquidationCooldownMechanism,
+        flashbotAccount,
+        useFlashLoan: config.useFlashLoan,
+        flashLoanProvider: config.flashLoanProvider,
+        alwaysRealizeBadDebt: ALWAYS_REALIZE_BAD_DEBT,
+      });
+
+      await aaveBot.initialize();
+      aaveBot.startPolling();
+      console.log(`${logTag}✅ Aave V3 liquidation bot started`);
+
+      // Register Aave bot with health server
+      const healthServer = getHealthServer();
+      healthServer.registerBot("aave", () => aaveBot.getHealthStatus());
+    } catch (e) {
+      console.error(`${logTag}Failed to start Aave bot:`, e);
     }
   }
 

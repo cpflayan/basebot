@@ -174,10 +174,10 @@ describe("Base chain flash loan liquidation - full path test", () => {
     async ({ encoder, client }) => {
       // Market parameters: WETH/USDC 86% LLTV
       const marketParams = {
-        loanToken: USDC_BASE,
-        collateralToken: WETH_BASE,
-        oracle: CHAINLINK_ORACLE_BASE,
-        irm: ADAPTIVE_CURVE_IRM_BASE,
+        loanToken: USDC_BASE as Address,
+        collateralToken: WETH_BASE as Address,
+        oracle: CHAINLINK_ORACLE_BASE as Address,
+        irm: ADAPTIVE_CURVE_IRM_BASE as Address,
         lltv: 860000000000000000n, // 0.86
       };
 

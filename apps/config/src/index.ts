@@ -4,6 +4,7 @@ import type { Address, Chain, Hex } from "viem";
 import { chainConfigs } from "./config";
 import type {
   ChainConfig,
+  AaveWatchlistConfig,
   CometWatchlistConfig,
   MoonwellWatchlistConfig,
   DataProviderName,
@@ -64,6 +65,7 @@ export * from "./chains";
 export {
   chainConfigs,
   type ChainConfig,
+  type AaveWatchlistConfig,
   type CometWatchlistConfig,
   type MoonwellWatchlistConfig,
   type DataProviderName,

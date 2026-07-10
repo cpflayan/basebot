@@ -23,13 +23,14 @@ import {
   createPublicClient,
   http,
 } from "viem";
-import { readContract, watchBlocks, getBlockNumber, getCode } from "viem/actions";
+import { readContract, watchBlocks } from "viem/actions";
 import { base } from "viem/chains";
 
 import { BALANCER_VAULT_ADDRESS } from "./abis/BalancerVault.js";
 import { cometViewAbi, COMET_COLLATERAL_ASSETS } from "./abis/Comet.js";
 import { CometAccountRegistry } from "./cometAccountRegistry.js";
 import { PositionLiquidationCooldownMechanism } from "./utils/cooldownMechanisms.js";
+import { findDeployBlock } from "./utils/findDeployBlock.js";
 import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
 import {
   type SharedExecutionDeps,
@@ -158,7 +159,12 @@ export class CometLiquidationBot {
       // Binary search to find exact deploy block (if not already scanned)
       const lastScanned = this.registry.getLastScannedBlock(comet.address);
       if (lastScanned === undefined) {
-        const deployBlock = await this.findDeployBlock(comet.address, comet.deployBlock);
+        const deployBlock = await findDeployBlock(
+          this.scanClient,
+          comet.address,
+          comet.deployBlock,
+          this.logTag,
+        );
         if (deployBlock !== undefined) {
           console.log(
             `${this.logTag}🔎 Binary search: ${comet.address.slice(0, 10)}... deployed at block ${deployBlock} (configured: ${comet.deployBlock})`,
@@ -183,103 +189,6 @@ export class CometLiquidationBot {
     console.log(
       `${this.logTag}🗄️ Comet registry initialized: ${this.registry.totalAccounts} total accounts across ${this.cometList.length} Comets`,
     );
-  }
-
-  /**
-   * Find the exact deployment block of a Comet contract using exponential search + binary search.
-   * Uses eth_getCode to check if the contract exists at a given block.
-   * Falls back to estimatedDeployBlock if search fails.
-   */
-  private async findDeployBlock(
-    cometAddress: Address,
-    estimatedBlock: number,
-  ): Promise<number | undefined> {
-    try {
-      const currentBlock = Number(await getBlockNumber(this.scanClient));
-
-      // Step 1: Check if contract exists at estimated block
-      let code = await getCode(this.scanClient, {
-        address: cometAddress,
-        blockNumber: BigInt(estimatedBlock),
-      });
-
-      let lo: number;
-      let hi: number;
-
-      if (code && code !== "0x") {
-        // Contract exists at estimated block — search backwards
-        hi = estimatedBlock;
-        lo = Math.max(0, estimatedBlock - 100_000);
-        let step = 100_000;
-
-        // Exponential expansion backwards
-        while (lo > 0) {
-          code = await getCode(this.scanClient, {
-            address: cometAddress,
-            blockNumber: BigInt(lo),
-          });
-          if (code && code !== "0x") {
-            hi = lo;
-            lo = Math.max(0, lo - step);
-            step *= 2;
-          } else {
-            break;
-          }
-        }
-      } else {
-        // Contract doesn't exist at estimated block — search forwards
-        lo = estimatedBlock;
-        hi = estimatedBlock;
-        let step = 100_000;
-        let found = false;
-
-        // Exponential expansion forwards
-        while (hi < currentBlock) {
-          hi += step;
-          step *= 2;
-          code = await getCode(this.scanClient, {
-            address: cometAddress,
-            blockNumber: BigInt(hi),
-          });
-          if (code && code !== "0x") {
-            found = true;
-            break;
-          }
-        }
-
-        if (!found) {
-          console.warn(
-            `${this.logTag}⚠️ Comet ${cometAddress.slice(0, 10)}... not found up to block ${hi}`,
-          );
-          return undefined;
-        }
-      }
-
-      // Step 2: Binary search in [lo, hi]
-      let searchLo = lo;
-      let searchHi = hi;
-      while (searchLo < searchHi) {
-        const mid = Math.floor((searchLo + searchHi) / 2);
-        const codeAtMid = await getCode(this.scanClient, {
-          address: cometAddress,
-          blockNumber: BigInt(mid),
-        });
-
-        if (codeAtMid && codeAtMid !== "0x") {
-          searchHi = mid;
-        } else {
-          searchLo = mid + 1;
-        }
-      }
-
-      return searchLo;
-    } catch (e) {
-      console.warn(
-        `${this.logTag}⚠️ Deploy block search failed for ${cometAddress.slice(0, 10)}..., using configured value:`,
-        e,
-      );
-      return undefined;
-    }
   }
 
   /**

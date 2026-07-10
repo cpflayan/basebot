@@ -2,6 +2,7 @@ import { ExecutorEncoder } from "executooor-viem";
 import type { Account, Address, Chain, Client, Hex, Transport } from "viem";
 import { encodeAbiParameters, encodeFunctionData } from "viem";
 
+import { aavePoolWriteAbi } from "../abis/AaveV3";
 import { cometViewAbi } from "../abis/Comet";
 import { mTokenAbi } from "../abis/Moonwell";
 import { preLiquidationAbi } from "../abis/PreLiquidation";
@@ -36,6 +37,36 @@ export class LiquidationEncoder<
         sender: preLiquidation,
         dataIndex: 1n, // onPreLiquidate(uint256,bytes)
       },
+    );
+  }
+
+  // ─── Aave V3 methods ───
+
+  /**
+   * Call Aave V3 Pool.liquidationCall() — repay a borrower's debt and seize their collateral.
+   * @param poolAddress - Aave V3 Pool contract address
+   * @param collateralAsset - the collateral asset to seize
+   * @param debtAsset - the debt asset to repay
+   * @param user - the underwater borrower address
+   * @param debtToCover - amount of debt to cover (in debt asset units)
+   * @param receiveAToken - whether to receive aTokens instead of underlying
+   */
+  public aaveLiquidationCall(
+    poolAddress: Address,
+    collateralAsset: Address,
+    debtAsset: Address,
+    user: Address,
+    debtToCover: bigint,
+    receiveAToken: boolean,
+  ) {
+    this.pushCall(
+      poolAddress,
+      0n,
+      encodeFunctionData({
+        abi: aavePoolWriteAbi,
+        functionName: "liquidationCall",
+        args: [collateralAsset, debtAsset, user, debtToCover, receiveAToken],
+      }),
     );
   }
 

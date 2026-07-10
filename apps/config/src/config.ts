@@ -244,6 +244,29 @@ export const chainConfigs: Record<number, Config> = {
         ],
         pollIntervalBlocks: 5,
       },
+      aaveWatchlist: {
+        enabled: false, // feature flag — set to true to enable Aave V3 liquidation bot
+        poolAddress: "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5",
+        poolDeployBlock: 2357134, // verified via binary search (eth_getCode)
+        reserves: [
+          "0x4200000000000000000000000000000000000006", // WETH
+          "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22", // cbETH
+          "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA", // USDbC
+          "0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452", // wstETH
+          "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", // USDC
+          "0x04C0599Ae5A44757c0af6F9eC3b93da8976c150A", // weETH
+          "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf", // cbBTC
+          "0x2416092f143378750bb29b79eD961ab195CcEea5", // ezETH
+          "0x6Bb7a212910682DCFdbd5BCBb3e28FB4E8da10Ee", // GHO
+          "0xEDfa23602D0EC14714057867A78d01e94176BEA0", // lbtc
+          "0xecAc9C5F704e954931349Da37F60E39f515c11c1", // rETH
+          "0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42", // EURC
+          "0x63706e401c06ac8513145b7687A14804d17f814b", // tBTC
+          "0x236aa50979D5f3De3Bd1Eeb40E81137F22ab794b", // xETH
+          "0x660975730059246A68521a3e2FBD4740173100f5", // rgUSD
+        ],
+        pollIntervalBlocks: 5,
+      },
     },
   },
   [unichain.id]: {
