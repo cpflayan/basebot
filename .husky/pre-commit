@@ -1,1 +1,1 @@
-cd morpho-blue-liquidation-bot && pnpm exec lint-staged
+npx lint-staged --config .lintstagedrc.json

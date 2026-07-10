@@ -131,6 +131,28 @@ export const chainConfigs: Record<number, Config> = {
         ],
         pollIntervalBlocks: 5,
       },
+      moonwellWatchlist: {
+        enabled: true,
+        comptroller: "0xfBb21d0380beE3312B33c4353c8936a0F13EF26C",
+        mTokens: [
+          {
+            address: "0xEdc817A28E8B93B03976FBd4a3dDBc9f7D176c22", // mUSDC
+            underlying: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", // USDC
+            deployBlock: 19_000_000, // Moonwell deployment on Base — approx Aug 2024
+          },
+          {
+            address: "0x628ff693426583D9a7FB391E54366292F509D457", // mWETH
+            underlying: "0x4200000000000000000000000000000000000006", // WETH
+            deployBlock: 19_000_000,
+          },
+          {
+            address: "0xF877ACaFA28c19b96727966690b2f44d35aD5976", // mcbBTC
+            underlying: "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf", // cbBTC
+            deployBlock: 19_000_000,
+          },
+        ],
+        pollIntervalBlocks: 5,
+      },
     },
   },
   [unichain.id]: {

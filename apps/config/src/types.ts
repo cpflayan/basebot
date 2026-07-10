@@ -39,6 +39,7 @@ export interface Options {
   useFlashLoan?: boolean;
   flashLoanProvider?: FlashLoanProvider;
   cometWatchlist?: CometWatchlistConfig;
+  moonwellWatchlist?: MoonwellWatchlistConfig;
 }
 
 export interface CometWatchlistConfig {
@@ -46,6 +47,20 @@ export interface CometWatchlistConfig {
   comets: {
     address: Address;
     baseAsset: Address;
+    deployBlock: number;
+  }[];
+  pollIntervalBlocks?: number;
+}
+
+export interface MoonwellWatchlistConfig {
+  enabled: boolean;
+  comptroller: Address;
+  mTokens: {
+    /** MToken (cToken) address */
+    address: Address;
+    /** Underlying token address */
+    underlying: Address;
+    /** Block number where the mToken was deployed */
     deployBlock: number;
   }[];
   pollIntervalBlocks?: number;

@@ -5,6 +5,7 @@ import { chainConfigs } from "./config";
 import type {
   ChainConfig,
   CometWatchlistConfig,
+  MoonwellWatchlistConfig,
   DataProviderName,
   LiquidityVenueName,
   PricerName,
@@ -64,6 +65,7 @@ export {
   chainConfigs,
   type ChainConfig,
   type CometWatchlistConfig,
+  type MoonwellWatchlistConfig,
   type DataProviderName,
   type LiquidityVenueName,
   type PricerName,

@@ -14,6 +14,7 @@ import { watchBlocks } from "viem/actions";
 
 import { LiquidationBot, type LiquidationBotInputs } from "./bot";
 import { CometLiquidationBot } from "./cometBot";
+import { MoonwellLiquidationBot } from "./moonwellBot";
 import {
   MarketsFetchingCooldownMechanism,
   PositionLiquidationCooldownMechanism,
@@ -162,6 +163,35 @@ export const launchBot = async (
       console.log(`${logTag}✅ Comet liquidation bot started`);
     } catch (e) {
       console.error(`${logTag}Failed to start Comet bot:`, e);
+    }
+  }
+
+  // ─── Moonwell (Compound V2) Bot (parallel to Morpho + Comet) ───
+
+  if (config.moonwellWatchlist?.enabled) {
+    try {
+      const moonwellBot = new MoonwellLiquidationBot({
+        logTag: `[${config.chain.name} moonwell]: `,
+        client,
+        moonwellWatchlist: config.moonwellWatchlist,
+        executorAddress: config.executorAddress,
+        treasuryAddress,
+        liquidityVenues,
+        pricers,
+        wNative: config.wNative,
+        chainId: config.chainId,
+        positionLiquidationCooldownMechanism,
+        flashbotAccount,
+        useFlashLoan: config.useFlashLoan,
+        flashLoanProvider: config.flashLoanProvider,
+        alwaysRealizeBadDebt: ALWAYS_REALIZE_BAD_DEBT,
+      });
+
+      await moonwellBot.initialize();
+      moonwellBot.startPolling();
+      console.log(`${logTag}✅ Moonwell liquidation bot started`);
+    } catch (e) {
+      console.error(`${logTag}Failed to start Moonwell bot:`, e);
     }
   }
 
