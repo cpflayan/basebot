@@ -57,6 +57,10 @@ const TOKEN_BLACKLIST = new Set<string>([
 /** mantissa 精度 (1e18) */
 const MANTISSA = 10n ** 18n;
 
+/** Simulation failure cooldown — skip accounts that repeatedly fail simulation */
+const MAX_SIMULATION_FAILURES = 3;
+const SIMULATION_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
+
 export interface MoonwellLiquidationBotInputs {
   logTag: string;
   client: WalletClient<Transport, Chain, Account>;
@@ -106,6 +110,21 @@ export class MoonwellLiquidationBot {
   /** Cached Comptroller params */
   private closeFactor = 0n;
   private liquidationIncentive = 0n;
+
+  /** Cached mToken → reserveFactor (for pre-filtering unprofitable markets) */
+  private reserveFactors = new Map<Address, bigint>();
+  /** mTokens excluded due to RF >= 99% — almost all liquidation bonus goes to protocol reserves */
+  private highRfMarkets = new Set<Address>();
+
+  /** Oracle feed timestamps — tracked to detect recent price updates */
+  private lastOracleUpdates = new Map<Address, bigint>();
+  /** mTokens whose oracle just updated in the last check cycle */
+  private hotMarkets = new Set<Address>();
+
+  /** Simulation failure tracking — accounts that fail simulation repeatedly are cooled down */
+  private simulationFailures = new Map<string, number>();
+  /** Cooldown expiry timestamps — accounts are skipped until this time */
+  private simulationCooldowns = new Map<string, number>();
 
   /** Cached mToken → underlying mapping (populated at init from config + on-chain) */
   private underlyingCache = new Map<Address, Address>();
@@ -169,6 +188,12 @@ export class MoonwellLiquidationBot {
 
     // Cache Comptroller global params
     await this.cacheComptrollerParams();
+
+    // Cache reserve factors and filter out high-RF markets
+    await this.cacheReserveFactors();
+
+    // Initialize oracle timestamp tracking
+    await this.initOracleTimestamps();
 
     // Discover underlying addresses on-chain for mTokens not in hardcoded map
     await this.discoverUnderlyings();
@@ -273,6 +298,47 @@ export class MoonwellLiquidationBot {
     }
   }
 
+  /**
+   * Cache reserveFactorMantissa for each mToken.
+   * Markets with RF >= 99% send nearly all liquidation rewards to protocol reserves,
+   * making them unprofitable for the bot. These are moved to highRfMarkets.
+   */
+  private async cacheReserveFactors(): Promise<void> {
+    const RF_THRESHOLD = 99n * 10n ** 16n; // 0.99e18 = 99%
+
+    const results = await Promise.allSettled(
+      this.mTokenList.map(async (mToken) => {
+        const rf = await readContract(this.client, {
+          address: mToken.address,
+          abi: mTokenAbi,
+          functionName: "reserveFactorMantissa",
+        });
+        return { mToken: mToken.address, rf };
+      }),
+    );
+
+    for (const result of results) {
+      if (result.status !== "fulfilled") continue;
+      const { mToken, rf } = result.value;
+      this.reserveFactors.set(mToken, rf);
+
+      if (rf >= RF_THRESHOLD) {
+        this.highRfMarkets.add(mToken);
+        console.log(
+          `${this.logTag}⏭️ ${mToken.slice(0, 10)}... excluded (RF=${Number(rf) / 1e16}%) — nearly all rewards go to reserves`,
+        );
+      }
+    }
+
+    // Filter mTokenList to only active (profitable) markets
+    const originalCount = this.mTokenList.length;
+    this.mTokenList = this.mTokenList.filter((m) => !this.highRfMarkets.has(m.address));
+
+    console.log(
+      `${this.logTag}📊 Reserve factors: ${this.mTokenList.length}/${originalCount} markets active, ${this.highRfMarkets.size} excluded (RF≥99%)`,
+    );
+  }
+
   // ─── Polling loop ───
 
   /**
@@ -323,6 +389,9 @@ export class MoonwellLiquidationBot {
       }
     }
 
+    // Detect oracle price updates — mark affected markets as "hot"
+    await this.detectOracleUpdates();
+
     // Collect all unique accounts across all mTokens
     const allAccounts = new Set<string>();
     for (const mToken of this.mTokenList) {
@@ -338,18 +407,31 @@ export class MoonwellLiquidationBot {
 
     if (liquidatable.length === 0) return;
 
-    console.log(`${this.logTag}🎯 ${liquidatable.length} liquidatable account(s) found!`);
+    // Sort: (1) hot market accounts first, (2) by shortfall descending
+    liquidatable.sort((a, b) => {
+      const aHot = this.isAccountInHotMarket(a.account) ? 0 : 1;
+      const bHot = this.isAccountInHotMarket(b.account) ? 0 : 1;
+      if (aHot !== bHot) return aHot - bHot;
+      return b.shortfall > a.shortfall ? 1 : b.shortfall < a.shortfall ? -1 : 0;
+    });
 
-    for (const account of liquidatable) {
+    const hotCount = liquidatable.filter((l) => this.isAccountInHotMarket(l.account)).length;
+    console.log(
+      `${this.logTag}🎯 ${liquidatable.length} liquidatable account(s) found! (${hotCount} in hot markets, sorted by priority)`,
+    );
+
+    for (const { account } of liquidatable) {
       await this.liquidateAccount(account);
     }
   }
 
   /**
    * Batch check getAccountLiquidity for multiple accounts.
-   * Returns accounts with shortfall > 0.
+   * Returns accounts with shortfall > 0, paired with their shortfall amount for sorting.
    */
-  private async batchCheckShortfall(accounts: Address[]): Promise<Address[]> {
+  private async batchCheckShortfall(
+    accounts: Address[],
+  ): Promise<{ account: Address; shortfall: bigint }[]> {
     const results = await Promise.allSettled(
       accounts.map(async (account) => {
         const [error, , shortfall] = await readContract(this.client, {
@@ -359,14 +441,21 @@ export class MoonwellLiquidationBot {
           args: [account],
         });
         // error === 0 means success, shortfall > 0 means liquidatable
-        return error === 0n && shortfall > 0n ? account : null;
+        return error === 0n && shortfall > 0n ? { account, shortfall } : null;
       }),
     );
 
     return results
-      .filter((r): r is PromiseFulfilledResult<Address | null> => r.status === "fulfilled")
+      .filter(
+        (
+          r,
+        ): r is PromiseFulfilledResult<{
+          account: Address;
+          shortfall: bigint;
+        } | null> => r.status === "fulfilled",
+      )
       .map((r) => r.value)
-      .filter((a): a is Address => a !== null);
+      .filter((a): a is { account: Address; shortfall: bigint } => a !== null);
   }
 
   // ─── Liquidation execution ───
@@ -377,57 +466,103 @@ export class MoonwellLiquidationBot {
       return;
     }
 
+    // Simulation failure cooldown — skip accounts that repeatedly fail simulation
+    const accountKey = account.toLowerCase();
+    const cooldownExpiry = this.simulationCooldowns.get(accountKey);
+    if (cooldownExpiry && Date.now() < cooldownExpiry) {
+      return; // Still in cooldown, skip silently
+    }
+    // Cooldown expired, clear it
+    if (cooldownExpiry) {
+      this.simulationCooldowns.delete(accountKey);
+      this.simulationFailures.set(accountKey, 0);
+    }
+
     console.log(`${this.logTag}  🎯 ${account} — attempting Moonwell liquidation`);
 
-    // Find borrow mToken (where account has debt) and collateral mToken (where account has supply)
-    const { borrowMToken, collateralMToken, borrowBalance } =
-      await this.findLiquidationTargets(account);
+    // Find all borrow positions, sorted by balance descending
+    const borrowPositions = await this.findAllBorrowPositions(account);
 
-    if (!borrowMToken || !collateralMToken) {
-      console.log(`${this.logTag}  ${account} — could not find borrow/collateral mToken, skipping`);
+    if (borrowPositions.length === 0) {
+      console.log(`${this.logTag}  ${account} — no borrow positions found, skipping`);
       return;
     }
 
-    const borrowUnderlying = this.getUnderlying(borrowMToken);
+    // Find best collateral (largest mToken balance)
+    const collateralMToken = await this.findBestCollateral(account);
+    if (!collateralMToken) {
+      console.log(`${this.logTag}  ${account} — no collateral found, skipping`);
+      return;
+    }
     const collateralUnderlying = this.getUnderlying(collateralMToken);
 
-    // SECURITY: Skip blacklisted tokens
-    if (
-      TOKEN_BLACKLIST.has(borrowUnderlying.toLowerCase()) ||
-      TOKEN_BLACKLIST.has(collateralUnderlying.toLowerCase())
-    ) {
-      console.log(`${this.logTag}  ⛔ Skip ${account}: blacklisted token`);
+    // SECURITY: Skip if collateral is blacklisted
+    if (TOKEN_BLACKLIST.has(collateralUnderlying.toLowerCase())) {
+      console.log(`${this.logTag}  ⛔ Skip ${account}: blacklisted collateral`);
       return;
     }
 
-    // Calculate repay amount: min(borrowBalance × closeFactor, availableBalance)
-    // For flash loan, availableBalance = flash loan amount (unlimited)
-    // So repayAmount = borrowBalance × closeFactor
-    const maxRepay = (borrowBalance * this.closeFactor) / MANTISSA;
-    if (maxRepay === 0n) {
-      console.log(`${this.logTag}  ${account} — maxRepay is 0, skipping`);
-      return;
+    // Try each borrow position (sorted by balance) until one succeeds
+    for (const { borrowMToken, borrowBalance } of borrowPositions) {
+      const borrowUnderlying = this.getUnderlying(borrowMToken);
+
+      // Skip blacklisted borrow tokens
+      if (TOKEN_BLACKLIST.has(borrowUnderlying.toLowerCase())) {
+        continue;
+      }
+
+      // Skip if borrow and collateral are the same market (can't seize what you owe)
+      if (borrowMToken.toLowerCase() === collateralMToken.toLowerCase()) {
+        continue;
+      }
+
+      const maxRepay = (borrowBalance * this.closeFactor) / MANTISSA;
+      if (maxRepay === 0n) continue;
+
+      try {
+        if (this.useFlashLoan) {
+          await this.liquidateWithFlashLoan(
+            account,
+            borrowMToken,
+            collateralMToken,
+            borrowUnderlying,
+            collateralUnderlying,
+            maxRepay,
+          );
+        } else {
+          await this.liquidateDirect(
+            account,
+            borrowMToken,
+            collateralMToken,
+            borrowUnderlying,
+            collateralUnderlying,
+            maxRepay,
+          );
+        }
+        // Success — reset failure counter and stop trying other borrow positions
+        this.simulationFailures.set(accountKey, 0);
+        return;
+      } catch (error) {
+        console.warn(
+          `${this.logTag}  ⚠️ Liquidation via ${borrowMToken.slice(0, 10)}... failed, trying next borrow...`,
+          error,
+        );
+      }
     }
 
-    if (this.useFlashLoan) {
-      await this.liquidateWithFlashLoan(
-        account,
-        borrowMToken,
-        collateralMToken,
-        borrowUnderlying,
-        collateralUnderlying,
-        maxRepay,
-      );
-    } else {
-      await this.liquidateDirect(
-        account,
-        borrowMToken,
-        collateralMToken,
-        borrowUnderlying,
-        collateralUnderlying,
-        maxRepay,
+    // All borrow positions exhausted — record failure
+    const failures = (this.simulationFailures.get(accountKey) ?? 0) + 1;
+    this.simulationFailures.set(accountKey, failures);
+
+    if (failures >= MAX_SIMULATION_FAILURES) {
+      const cooldownUntil = Date.now() + SIMULATION_COOLDOWN_MS;
+      this.simulationCooldowns.set(accountKey, cooldownUntil);
+      console.warn(
+        `${this.logTag}  ⏸️ ${account} — ${failures} consecutive simulation failures, cooling down for ${SIMULATION_COOLDOWN_MS / 1000}s`,
       );
     }
+
+    console.log(`${this.logTag}  ${account} — all borrow positions exhausted, skipping`);
   }
 
   /**
@@ -570,58 +705,145 @@ export class MoonwellLiquidationBot {
   // ─── Helpers ───
 
   /**
-   * Find which mToken the account has borrowed and which has the most collateral.
-   * Returns borrow mToken, collateral mToken, and the borrow balance.
+   * Find ALL borrow positions for an account, sorted by balance descending.
+   * Returns array of { borrowMToken, borrowBalance } — caller tries each until one succeeds.
    */
-  private async findLiquidationTargets(account: Address): Promise<{
-    borrowMToken: Address | null;
-    collateralMToken: Address | null;
-    borrowBalance: bigint;
-  }> {
-    let borrowMToken: Address | null = null;
-    let borrowBalance = 0n;
-    let collateralMToken: Address | null = null;
-    let maxCollateralBalance = 0n;
-
-    // Check all mTokens in parallel
+  private async findAllBorrowPositions(
+    account: Address,
+  ): Promise<{ borrowMToken: Address; borrowBalance: bigint }[]> {
     const results = await Promise.allSettled(
       this.mTokenList.map(async (mToken) => {
-        const [borrowBal, mTokenBal] = await Promise.all([
-          readContract(this.client, {
-            address: mToken.address,
-            abi: mTokenAbi,
-            functionName: "borrowBalanceStored",
-            args: [account],
-          }),
-          readContract(this.client, {
-            address: mToken.address,
-            abi: mTokenAbi,
-            functionName: "balanceOf",
-            args: [account],
-          }),
-        ]);
-        return { mToken: mToken.address, borrowBal, mTokenBal };
+        const borrowBal = await readContract(this.client, {
+          address: mToken.address,
+          abi: mTokenAbi,
+          functionName: "borrowBalanceStored",
+          args: [account],
+        });
+        return { borrowMToken: mToken.address, borrowBalance: borrowBal };
+      }),
+    );
+
+    return results
+      .filter(
+        (r): r is PromiseFulfilledResult<{ borrowMToken: Address; borrowBalance: bigint }> =>
+          r.status === "fulfilled" && r.value.borrowBalance > 0n,
+      )
+      .map((r) => r.value)
+      .sort((a, b) =>
+        b.borrowBalance > a.borrowBalance ? 1 : b.borrowBalance < a.borrowBalance ? -1 : 0,
+      );
+  }
+
+  /**
+   * Find the best collateral mToken (largest balance) for an account.
+   */
+  private async findBestCollateral(account: Address): Promise<Address | null> {
+    let bestMToken: Address | null = null;
+    let maxBalance = 0n;
+
+    const results = await Promise.allSettled(
+      this.mTokenList.map(async (mToken) => {
+        const bal = await readContract(this.client, {
+          address: mToken.address,
+          abi: mTokenAbi,
+          functionName: "balanceOf",
+          args: [account],
+        });
+        return { mToken: mToken.address, balance: bal };
       }),
     );
 
     for (const result of results) {
       if (result.status !== "fulfilled") continue;
-      const { mToken, borrowBal, mTokenBal } = result.value;
-
-      // Find borrow mToken (first one with debt)
-      if (borrowBal > 0n && borrowMToken === null) {
-        borrowMToken = mToken;
-        borrowBalance = borrowBal;
-      }
-
-      // Find collateral mToken (largest mToken balance)
-      if (mTokenBal > maxCollateralBalance) {
-        maxCollateralBalance = mTokenBal;
-        collateralMToken = mToken;
+      if (result.value.balance > maxBalance) {
+        maxBalance = result.value.balance;
+        bestMToken = result.value.mToken;
       }
     }
 
-    return { borrowMToken, collateralMToken, borrowBalance };
+    return bestMToken;
+  }
+
+  /**
+   * Check if an account has a position in any hot market.
+   */
+  private isAccountInHotMarket(account: Address): boolean {
+    if (this.hotMarkets.size === 0) return false;
+    const lowerAccount = account.toLowerCase();
+    // An account is "hot" if it has any position (borrow or collateral) in a hot market
+    for (const hotMToken of this.hotMarkets) {
+      const accounts = this.registry.getAccounts(hotMToken);
+      if (accounts.some((a) => a.toLowerCase() === lowerAccount)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Initialize oracle timestamp tracking for all active markets.
+   * Records baseline exchange rates for detecting changes in subsequent checks.
+   */
+  private async initOracleTimestamps(): Promise<void> {
+    const results = await Promise.allSettled(
+      this.mTokenList.map(async (mToken) => {
+        const exchangeRate = await readContract(this.client, {
+          address: mToken.address,
+          abi: mTokenAbi,
+          functionName: "exchangeRateStored",
+        });
+        return { mToken: mToken.address, exchangeRate };
+      }),
+    );
+
+    for (const result of results) {
+      if (result.status === "fulfilled") {
+        this.lastOracleUpdates.set(result.value.mToken, result.value.exchangeRate);
+      }
+    }
+
+    console.log(
+      `${this.logTag}📡 Oracle tracking initialized: ${this.lastOracleUpdates.size} market(s) baseline recorded`,
+    );
+  }
+
+  /**
+   * Detect oracle price updates since last check.
+   * Markets with updated prices are marked as "hot" for priority processing.
+   */
+  private async detectOracleUpdates(): Promise<void> {
+    this.hotMarkets.clear();
+
+    // Simple heuristic: check if any market's exchange rate changed since last check
+    // This is more reliable than trying to read oracle feeds directly
+    const results = await Promise.allSettled(
+      this.mTokenList.map(async (mToken) => {
+        const exchangeRate = await readContract(this.client, {
+          address: mToken.address,
+          abi: mTokenAbi,
+          functionName: "exchangeRateStored",
+        });
+        return { mToken: mToken.address, exchangeRate };
+      }),
+    );
+
+    // Compare with cached values — if exchange rate changed, the oracle likely updated
+    for (const result of results) {
+      if (result.status !== "fulfilled") continue;
+      const { mToken, exchangeRate } = result.value;
+      const lastRate = this.lastOracleUpdates.get(mToken);
+
+      if (lastRate !== undefined && lastRate !== exchangeRate) {
+        // Exchange rate changed — this market is "hot"
+        this.hotMarkets.add(mToken);
+      }
+
+      this.lastOracleUpdates.set(mToken, exchangeRate);
+    }
+
+    if (this.hotMarkets.size > 0) {
+      console.log(
+        `${this.logTag}🔥 ${this.hotMarkets.size} hot market(s) detected (exchange rate changed since last check)`,
+      );
+    }
   }
 
   /**
