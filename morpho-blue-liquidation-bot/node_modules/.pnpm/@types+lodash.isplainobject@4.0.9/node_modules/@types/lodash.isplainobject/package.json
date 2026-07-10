@@ -1,0 +1,32 @@
+{
+    "name": "@types/lodash.isplainobject",
+    "version": "4.0.9",
+    "description": "TypeScript definitions for lodash.isplainobject",
+    "homepage": "https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/lodash.isplainobject",
+    "license": "MIT",
+    "contributors": [
+        {
+            "name": "Brian Zengel",
+            "githubUsername": "bczengel",
+            "url": "https://github.com/bczengel"
+        },
+        {
+            "name": "Ilya Mochalov",
+            "githubUsername": "chrootsu",
+            "url": "https://github.com/chrootsu"
+        }
+    ],
+    "main": "",
+    "types": "index.d.ts",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/DefinitelyTyped/DefinitelyTyped.git",
+        "directory": "types/lodash.isplainobject"
+    },
+    "scripts": {},
+    "dependencies": {
+        "@types/lodash": "*"
+    },
+    "typesPublisherContentHash": "d6640f0eb9048dd7d406c1be667ed7f6c752f4b948c4a6f811656329345d63d1",
+    "typeScriptVersion": "4.5"
+}

@@ -1,0 +1,17 @@
+import { TypedDataDomain, TypedDataField } from '@ethersproject/abstract-signer';
+export declare const EIP712_DOMAIN_NAME = "UniversalRouter";
+export declare const EIP712_DOMAIN_VERSION = "2";
+export declare const EXECUTE_SIGNED_TYPES: Record<string, TypedDataField[]>;
+/**
+ * Generate EIP712 domain for Universal Router
+ */
+export declare function getUniversalRouterDomain(chainId: number, verifyingContract: string): TypedDataDomain;
+/**
+ * Generate a random nonce for signed execution
+ * Uses ethers.utils.randomBytes for secure randomness
+ */
+export declare function generateNonce(): string;
+/**
+ * Sentinel value to skip nonce checking (allows signature replay)
+ */
+export declare const NONCE_SKIP_CHECK: string;

@@ -1,1 +1,1 @@
-pnpm exec lint-staged
+cd morpho-blue-liquidation-bot && pnpm exec lint-staged

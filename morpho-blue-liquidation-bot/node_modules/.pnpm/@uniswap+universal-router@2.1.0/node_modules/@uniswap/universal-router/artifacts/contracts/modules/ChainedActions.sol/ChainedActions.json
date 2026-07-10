@@ -1,0 +1,34 @@
+{
+  "_format": "hh-sol-artifact-1",
+  "contractName": "ChainedActions",
+  "sourceName": "contracts/modules/ChainedActions.sol",
+  "abi": [
+    {
+      "inputs": [],
+      "name": "InsufficientETH",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "InsufficientToken",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "SPOKE_POOL",
+      "outputs": [
+        {
+          "internalType": "contract IV3SpokePool",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    }
+  ],
+  "bytecode": "0x",
+  "deployedBytecode": "0x",
+  "linkReferences": {},
+  "deployedLinkReferences": {}
+}
