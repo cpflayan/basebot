@@ -1,9 +1,15 @@
 # Base Liquidation Bot — Architecture
 
-Multi-chain liquidation system for **Morpho Blue** and **Compound V3 (Comet)** lending protocols. Consists of two projects:
+Multi-protocol, multi-chain liquidation system for three lending protocols:
+
+1. **Morpho Blue** — Isolated lending markets with oracle-based pricing
+2. **Compound V3 (Comet)** — Single borrowing market per Comet with absorb + buyCollateral
+3. **Moonwell (Compound V2)** — Fork of Compound V2 with liquidateBorrow + redeemUnderlying
+
+Consists of two projects:
 
 1. **`morpho-blue-liquidation-bot`** — Executes profitable liquidations via on-chain executor contracts
-2. **`morpho-liquidation-discovery`** — Scans and validates markets, generates whitelist for the bot
+2. **`morpho-liquidation-discovery`** — Scans and validates Morpho markets, generates whitelist for the bot
 
 ## Architecture
 
@@ -24,49 +30,105 @@ Workspace monorepo with six packages:
 - **Factories** (`apps/data-providers/src/factory.ts`, `apps/liquidity-venues/src/factory.ts`, `apps/pricers/src/factory.ts`) — Map config string identifiers to class instances. The config package exports only string names; the implementation packages own the classes. The data provider factory (`createDataProviders`) takes chain IDs and returns a `Map<number, DataProvider>` with a shared instance.
 - **`LiquidationBot`** (`apps/client/src/bot.ts`) — Core Morpho Blue orchestrator. Fetches markets, finds liquidatable positions, encodes liquidation calldata, simulates, checks profitability, and executes. Supports both direct and flash-loan-backed liquidation paths, and an event-driven fast path via webhook events.
 - **`CometLiquidationBot`** (`apps/client/src/cometBot.ts`) — Compound V3 orchestrator. Runs in parallel with `LiquidationBot`. Uses `Comet.isLiquidatable()` to check accounts, executes via `absorb` + `buyCollateral` with optional flash loan support. Shares liquidity venues, pricers, and execution utilities with the Morpho bot.
+- **`MoonwellLiquidationBot`** (`apps/client/src/moonwellBot.ts`) — Moonwell (Compound V2) orchestrator. Runs in parallel with Morpho and Comet bots. Uses `Comptroller.getAccountLiquidity()` to detect shortfall, executes via `liquidateBorrow` + `redeemUnderlying` with optional flash loan support. Key difference from Comet: no absorb step needed — `liquidateBorrow` directly seizes collateral mTokens, which must be redeemed via `redeemUnderlying` before DEX swap.
 - **`CometAccountRegistry`** (`apps/client/src/cometAccountRegistry.ts`) — Account discovery module for Compound V3. Scans `SupplyCollateral`/`WithdrawCollateral` events to build a deduplicated account list per Comet. Persists state to JSON for incremental scanning across restarts.
+- **`MoonwellAccountRegistry`** (`apps/client/src/moonwellAccountRegistry.ts`) — Account discovery module for Moonwell. Scans `Borrow`/`LiquidateBorrow` events to build a deduplicated account list per mToken. Persists state to JSON for incremental scanning across restarts. Key difference from Comet registry: tracks per-mToken (not per-Comet), focuses on borrowers since only they can be liquidated.
+- **`SharedExecution`** (`apps/client/src/utils/sharedExecution.ts`) — Shared execution utilities used by Comet and Moonwell bots. Extracted from `bot.ts` to avoid duplication. Provides: `SharedExecutionDeps` (dependency injection type), `checkProfit` (USD profitability verification), `convertCollateralToLoan` (DEX swap with encoder snapshot/restore), `simulateAndExecFlashLoan` (flash loan simulation + slippage margin + execution), `simulateAndExec` (direct path simulation + execution).
 - **`LiquidationEncoder`** (`apps/client/src/utils/LiquidationEncoder.ts`) — Builds batched calldata for the on-chain executor contract. Extends `ExecutorEncoder` with pre-liquidation support.
-- **`PositionCache`** (`apps/client/src/positionCache.ts`) — In-memory cache for positions and market state. Enables the event-driven fast path: events update cache incrementally, fresh oracle prices are fetched on demand, and HF is recalculated to identify at-risk positions without a full API round-trip.
-- **`WebhookServer`** (`apps/client/src/webhook.ts`) — Fastify HTTP server that receives Alchemy webhook POST payloads, decodes MorphoBlue events from logs, and triggers `handleEvents()` on all registered bots for event-driven liquidation.
-- **`HealthServer`** (`apps/client/src/health.ts`) — Singleton Fastify server exposing a `/health` endpoint for container orchestration and monitoring.
+- **`PositionCache`** (`apps/client/src/positionCache.ts`) — In-memory cache for Morpho positions and market state. Enables the event-driven fast path: events update cache incrementally, fresh oracle prices are fetched on demand, and HF is recalculated to identify at-risk positions without a full API round-trip. Uses `@morpho-org/blue-sdk` `Market` and `AccrualPosition` for accurate HF computation.
+- **`WebhookServer`** (`apps/client/src/webhook.ts`) — Fastify HTTP server that receives Alchemy webhook POST payloads, decodes MorphoBlue events from logs, and triggers `handleEvents()` on all registered bots for event-driven liquidation. Supports 6 event types: `Borrow`, `WithdrawCollateral`, `Withdraw`, `SupplyCollateral`, `Repay`, `Liquidate`. Includes a 2-second cooldown to prevent rapid re-triggering.
+- **`HealthServer`** (`apps/client/src/health.ts`) — Singleton Fastify server exposing a `/health` endpoint for container orchestration and monitoring. Binds to `127.0.0.1` by default for security.
 
 ### Flow
 
+All three bots run in parallel within a single process, sharing infrastructure (liquidity venues, pricers, executor contract, treasury).
+
 1. Config defines which chains, data provider, vaults, venues, and pricers to use
-2. `script.ts` starts the `HealthServer` (liveness probe) and `WebhookServer` (Alchemy event-driven triggering)
-3. `script.ts` reads all chain configs, groups chains by data provider, creates shared providers (awaiting `init()` for backfill), then launches one bot per chain
-4. Each bot initializes its `PositionCache`: fetches covered markets (vault whitelist + discovery-layer approved markets) and caches liquidatable positions + market state from the data provider
-5. **Slow path** (block-watcher loop): `watchBlocks` triggers `bot.run()` at configured `blockInterval` — fetches fresh liquidatable positions from the data provider, updates cache, and attempts liquidation
-6. **Fast path** (event-driven): Alchemy webhook → `WebhookServer` decodes MorphoBlue events → `handleEvents()` updates cache incrementally, fetches fresh oracle prices, recalculates HF, and triggers liquidation for newly at-risk positions
-7. For each liquidatable position: try liquidity venues in order to convert collateral → loan token (with encoder state snapshot/restore on failure)
-8. Simulate the full liquidation via `simulateCalls`, check profitability via pricers (profit must exceed gas costs)
-9. Execute via `writeContract` or Flashbots bundle (mainnet only)
-10. **Flash loan path** (optional): when `useFlashLoan` is enabled, the bot uses a Balancer V2 flash loan (0% fee) to borrow loan tokens, liquidate the position, swap seized collateral via DEX, repay the flash loan, and skim profit to treasury — all within a single executor transaction. A slippage safety margin protects against sandwich attacks between simulation and execution.
+2. `script.ts` starts the `HealthServer` (liveness probe on port 3000) and `WebhookServer` (Alchemy event-driven triggering on port 3001)
+3. `script.ts` reads all chain configs, groups chains by data provider, creates shared providers (awaiting `init()` for backfill), then launches one bot per chain via `launchBot()`
+4. `launchBot()` in `index.ts` creates the Morpho `LiquidationBot`, and conditionally starts `CometLiquidationBot` and `MoonwellLiquidationBot` if their watchlists are enabled
+
+#### Morpho Blue Bot Flow
+
+5. Each Morpho bot initializes its `PositionCache`: fetches covered markets (vault whitelist + discovery-layer approved markets) and caches liquidatable positions + market state from the data provider
+6. **Slow path** (block-watcher loop): `watchBlocks` triggers `bot.run()` at configured `blockInterval` — fetches fresh liquidatable positions from the data provider, updates cache, and attempts liquidation
+7. **Fast path** (event-driven): Alchemy webhook → `WebhookServer` decodes MorphoBlue events → `handleEvents()` updates cache incrementally, fetches fresh oracle prices, recalculates HF, and triggers liquidation for newly at-risk positions
+8. For each liquidatable position: try liquidity venues in order to convert collateral → loan token (with encoder state snapshot/restore on failure)
+9. Simulate the full liquidation via `simulateCalls`, check profitability via pricers (profit must exceed gas costs)
+10. Execute via `writeContract` or Flashbots bundle (mainnet only)
+11. **Flash loan path** (optional): when `useFlashLoan` is enabled, the bot uses a Balancer V2 flash loan (0% fee) to borrow loan tokens, liquidate the position, swap seized collateral via DEX, repay the flash loan, and skim profit to treasury — all within a single executor transaction. A slippage safety margin protects against sandwich attacks between simulation and execution.
 
 ### Compound V3 (Comet) Flow
 
 The `CometLiquidationBot` runs in parallel with the Morpho `LiquidationBot`, sharing infrastructure (liquidity venues, pricers, executor, treasury).
 
-1. **Account Discovery** (`CometAccountRegistry`):
-   - On first startup: exponential search + binary search via `eth_getCode` to find exact Comet deploy blocks
-   - Historical scan: scans `SupplyCollateral`/`WithdrawCollateral` events from deploy block to current, using Base public RPC (10k blocks per batch)
-   - Persists accounts + `lastScannedBlock` to `./data/comet-accounts.<chainId>.json`
-   - On restart: loads JSON, only scans new blocks (incremental)
+### Account Discovery (`CometAccountRegistry`)
 
-2. **Polling Loop**:
-   - `watchBlocks` triggers periodic checks at configured `pollIntervalBlocks` (default: 5 blocks)
-   - Each cycle: incremental event scan → batch `isLiquidatable()` checks → trigger liquidations
+- On first startup: exponential search + binary search via `eth_getCode` to find exact Comet deploy blocks
+- Historical scan: scans `SupplyCollateral`/`WithdrawCollateral` events from deploy block to current, using Base public RPC (10k blocks per batch)
+- Persists accounts + `lastScannedBlock` to `./data/comet-accounts.<chainId>.json`
+- On restart: loads JSON, only scans new blocks (incremental)
+- Fallback: if event-specific log filter fails, uses broad log scan to capture all interaction types
 
-3. **Liquidation Execution**:
-   - For each liquidatable account: estimate debt via `userBasic` + `totalsBasic`
-   - **Flash loan path**: Balancer flash loan → ERC20 approve → `Comet.absorb(executor, [accounts])` → `Comet.buyCollateral(asset, minAmount, baseAmount, executor)` → DEX swap seized collateral → repay flash loan → skim profit
-   - **Direct path**: when flash loan is disabled or debt is too small
-   - Profit check: collateral value must exceed debt + gas + slippage margin
-   - Execution via `simulateAndExecFlashLoan` (shared with Morpho bot)
+### Polling Loop
 
-4. **Dual-RPC Architecture**:
-   - **Historical scanning**: Base public RPC (`https://mainnet.base.org`) — supports 10k block `eth_getLogs`, free, no API key
-   - **Trading + incremental**: Alchemy RPC (configured via `RPC_URL_8453`) — reliable for writes and small-range queries
+- `watchBlocks` triggers periodic checks at configured `pollIntervalBlocks` (default: 5 blocks)
+- Each cycle: incremental event scan → batch `isLiquidatable()` checks (via `Promise.allSettled`) → trigger liquidations
+- Overlapping runs prevented by `running` flag
+
+### Liquidation Execution
+
+- For each liquidatable account: estimate debt via `userBasic` + `totalsBasic` (borrow balance = |principal| × baseBorrowIndex / 1e15)
+- **Flash loan path**: Balancer flash loan → ERC20 approve → `Comet.absorb(executor, [accounts])` → `Comet.buyCollateral(asset, minAmount, baseAmount, executor)` for each collateral with reserves → DEX swap seized non-base collateral → repay flash loan → skim profit
+- **Direct path**: when flash loan is disabled — same flow but without Balancer wrapper
+- Profit check: via `simulateAndExecFlashLoan` / `simulateAndExec` from `sharedExecution.ts` — treasury balance change must exceed gas cost + slippage margin
+- Collateral assets cached at startup via `numCollateralAssets()` + `getCollateralAsset()`, with hardcoded fallback
+
+### Dual-RPC Architecture
+
+- **Historical scanning**: Base public RPC (`https://mainnet.base.org`) — supports 10k block `eth_getLogs`, free, no API key
+- **Trading + incremental**: Alchemy RPC (configured via `RPC_URL_8453`) — reliable for writes and small-range queries
+
+## Moonwell (Compound V2) Flow
+
+The `MoonwellLiquidationBot` runs in parallel with Morpho and Comet bots, sharing the same infrastructure.
+
+### Key Differences from Comet (V3)
+
+| Aspect | Comet (V3) | Moonwell (V2) |
+|--------|-----------|---------------|
+| Liquidation check | `Comet.isLiquidatable(account)` | `Comptroller.getAccountLiquidity(account)` → shortfall > 0 |
+| Seize collateral | `absorb()` then `buyCollateral()` | `liquidateBorrow()` directly seizes mToken |
+| Collateral form after seize | Underlying tokens | mTokens (must `redeemUnderlying()` to get underlying) |
+| Repay amount | Full debt | min(borrowBalance × closeFactor, available) |
+| Account discovery events | `SupplyCollateral` / `WithdrawCollateral` | `Borrow` / `LiquidateBorrow` |
+| Registry granularity | Per-Comet | Per-mToken |
+
+### Account Discovery (`MoonwellAccountRegistry`)
+
+- Scans `Borrow` events per mToken to discover accounts with debt
+- Batch size: 10,000 blocks per `eth_getLogs` call (Base public RPC limit)
+- Persists to `./data/moonwell-accounts.<chainId>.json`
+- Incremental scanning on restart (only new blocks since last scan)
+- Fallback: broad log scan if event-specific filter fails
+
+### Polling Loop
+
+- `watchBlocks` triggers at `pollIntervalBlocks` (default: 5 blocks)
+- Each cycle: incremental scan across all mTokens → collect unique accounts → batch `getAccountLiquidity()` checks → trigger liquidations for accounts with shortfall > 0
+
+### Liquidation Execution
+
+- **Target selection**: `findLiquidationTargets()` reads `borrowBalanceStored` + `balanceOf` for all mTokens in parallel — finds the first mToken with debt (borrow target) and the mToken with largest mToken balance (collateral target)
+- **Repay amount**: `borrowBalance × closeFactor / 1e18` (closeFactor cached from Comptroller at startup, default 50%)
+- **Comptroller params**: `closeFactorMantissa` and `liquidationIncentiveMantissa` cached at startup with hardcoded fallback (50% / 10%)
+- **Flash loan path**: Balancer flash loan → approve borrow mToken → `liquidateBorrow(borrowMToken, collateralMToken, account, repayAmount)` → `redeemUnderlying(collateralMToken, 0n)` to convert seized mToken to underlying → DEX swap collateral underlying → borrow underlying (if different tokens) → skim profit → auto-repay Balancer
+- **Direct path**: same flow without Balancer wrapper
+- Profit check: via shared `simulateAndExecFlashLoan` / `simulateAndExec`
+
+### Token Blacklist
+
+All three bots independently maintain a `TOKEN_BLACKLIST` (currently USR at `0x35e5db674d8e93a03d814fa0ada70731efe8a4b9`). Markets involving blacklisted tokens are skipped entirely.
 
 ## Compound V3 Configuration
 
@@ -94,6 +156,50 @@ cometWatchlist: {
 | AERO | `0x784efeB622244d2348d4F2522f8860B96fbEcE89` | `0x940181a94A35A4569E4529A3CDfB74e38FD98631` | 20,852,405 |
 
 Deploy blocks are verified via binary search on startup. If the configured value is incorrect, the bot automatically finds the exact block using exponential search + `eth_getCode`.
+
+## Moonwell Configuration
+
+Moonwell markets are configured in `apps/config/src/config.ts` under `options.moonwellWatchlist`:
+
+```typescript
+moonwellWatchlist: {
+  enabled: boolean;
+  comptroller: Address;     // Moonwell Comptroller address
+  mTokens: {
+    address: Address;       // mToken (cToken) contract address
+    underlying: Address;    // Underlying token address
+    deployBlock: number;    // Block number where the mToken was deployed
+  }[];
+  pollIntervalBlocks?: number;  // Polling frequency (default: 5)
+}
+```
+
+### Base Chain Moonwell mTokens (Dynamic — Verified On-Chain)
+
+Moonwell Core is a **shared pool** (Compound V2 style) — all assets share one Comptroller, any asset can be collateral to borrow any other asset. Not paired markets.
+
+All markets have `protocolSeizeShareMantissa = 3%` — 3% of seized collateral goes to protocol reserves.
+
+**The complete market list is NOT hardcoded here.** CF and RF values change via governance. Use the scan script to get ground truth:
+
+```bash
+RPC_URL=https://base-mainnet.g.alchemy.com/v2/<key> node scripts/moonwell-markets-scan.mjs
+```
+
+This script calls `Comptroller.getAllMarkets()` and reads per-market: `underlying()`, `symbol()`, `decimals()`, `reserveFactorMantissa()`, `protocolSeizeShareMantissa()`, `Comptroller.markets()` for CF, and binary-searches `eth_getCode` for deploy blocks. It also classifies each market's oracle type via OEV probe (see below). Output includes config-ready snippets for `config.ts`.
+
+The bot also discovers markets dynamically at startup — `moonwellBot.ts` calls `discoverUnderlyings()` to cache all `mToken.underlying()` addresses, and reads `Comptroller.getCloseFactor()` / `liquidationIncentiveMantissa()` once at init. Per-market CF is read via `Comptroller.markets(mToken)` during health factor calculation.
+
+Comptroller: `0xfBb21d0380beE3312B33c4353c8936a0F13EF26C`
+
+**ABI note**: Moonwell V2 `Comptroller.markets(address)` returns `(bool isListed, uint256 collateralFactorMantissa)` — only 2 fields, NOT the standard Compound V2 3-field `(bool, uint256, bool)` format. Using the wrong ABI causes `buffer overrun` decoding errors.
+
+**OEV classification** (probe via `maxRoundDelay()` on ChainlinkOracle.getFeed() result):
+- 🟢 **OEV-wrapped** (15 markets): Most markets use OEV wrappers — liquidation profits are partially captured by the wrapper's `liquidatorFeeBps`, reducing bot profitability
+- ⚪ **Traditional** (6 markets): mcbETH, mwstETH, mrETH, mweETH, mwrsETH, mLBTC — plain or composite Chainlink feeds, no OEV wrapper. These are the **best targets** for liquidation bots since no wrapper fee deduction
+- ⚠️ **Probe caveat**: The `maxRoundDelay()` probe assumes all OEV wrappers expose this function. If Moonwell changes the wrapper interface, the probe will silently misclassify everything as "traditional". Always manually verify a few known markets (e.g. cbETH=traditional, USDC=OEV) after running the script
+
+**Profitability guidance**: Markets with 99-100% reserve factors (check via scan script) send nearly all liquidation rewards to protocol reserves — focus on markets with lower RF for better profitability. Non-USD assets (wstETH, rETH, weETH, wrsETH, cbBTC, tBTC, cbETH, LBTC, VIRTUAL, MORPHO, cbXRP, MAMO, VVV) use exchange-rate composite oracles and are most likely to create liquidation opportunities.
 
 ## Discovery Layer
 

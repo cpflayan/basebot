@@ -1,13 +1,19 @@
-# Morpho Blue Liquidation Bot
+# Multi-Protocol Liquidation Bot
 
-A simple, fast, and easily deployable liquidation bot for the **Morpho Blue** protocol. This bot is entirely based on **RPC calls** and is designed to be **easy to configure**, **customizable**, and **ready to deploy** on any EVM-compatible chain.
+A simple, fast, and easily deployable liquidation bot for **Morpho Blue**, **Compound V3 (Comet)**, and **Moonwell (Compound V2)** lending protocols. This bot is entirely based on **RPC calls** and is designed to be **easy to configure**, **customizable**, and **ready to deploy** on any EVM-compatible chain.
 
 ## Features
 
-- Automatically detects liquidatable positions and executes the liquidations.
+- **Multi-protocol support**: Automatically detects and liquidates positions across three lending protocols:
+  - **Morpho Blue**: Isolated lending markets with oracle-based pricing
+  - **Compound V3 (Comet)**: Single borrowing market per Comet with absorb + buyCollateral
+  - **Moonwell**: Compound V2 fork with liquidateBorrow + redeemUnderlying
 - Multi-chain compatible.
 - Modular architecture with pluggable [data providers](./apps/data-providers/README.md), [liquidity venues](./apps/liquidity-venues/README.md), and [pricers](./apps/pricers/README.md).
 - Profit evaluation thanks to configurable pricers.
+- **Flash loan support**: Balancer V2 (0% fee) and Aave V3 (0.05% fee) for capital-efficient liquidations.
+- **Event-driven fast path** (Morpho only): Alchemy webhook integration for instant liquidation opportunities.
+- **Dual-RPC architecture** (Comet & Moonwell): Base public RPC for historical scanning + Alchemy for trading.
 - Minimal setup and dependencies (RPC-only, no extra infra required).
 
 ### ⚠️ Disclaimer
@@ -75,6 +81,14 @@ For each chain, here are the parameters that need to be configured:
 
 - `options.watchBlocksRetryDelayMs` (optional): Delay in milliseconds before restarting the block watcher after an RPC error. Default: 5000.
 
+- `options.useFlashLoan` (optional): Enable Balancer V2 flash loans for capital-efficient liquidations. Default: false.
+
+- `options.flashLoanProvider` (optional): Flash loan provider — `"balancer"` (0% fee) or `"aave"` (0.05% fee). Default: `"balancer"`.
+
+- `options.cometWatchlist` (optional): Compound V3 Comet market configuration. See [ARCHITECTURE.md](./ARCHITECTURE.md#compound-v3-configuration) for details.
+
+- `options.moonwellWatchlist` (optional): Moonwell (Compound V2) market configuration. See [ARCHITECTURE.md](./ARCHITECTURE.md#moonwell-configuration) for details.
+
 ### Secrets
 
 Secrets are set in the `.env` file at the root of the repository, with the following keys:
@@ -134,3 +148,35 @@ pnpm skim --chainId 1 --token 0x... --recipient 0x...
 ## Liquidation Process
 
 ![Process](./img/liquidation-process-high-level.png)
+
+### Morpho Blue Flow
+
+1. **Slow path**: `watchBlocks` → `bot.run()` → fetch liquidatable positions from Morpho API → attempt liquidation
+2. **Fast path**: Alchemy webhook → decode MorphoBlue events → update `PositionCache` → fetch fresh oracle price → recalculate HF → liquidate if HF < 1
+3. For each position: try liquidity venues → simulate → check profit → execute via executor contract or Flashbots
+
+### Compound V3 (Comet) Flow
+
+1. **Account discovery**: `CometAccountRegistry` scans `SupplyCollateral`/`WithdrawCollateral` events to build account list
+2. **Polling**: `watchBlocks` → batch `isLiquidatable()` checks → attempt liquidation
+3. For each liquidatable account: estimate debt → Balancer flash loan → `absorb()` → `buyCollateral()` → DEX swap → repay flash loan → skim profit
+
+### Moonwell (Compound V2) Flow
+
+1. **Account discovery**: `MoonwellAccountRegistry` scans `Borrow` events per mToken to find accounts with debt
+2. **Polling**: `watchBlocks` → batch `getAccountLiquidity()` checks → find accounts with shortfall > 0
+3. For each liquidatable account: find borrow/collateral mTokens → Balancer flash loan → `liquidateBorrow()` → `redeemUnderlying()` → DEX swap → repay flash loan → skim profit
+
+## Security Features
+
+- **Token blacklist**: Markets involving depegged/risky tokens (e.g., USR) are skipped entirely
+- **Pricer mandatory**: Bot refuses to execute trades without configured pricers (cannot verify profitability)
+- **Slippage protection**: Flash loan path enforces 1% slippage margin between simulation and execution
+- **Simulation-first**: All transactions simulated before execution; failed simulations are skipped
+- **Treasury separation**: Profits sent to configured treasury address (not EOA) for reduced private key exposure
+- **Encoder snapshot/restore**: Failed venue attempts don't corrupt encoder state
+
+## Documentation
+
+- [ARCHITECTURE.md](./ARCHITECTURE.md) — Detailed architecture, bot flows, and configuration
+- [TECHNICAL_SPEC.md](./TECHNICAL_SPEC.md) — Technical specifications and implementation details

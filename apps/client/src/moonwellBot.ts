@@ -107,6 +107,9 @@ export class MoonwellLiquidationBot {
   private closeFactor = 0n;
   private liquidationIncentive = 0n;
 
+  /** Cached mToken → underlying mapping (populated at init from config + on-chain) */
+  private underlyingCache = new Map<Address, Address>();
+
   constructor(inputs: MoonwellLiquidationBotInputs) {
     this.logTag = inputs.logTag;
     this.client = inputs.client;
@@ -167,6 +170,9 @@ export class MoonwellLiquidationBot {
     // Cache Comptroller global params
     await this.cacheComptrollerParams();
 
+    // Discover underlying addresses on-chain for mTokens not in hardcoded map
+    await this.discoverUnderlyings();
+
     // Scan each mToken for historical accounts
     for (const mToken of this.mTokenList) {
       await this.registry.initialScan(
@@ -180,6 +186,57 @@ export class MoonwellLiquidationBot {
 
     console.log(
       `${this.logTag}🗄️ Moonwell registry initialized: ${this.registry.totalAccounts} total accounts across ${this.mTokenList.length} mTokens`,
+    );
+  }
+
+  /**
+   * Discover underlying addresses for all mTokens.
+   * Uses hardcoded map first, falls back to on-chain underlying() call.
+   * Caches results for later use in getUnderlying().
+   */
+  private async discoverUnderlyings(): Promise<void> {
+    // Pre-populate cache from hardcoded map
+    for (const [mToken, underlying] of Object.entries(MOONWELL_UNDERLYING_MAP)) {
+      this.underlyingCache.set(mToken as Address, underlying);
+    }
+
+    // Discover missing underlyings on-chain
+    const toDiscover = this.mTokenList.filter((m) => !this.underlyingCache.has(m.address));
+
+    if (toDiscover.length === 0) {
+      console.log(
+        `${this.logTag}✅ All ${this.mTokenList.length} underlying addresses found in hardcoded map`,
+      );
+      return;
+    }
+
+    console.log(
+      `${this.logTag}🔍 Discovering ${toDiscover.length} underlying address(es) on-chain...`,
+    );
+
+    const results = await Promise.allSettled(
+      toDiscover.map(async (mToken) => {
+        const underlying = await readContract(this.client, {
+          address: mToken.address,
+          abi: mTokenAbi,
+          functionName: "underlying",
+        });
+        return { mToken: mToken.address, underlying };
+      }),
+    );
+
+    let successCount = 0;
+    for (const result of results) {
+      if (result.status === "fulfilled") {
+        this.underlyingCache.set(result.value.mToken, result.value.underlying);
+        successCount++;
+      } else {
+        console.warn(`${this.logTag}⚠️ Failed to discover underlying for mToken`);
+      }
+    }
+
+    console.log(
+      `${this.logTag}✅ Discovered ${successCount}/${toDiscover.length} underlying addresses on-chain`,
     );
   }
 
@@ -399,11 +456,10 @@ export class MoonwellLiquidationBot {
     // Step 2: liquidateBorrow — repay debt, seize collateral mToken
     callbackEncoder.moonwellLiquidateBorrow(borrowMToken, collateralMToken, account, repayAmount);
 
-    // Step 3: redeemUnderlying — convert seized mToken to underlying
-    // We don't know exact seized amount at encoding time, so use 0 to redeem all available
-    // The executor will have the seized mTokens after liquidateBorrow
-    // Use a large value to redeem everything available
-    callbackEncoder.moonwellRedeemUnderlying(collateralMToken, 0n);
+    // Step 3: redeem — convert seized mToken to underlying
+    // Use redeem(maxUint256) to burn ALL seized mTokens. Do NOT use redeemUnderlying(0)
+    // — in Compound V2, redeemUnderlying(0) is a no-op (redeems 0 underlying tokens).
+    callbackEncoder.moonwellRedeem(collateralMToken, maxUint256);
 
     // Step 4: DEX swap collateral underlying → borrow underlying (if different tokens)
     if (collateralUnderlying.toLowerCase() !== borrowUnderlying.toLowerCase()) {
@@ -471,8 +527,8 @@ export class MoonwellLiquidationBot {
     // liquidateBorrow
     encoder.moonwellLiquidateBorrow(borrowMToken, collateralMToken, account, repayAmount);
 
-    // redeemUnderlying — convert seized mToken to underlying
-    encoder.moonwellRedeemUnderlying(collateralMToken, 0n);
+    // redeem — convert seized mToken to underlying
+    encoder.moonwellRedeem(collateralMToken, maxUint256);
 
     // DEX swap collateral underlying → borrow underlying (if different tokens)
     if (collateralUnderlying.toLowerCase() !== borrowUnderlying.toLowerCase()) {
@@ -570,14 +626,14 @@ export class MoonwellLiquidationBot {
 
   /**
    * Get the underlying token address for a mToken.
-   * Uses the hardcoded map first, falls back to on-chain query.
+   * Returns cached value from init-time discovery (hardcoded map + on-chain).
+   * Falls back to mToken address itself if not found (should not happen after init).
    */
   private getUnderlying(mToken: Address): Address {
-    const mapped = MOONWELL_UNDERLYING_MAP[mToken];
-    if (mapped) return mapped;
+    const cached = this.underlyingCache.get(mToken);
+    if (cached) return cached;
 
-    // Fallback: should not happen in normal operation since we configure all mTokens
-    // with their underlying addresses. Log a warning and return the mToken itself.
+    // Fallback: should not happen after initialize() has run
     console.warn(
       `${this.logTag}⚠️ No underlying mapping for ${mToken.slice(0, 10)}..., using mToken address as fallback`,
     );

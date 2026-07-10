@@ -111,12 +111,30 @@ export class LiquidationEncoder<
   }
 
   /**
-   * Call MToken.redeemUnderlying() — convert mToken collateral to underlying token.
-   * After liquidateBorrow, the executor holds seized mTokens. This redeems them
-   * for the underlying asset so it can be swapped via DEX.
+   * Call MToken.redeem() — burn mTokens to receive underlying tokens.
+   * Use maxUint256 to redeem ALL mTokens held by the caller.
+   *
+   * This is the correct way to convert seized mToken collateral to underlying
+   * after liquidateBorrow, since we don't know the exact mToken amount at encoding time.
    *
    * @param mToken - the mToken contract to redeem
-   * @param redeemAmount - amount of underlying to redeem (in underlying token units)
+   * @param mTokenAmount - amount of mTokens to burn (use maxUint256 for all)
+   */
+  public moonwellRedeem(mToken: Address, mTokenAmount: bigint) {
+    this.pushCall(
+      mToken,
+      0n,
+      encodeFunctionData({
+        abi: mTokenAbi,
+        functionName: "redeem",
+        args: [mTokenAmount],
+      }),
+    );
+  }
+
+  /**
+   * @deprecated Use moonwellRedeem(maxUint256) instead.
+   * redeemUnderlying(0) is a no-op in Compound V2 — it redeems 0 underlying tokens.
    */
   public moonwellRedeemUnderlying(mToken: Address, redeemAmount: bigint) {
     this.pushCall(
