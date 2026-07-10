@@ -41,8 +41,9 @@ export class LiquidSwapVenue implements LiquidityVenue {
         srcAmount: parseUnits(data.amountOut, data.tokens.tokenOut.decimals),
       };
     } catch (error) {
-      console.error("failed to fetch assets decimals or liquid swap route", error);
-      return toConvert;
+      throw new Error(
+        `(LiquidSwap) failed to fetch route or decimals: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
 

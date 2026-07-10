@@ -5,7 +5,7 @@ import {
 } from "@morpho-blue-liquidation-bot/config";
 import { BigIntish } from "@morpho-org/blue-sdk";
 import { type ExecutorEncoder } from "executooor-viem";
-import { type Address, getAddress, maxUint256 } from "viem";
+import { type Address, getAddress } from "viem";
 
 import type { LiquidityVenue } from "../liquidityVenue";
 import type { ToConvert } from "../types";
@@ -84,9 +84,10 @@ export class PendlePTVenue implements LiquidityVenue {
         this.lastPoolRefresh[encoder.client.chain.id] = Date.now();
       } catch (error) {
         this.lastPoolRefresh[encoder.client.chain.id] = Date.now(); // prevent infinite retries
-        throw new Error(
+        console.error(
           `(PendlePT) Error fetching pendle tokens: ${error instanceof Error ? error.message : String(error)}`,
         );
+        return false;
       }
     }
     return this.isPT(src, encoder.client.chain.id);
@@ -170,7 +171,7 @@ export class PendlePTVenue implements LiquidityVenue {
     });
 
     encoder
-      .erc20Approve(src, redeemCallData.tx.to, maxUint256)
+      .erc20Approve(src, redeemCallData.tx.to, srcAmount)
       .pushCall(
         redeemCallData.tx.to,
         redeemCallData.tx.value ? BigInt(redeemCallData.tx.value) : 0n,
@@ -195,7 +196,7 @@ export class PendlePTVenue implements LiquidityVenue {
       amountIn: srcAmount.toString(),
     });
     encoder
-      .erc20Approve(src, swapCallData.tx.to, maxUint256)
+      .erc20Approve(src, swapCallData.tx.to, srcAmount)
       .pushCall(
         swapCallData.tx.to,
         swapCallData.tx.value ? BigInt(swapCallData.tx.value) : 0n,

@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@morpho-blue-liquidation-bot/config": "workspace:*",
+    "@morpho-blue-liquidation-bot/liquidity-venues": "workspace:*",
     "viem": "^2.46.0"
   },
   "devDependencies": {

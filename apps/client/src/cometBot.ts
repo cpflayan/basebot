@@ -8,7 +8,7 @@
  *   - Flash loan path: Balancer flash loan → absorb → buyCollateral → DEX swap → repay
  *   - Reuses shared execution utilities (profit check, simulation, encoder)
  */
-import type { CometWatchlistConfig } from "@morpho-blue-liquidation-bot/config";
+import type { CometWatchlistConfig, FlashLoanProvider } from "@morpho-blue-liquidation-bot/config";
 import type { LiquidityVenue } from "@morpho-blue-liquidation-bot/liquidity-venues";
 import type { Pricer } from "@morpho-blue-liquidation-bot/pricers";
 import {
@@ -19,35 +19,28 @@ import {
   type Client,
   type WalletClient,
   type LocalAccount,
+  erc20Abi,
   maxUint256,
-  createPublicClient,
-  http,
 } from "viem";
-import { readContract, watchBlocks } from "viem/actions";
+import { readContract, multicall } from "viem/actions";
 import { base } from "viem/chains";
 
-import { BALANCER_VAULT_ADDRESS } from "./abis/BalancerVault.js";
 import { cometViewAbi, COMET_COLLATERAL_ASSETS } from "./abis/Comet.js";
 import { CometAccountRegistry } from "./cometAccountRegistry.js";
 import { PositionLiquidationCooldownMechanism } from "./utils/cooldownMechanisms.js";
 import { findDeployBlock } from "./utils/findDeployBlock.js";
 import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
+import { liquidationTracker } from "./utils/liquidationState.js";
+import { createScanClient } from "./utils/rpcFallback.js";
 import {
   type SharedExecutionDeps,
+  TOKEN_BLACKLIST,
   convertCollateralToLoan,
-  simulateAndExecFlashLoan,
+  createBlockPolling,
+  priceAsset,
+  simulateAndExecFlashLoanWithFallback,
   simulateAndExec,
 } from "./utils/sharedExecution.js";
-
-/** Base 官方公開 RPC — 支持 10,000 區塊範圍的 eth_getLogs */
-const BASE_PUBLIC_RPC = "https://mainnet.base.org";
-
-/**
- * Token blacklist — skip Comets involving these tokens.
- */
-const TOKEN_BLACKLIST = new Set<string>([
-  "0x35e5db674d8e93a03d814fa0ada70731efe8a4b9", // USR (depegged)
-]);
 
 export interface CometLiquidationBotInputs {
   logTag: string;
@@ -62,9 +55,11 @@ export interface CometLiquidationBotInputs {
   positionLiquidationCooldownMechanism?: PositionLiquidationCooldownMechanism;
   flashbotAccount?: LocalAccount;
   useFlashLoan?: boolean;
-  flashLoanProvider?: "balancer" | "aave";
+  flashLoanProvider?: FlashLoanProvider;
+  flashLoanFallbackProviders?: FlashLoanProvider[];
   alwaysRealizeBadDebt?: boolean;
   registryFilePath?: string;
+  scanRpcUrls?: string[];
 }
 
 interface CometInfo {
@@ -88,13 +83,24 @@ export class CometLiquidationBot {
   private cooldown?: PositionLiquidationCooldownMechanism;
   private flashbotAccount?: LocalAccount;
   private useFlashLoan: boolean;
-  private flashLoanProvider: "balancer" | "aave";
+  private flashLoanProvider: FlashLoanProvider;
+  private flashLoanFallbackProviders: FlashLoanProvider[];
   private alwaysRealizeBadDebt: boolean;
   private registry: CometAccountRegistry;
   private pollIntervalBlocks: number;
   private sharedDeps: SharedExecutionDeps;
   /** Read-only client using Base public RPC — for historical event scanning only */
   private scanClient: Client<Transport, Chain>;
+
+  // ─── Health & monitoring stats ───
+  private _liquidationsAttempted = 0;
+  private _liquidationsSucceeded = 0;
+  private _liquidationsFailed = 0;
+  private _lastCheckTimestamp = 0;
+  private _lastCheckBlock = 0;
+  private _rpcErrors = 0;
+  private _rpcTotal = 0;
+  private _lastError?: string;
 
   constructor(inputs: CometLiquidationBotInputs) {
     this.logTag = inputs.logTag;
@@ -109,6 +115,7 @@ export class CometLiquidationBot {
     this.flashbotAccount = inputs.flashbotAccount;
     this.useFlashLoan = inputs.useFlashLoan ?? false;
     this.flashLoanProvider = inputs.flashLoanProvider ?? "balancer";
+    this.flashLoanFallbackProviders = inputs.flashLoanFallbackProviders ?? [];
     this.alwaysRealizeBadDebt = inputs.alwaysRealizeBadDebt ?? false;
     this.pollIntervalBlocks = inputs.cometWatchlist.pollIntervalBlocks ?? 5;
 
@@ -135,13 +142,11 @@ export class CometLiquidationBot {
       flashbotAccount: this.flashbotAccount,
       alwaysRealizeBadDebt: this.alwaysRealizeBadDebt,
       flashLoanProvider: this.flashLoanProvider,
+      flashLoanFallbackProviders: this.flashLoanFallbackProviders,
     };
 
     // Read-only client on Base public RPC for historical scanning
-    this.scanClient = createPublicClient({
-      chain: base,
-      transport: http(BASE_PUBLIC_RPC),
-    });
+    this.scanClient = createScanClient(base, inputs.scanRpcUrls ?? ["https://mainnet.base.org"]);
   }
 
   // ─── Initialization ───
@@ -243,38 +248,20 @@ export class CometLiquidationBot {
    * Returns an unwatch function.
    */
   startPolling(): () => void {
-    let blockCount = 0;
-    let running = false;
-
-    const unwatch = watchBlocks(this.client, {
-      onBlock: () => {
-        blockCount++;
-        if (blockCount % this.pollIntervalBlocks !== 0) return;
-        if (running) return; // Prevent overlapping runs
-        running = true;
-
-        this.checkAllComets()
-          .catch((e: unknown) => {
-            console.error(`${this.logTag}Error in checkAllComets:`, e);
-          })
-          .finally(() => {
-            running = false;
-          });
-      },
-      onError: (error: Error) => {
-        console.error(`${this.logTag}watchBlocks error:`, error);
-      },
+    return createBlockPolling({
+      logTag: this.logTag,
+      client: this.client,
+      pollIntervalBlocks: this.pollIntervalBlocks,
+      onTick: () => this.checkAllComets(),
     });
-
-    console.log(`${this.logTag}📡 Comet polling started (every ${this.pollIntervalBlocks} blocks)`);
-
-    return unwatch;
   }
 
   /**
    * Core check loop: for each Comet, scan new events, then check isLiquidatable for all known accounts.
    */
   async checkAllComets(): Promise<void> {
+    this._lastCheckTimestamp = Math.floor(Date.now() / 1000);
+
     for (const comet of this.cometList) {
       try {
         // Incremental scan for new accounts
@@ -303,25 +290,49 @@ export class CometLiquidationBot {
   }
 
   /**
-   * Batch check isLiquidatable for multiple accounts using Promise.allSettled.
+   * Batch check isLiquidatable for multiple accounts using multicall.
+   * 50 accounts = 1 RPC call instead of 50.
    */
   private async batchCheckLiquidatable(comet: Address, accounts: Address[]): Promise<Address[]> {
-    const results = await Promise.allSettled(
-      accounts.map(async (account) => {
-        const [isLiq] = await readContract(this.client, {
-          address: comet,
-          abi: cometViewAbi,
-          functionName: "isLiquidatable",
-          args: [account],
-        });
-        return isLiq ? account : null;
-      }),
-    );
+    const BATCH_SIZE = 50;
+    const liquidatable: Address[] = [];
 
-    return results
-      .filter((r): r is PromiseFulfilledResult<Address | null> => r.status === "fulfilled")
-      .map((r) => r.value)
-      .filter((a): a is Address => a !== null);
+    for (let i = 0; i < accounts.length; i += BATCH_SIZE) {
+      const batch = accounts.slice(i, i + BATCH_SIZE);
+
+      try {
+        const results = await multicall(this.client, {
+          contracts: batch.map((account) => ({
+            address: comet,
+            abi: cometViewAbi,
+            functionName: "isLiquidatable" as const,
+            args: [account] as const,
+          })),
+          allowFailure: true,
+        });
+
+        this._rpcTotal += batch.length;
+
+        for (let j = 0; j < results.length; j++) {
+          const result = results[j]!;
+          if (result.status !== "success") {
+            this._rpcErrors++;
+            continue;
+          }
+          const [isLiq] = result.result;
+          if (isLiq) {
+            liquidatable.push(batch[j]!);
+          }
+        }
+      } catch (e) {
+        this._rpcErrors += batch.length;
+        this._rpcTotal += batch.length;
+        this._lastError = String(e);
+        console.warn(`${this.logTag}⚠️ batchCheckLiquidatable batch ${i / BATCH_SIZE} failed:`, e);
+      }
+    }
+
+    return liquidatable;
   }
 
   // ─── Liquidation execution ───
@@ -339,6 +350,8 @@ export class CometLiquidationBot {
     }
 
     console.log(`${this.logTag}  🎯 ${account} — attempting Comet liquidation`);
+
+    this._liquidationsAttempted++;
 
     if (this.useFlashLoan) {
       await this.liquidateCometWithFlashLoan(comet, account);
@@ -371,38 +384,47 @@ export class CometLiquidationBot {
       return;
     }
 
-    const encoder = new LiquidationEncoder(this.executorAddress, this.client);
     const callbackEncoder = new LiquidationEncoder(this.executorAddress, this.client);
 
-    // Step 1: Approve Comet to spend base asset (for buyCollateral)
-    callbackEncoder.erc20Approve(comet.baseAsset, comet.address, maxUint256);
+    // Step 1: Approve Comet to spend base asset (for buyCollateral) — only if needed
+    const currentAllowance = await readContract(this.client, {
+      address: comet.baseAsset,
+      abi: erc20Abi,
+      functionName: "allowance",
+      args: [this.executorAddress, comet.address],
+    });
+    if (currentAllowance < flashLoanAmount) {
+      callbackEncoder.erc20Approve(comet.baseAsset, comet.address, maxUint256);
+    }
 
     // Step 2: Absorb — seize collateral from underwater account
     callbackEncoder.cometAbsorb(comet.address, [account]);
 
     // Step 3: Buy collateral from Comet using base asset
-    for (const collateral of collateralAssets) {
-      if (TOKEN_BLACKLIST.has(collateral.toLowerCase())) continue;
+    // Batch-read all collateral reserves via multicall (1 RPC instead of N)
+    const filteredCollaterals = collateralAssets.filter(
+      (c) => !TOKEN_BLACKLIST.has(c.toLowerCase()),
+    );
+    const reserveResults = await multicall(this.client, {
+      contracts: filteredCollaterals.map((collateral) => ({
+        address: comet.address,
+        abi: cometViewAbi,
+        functionName: "getCollateralReserves" as const,
+        args: [collateral] as const,
+      })),
+      allowFailure: true,
+    });
 
-      try {
-        const reserves = await readContract(this.client, {
-          address: comet.address,
-          abi: cometViewAbi,
-          functionName: "getCollateralReserves",
-          args: [collateral],
-        });
-
-        if (reserves > 0n) {
-          callbackEncoder.cometBuyCollateral(
-            comet.address,
-            collateral,
-            0n, // minAmount = 0 (we rely on simulation for safety)
-            flashLoanAmount, // max base asset to spend
-          );
-        }
-      } catch {
-        // Skip collateral that fails reserve check
-      }
+    for (let i = 0; i < reserveResults.length; i++) {
+      const result = reserveResults[i]!;
+      if (result.status !== "success" || result.result <= 0n) continue;
+      const collateral = filteredCollaterals[i]!;
+      callbackEncoder.cometBuyCollateral(
+        comet.address,
+        collateral,
+        0n, // minAmount = 0 (we rely on simulation for safety)
+        flashLoanAmount, // max base asset to spend
+      );
     }
 
     // Step 4: DEX swap any non-base collateral → base asset
@@ -424,26 +446,36 @@ export class CometLiquidationBot {
 
     const callbackCalls = callbackEncoder.flush();
 
-    // Step 6: Wrap in Balancer flash loan
-    encoder.balancerFlashLoan(
-      BALANCER_VAULT_ADDRESS,
-      [{ asset: comet.baseAsset, amount: flashLoanAmount }],
-      callbackCalls,
+    // Find primary collateral for cross-protocol tracking (first non-base, non-blacklisted)
+    const primaryCollateral = collateralAssets.find(
+      (c) =>
+        !TOKEN_BLACKLIST.has(c.toLowerCase()) && c.toLowerCase() !== comet.baseAsset.toLowerCase(),
     );
 
-    const calls = encoder.flush();
-
+    // Step 7: Wrap with flash loan (with fallback providers) and simulate + execute.
     try {
-      const success = await simulateAndExecFlashLoan(
+      const success = await simulateAndExecFlashLoanWithFallback(
         this.sharedDeps,
-        encoder,
-        calls,
+        callbackCalls,
         comet.baseAsset,
         false, // Comet liquidations are always profitable if simulation passes
         flashLoanAmount,
+        primaryCollateral,
       );
 
       if (success) {
+        this._liquidationsSucceeded++;
+        if (primaryCollateral) {
+          const collateralUsd =
+            (await priceAsset(this.sharedDeps, primaryCollateral, flashLoanAmount)) ?? 0;
+          liquidationTracker.report({
+            protocol: this.logTag,
+            collateralToken: primaryCollateral,
+            collateralAmount: flashLoanAmount,
+            collateralUsdEstimate: collateralUsd,
+            timestamp: Date.now(),
+          });
+        }
         console.log(
           `${this.logTag}[FlashLoan] Liquidated ${account} on Comet ${comet.address.slice(0, 10)}...`,
         );
@@ -453,6 +485,8 @@ export class CometLiquidationBot {
         );
       }
     } catch (error) {
+      this._liquidationsFailed++;
+      this._lastError = String(error);
       console.error(
         `${this.logTag}[FlashLoan] Failed to liquidate ${account} on Comet ${comet.address.slice(0, 10)}...`,
         error,
@@ -467,30 +501,39 @@ export class CometLiquidationBot {
     const collateralAssets = comet.collateralAssets ?? [];
     const encoder = new LiquidationEncoder(this.executorAddress, this.client);
 
-    // Approve Comet
-    encoder.erc20Approve(comet.baseAsset, comet.address, maxUint256);
+    // Approve Comet — only if allowance insufficient
+    const currentAllowance = await readContract(this.client, {
+      address: comet.baseAsset,
+      abi: erc20Abi,
+      functionName: "allowance",
+      args: [this.executorAddress, comet.address],
+    });
+    if (currentAllowance === 0n) {
+      encoder.erc20Approve(comet.baseAsset, comet.address, maxUint256);
+    }
 
     // Absorb
     encoder.cometAbsorb(comet.address, [account]);
 
-    // Buy collateral
-    for (const collateral of collateralAssets) {
-      if (TOKEN_BLACKLIST.has(collateral.toLowerCase())) continue;
+    // Buy collateral — batch-read reserves via multicall
+    const filteredCollaterals = collateralAssets.filter(
+      (c) => !TOKEN_BLACKLIST.has(c.toLowerCase()),
+    );
+    const reserveResults = await multicall(this.client, {
+      contracts: filteredCollaterals.map((collateral) => ({
+        address: comet.address,
+        abi: cometViewAbi,
+        functionName: "getCollateralReserves" as const,
+        args: [collateral] as const,
+      })),
+      allowFailure: true,
+    });
 
-      try {
-        const reserves = await readContract(this.client, {
-          address: comet.address,
-          abi: cometViewAbi,
-          functionName: "getCollateralReserves",
-          args: [collateral],
-        });
-
-        if (reserves > 0n) {
-          encoder.cometBuyCollateral(comet.address, collateral, 0n, maxUint256);
-        }
-      } catch {
-        // Skip
-      }
+    for (let i = 0; i < reserveResults.length; i++) {
+      const result = reserveResults[i]!;
+      if (result.status !== "success" || result.result <= 0n) continue;
+      const collateral = filteredCollaterals[i]!;
+      encoder.cometBuyCollateral(comet.address, collateral, 0n, maxUint256);
     }
 
     // DEX swap collateral → base asset
@@ -506,6 +549,12 @@ export class CometLiquidationBot {
 
     const calls = encoder.flush();
 
+    // Find primary collateral for cross-protocol tracking
+    const primaryCollateral = collateralAssets.find(
+      (c) =>
+        !TOKEN_BLACKLIST.has(c.toLowerCase()) && c.toLowerCase() !== comet.baseAsset.toLowerCase(),
+    );
+
     try {
       const success = await simulateAndExec(
         this.sharedDeps,
@@ -513,9 +562,24 @@ export class CometLiquidationBot {
         calls,
         comet.baseAsset,
         false,
+        undefined,
+        undefined,
+        primaryCollateral,
       );
 
       if (success) {
+        this._liquidationsSucceeded++;
+        if (primaryCollateral) {
+          const collateralUsd =
+            (await priceAsset(this.sharedDeps, primaryCollateral, maxUint256)) ?? 0;
+          liquidationTracker.report({
+            protocol: this.logTag,
+            collateralToken: primaryCollateral,
+            collateralAmount: 0n,
+            collateralUsdEstimate: collateralUsd,
+            timestamp: Date.now(),
+          });
+        }
         console.log(
           `${this.logTag}Liquidated ${account} on Comet ${comet.address.slice(0, 10)}...`,
         );
@@ -525,6 +589,8 @@ export class CometLiquidationBot {
         );
       }
     } catch (error) {
+      this._liquidationsFailed++;
+      this._lastError = String(error);
       console.error(
         `${this.logTag}Failed to liquidate ${account} on Comet ${comet.address.slice(0, 10)}...`,
         error,
@@ -540,54 +606,60 @@ export class CometLiquidationBot {
    */
   private async estimateDebt(comet: Address, account: Address): Promise<bigint> {
     try {
-      const [principal, , , _baseSupplyIndex, baseBorrowIndex] = await Promise.all([
+      const [userBasic, totalsBasic] = await Promise.all([
         readContract(this.client, {
           address: comet,
           abi: cometViewAbi,
           functionName: "userBasic",
           args: [account],
-        }).then((r) => r[0]), // principal (int104)
-        readContract(this.client, {
-          address: comet,
-          abi: cometViewAbi,
-          functionName: "userBasic",
-          args: [account],
-        }).then((r) => r[1]), // baseTrackingIndex
-        readContract(this.client, {
-          address: comet,
-          abi: cometViewAbi,
-          functionName: "userBasic",
-          args: [account],
-        }).then((r) => r[2]), // baseTrackingAccrued
+        }),
         readContract(this.client, {
           address: comet,
           abi: cometViewAbi,
           functionName: "totalsBasic",
-        }).then((r) => r[2]), // baseSupplyIndex
-        readContract(this.client, {
-          address: comet,
-          abi: cometViewAbi,
-          functionName: "totalsBasic",
-        }).then((r) => r[3]), // baseBorrowIndex
+        }),
       ]);
+
+      const principal = userBasic[0]; // principal (int104)
+      const baseBorrowIndex = totalsBasic[3]; // baseBorrowIndex
 
       // principal > 0 means supply, principal < 0 means borrow
       if (principal >= 0n) return 0n; // No debt
 
-      // Borrow balance = |principal| * baseBorrowIndex / 1e18 (approximate)
-      // Compound V3 uses: balance = presentValue(principal, baseBorrowIndex)
-      // where presentValue for negative principal = |principal| * baseBorrowIndex / BASE_INDEX_SCALE
+      // Borrow balance = |principal| * baseBorrowIndex / 1e15 (BASE_INDEX_SCALE)
       const absPrincipal = -principal;
-      // baseBorrowIndex is scaled by 1e15 (BASE_INDEX_SCALE = 1e15)
       const borrowBalance = (absPrincipal * baseBorrowIndex) / 1_000_000_000_000_000n;
 
       return borrowBalance;
     } catch (e) {
+      this._rpcErrors++;
+      this._lastError = String(e);
       console.warn(
         `${this.logTag}Failed to estimate debt for ${account} on ${comet.slice(0, 10)}...:`,
         e,
       );
       return 0n;
     }
+  }
+
+  /**
+   * Get current bot health status for monitoring endpoints.
+   */
+  getHealthStatus() {
+    const rpcErrorRate = this._rpcTotal > 0 ? this._rpcErrors / this._rpcTotal : 0;
+    return {
+      protocol: "comet" as const,
+      lastCheckTimestamp: this._lastCheckTimestamp,
+      lastCheckBlock: this._lastCheckBlock,
+      registryAccountCount: this.registry.totalAccounts,
+      liquidationsAttempted: this._liquidationsAttempted,
+      liquidationsSucceeded: this._liquidationsSucceeded,
+      liquidationsFailed: this._liquidationsFailed,
+      rpcErrors: this._rpcErrors,
+      rpcTotal: this._rpcTotal,
+      rpcErrorRate,
+      lastError: this._lastError,
+      isHealthy: rpcErrorRate < 0.3,
+    };
   }
 }

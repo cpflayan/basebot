@@ -1,4 +1,8 @@
-import { chainConfigs, loadApprovedMarketIds } from "@morpho-blue-liquidation-bot/config";
+import {
+  chainConfigs,
+  loadApprovedMarketIds,
+  type FlashLoanProvider,
+} from "@morpho-blue-liquidation-bot/config";
 import type { DataProvider } from "@morpho-blue-liquidation-bot/data-providers";
 import type { LiquidityVenue } from "@morpho-blue-liquidation-bot/liquidity-venues";
 import type { Pricer } from "@morpho-blue-liquidation-bot/pricers";
@@ -6,16 +10,13 @@ import {
   AccrualPosition,
   ChainAddresses,
   getChainAddresses,
-  type IMarketParams,
   MarketUtils,
   PreLiquidationPosition,
   MarketId,
 } from "@morpho-org/blue-sdk";
 import { fetchMarket } from "@morpho-org/blue-sdk-viem";
-import { executorAbi } from "executooor-viem";
 import {
   erc20Abi,
-  formatUnits,
   getAddress,
   LocalAccount,
   maxUint256,
@@ -27,15 +28,8 @@ import {
   type Transport,
   type WalletClient,
 } from "viem";
-import {
-  getBlockNumber,
-  getGasPrice,
-  readContract,
-  simulateCalls,
-  writeContract,
-} from "viem/actions";
+import { readContract } from "viem/actions";
 
-import { BALANCER_FLASH_LOAN_FEE_BPS, BALANCER_VAULT_ADDRESS } from "./abis/BalancerVault.js";
 import { oracleAbi } from "./abis/morpho/oracle.js";
 import { PositionCache, type CachedMarketState, type CachedPosition } from "./positionCache.js";
 import {
@@ -43,26 +37,19 @@ import {
   PositionLiquidationCooldownMechanism,
 } from "./utils/cooldownMechanisms.js";
 import { fetchWhitelistedVaults } from "./utils/fetch-whitelisted-vaults.js";
-import { Flashbots } from "./utils/flashbots.js";
 import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
+import { liquidationTracker } from "./utils/liquidationState.js";
 import { DEFAULT_LIQUIDATION_BUFFER_BPS, WAD, wMulDown } from "./utils/maths.js";
+import {
+  type SharedExecutionDeps,
+  TOKEN_BLACKLIST,
+  convertCollateralToLoan as sharedConvertCollateralToLoan,
+  priceAsset,
+  simulateAndExec,
+  simulateAndExecFlashLoanWithFallback,
+} from "./utils/sharedExecution.js";
 import type { DecodedMorphoEvent } from "./webhook.js";
 import "@morpho-org/blue-sdk-viem/lib/augment";
-
-/**
- * Slippage tolerance for DEX swaps within flash loan path.
- * 1% = 100 bps. Protects against sandwich attacks in public mempool.
- */
-const FLASH_LOAN_SLIPPAGE_BPS = 100n; // 1%
-const BPS_DENOMINATOR = 10_000n;
-
-/**
- * SECURITY: Token blacklist — markets involving these tokens are skipped entirely.
- * Prevents liquidation of positions with depegged/risky tokens (e.g. USR).
- */
-const TOKEN_BLACKLIST = new Set<string>([
-  "0x35e5db674d8e93a03d814fa0ada70731efe8a4b9", // USR (Resolv USD) on Base — depegged
-]);
 
 export interface LiquidationBotInputs {
   logTag: string;
@@ -81,7 +68,8 @@ export interface LiquidationBotInputs {
   marketsFetchingCooldownMechanism: MarketsFetchingCooldownMechanism;
   flashbotAccount?: LocalAccount;
   useFlashLoan?: boolean;
-  flashLoanProvider?: "balancer" | "aave";
+  flashLoanProvider?: FlashLoanProvider;
+  flashLoanFallbackProviders?: FlashLoanProvider[];
 }
 
 export class LiquidationBot {
@@ -103,11 +91,22 @@ export class LiquidationBot {
   private coveredMarkets: Hex[];
   private alwaysRealizeBadDebt: boolean;
   private useFlashLoan: boolean;
-  private flashLoanProvider: "balancer" | "aave";
+  private flashLoanProvider: FlashLoanProvider;
+  private flashLoanFallbackProviders: FlashLoanProvider[];
   private positionCache: PositionCache;
   /** Interval for slow-path full refresh (ms). Default: 5 minutes */
   private cacheRefreshInterval: number;
   private cacheRefreshTimer?: ReturnType<typeof setInterval>;
+
+  // ─── Health & monitoring stats ───
+  private _liquidationsAttempted = 0;
+  private _liquidationsSucceeded = 0;
+  private _liquidationsFailed = 0;
+  private _lastCheckTimestamp = 0;
+  private _lastCheckBlock = 0;
+  private _rpcErrors = 0;
+  private _rpcTotal = 0;
+  private _lastError?: string;
 
   constructor(inputs: LiquidationBotInputs) {
     this.logTag = inputs.logTag;
@@ -129,8 +128,29 @@ export class LiquidationBot {
     this.alwaysRealizeBadDebt = inputs.alwaysRealizeBadDebt;
     this.useFlashLoan = inputs.useFlashLoan ?? false;
     this.flashLoanProvider = inputs.flashLoanProvider ?? "balancer";
+    this.flashLoanFallbackProviders = inputs.flashLoanFallbackProviders ?? [];
     this.positionCache = new PositionCache();
     this.cacheRefreshInterval = Number(process.env.CACHE_REFRESH_INTERVAL_MS ?? "300000"); // 5 min
+  }
+
+  // ─── Shared execution deps ───
+
+  private get sharedDeps(): SharedExecutionDeps {
+    return {
+      logTag: this.logTag,
+      chainId: this.chainId,
+      client: this.client,
+      executorAddress: this.executorAddress,
+      treasuryAddress: this.treasuryAddress,
+      liquidityVenues: this.liquidityVenues,
+      pricers: this.pricers,
+      wNative: this.wNative,
+      flashbotAccount: this.flashbotAccount,
+      alwaysRealizeBadDebt: this.alwaysRealizeBadDebt,
+      flashLoanProvider: this.flashLoanProvider,
+      flashLoanFallbackProviders: this.flashLoanFallbackProviders,
+      morphoAddress: this.chainAddresses.morpho,
+    };
   }
 
   // ─── Cache lifecycle ───
@@ -140,6 +160,12 @@ export class LiquidationBot {
    * Called once at startup, then periodically via slow-path refresh.
    */
   async initializeCache(): Promise<void> {
+    // Try to restore from disk snapshot first
+    const cachePath = `./data/position-cache.${this.chainId}.json`;
+    if (this.positionCache.loadFromFile(cachePath)) {
+      console.log(`${this.logTag}🗄️ Cache restored from disk snapshot`);
+    }
+
     await this.fetchMarkets();
 
     const { liquidatablePositions } = await this.dataProvider.fetchLiquidatablePositions(
@@ -207,6 +233,9 @@ export class LiquidationBot {
     console.log(
       `${this.logTag}🗄️ Cache initialized: ${posCount} positions, ${marketCount} markets`,
     );
+
+    // Save snapshot after successful initialization
+    this.positionCache.saveToFile(cachePath);
   }
 
   /**
@@ -331,76 +360,76 @@ export class LiquidationBot {
       `${this.logTag}⚡ ${events.length} event(s) → ${affectedMarkets.size} market(s) affected, checking HF...`,
     );
 
-    // For each affected market, fetch fresh oracle price and check HF
-    for (const marketId of affectedMarkets) {
-      try {
-        const cachedMarket = this.positionCache.getMarket(marketId);
-        if (!cachedMarket) {
-          // Market not in cache — might be new. Do a full fetch.
-          await this.refreshMarketInCache(marketId);
-          continue;
-        }
+    // For each affected market, fetch fresh oracle price and check HF (in parallel)
+    await Promise.allSettled(
+      [...affectedMarkets].map(async (marketId) => {
+        try {
+          const cachedMarket = this.positionCache.getMarket(marketId);
+          if (!cachedMarket) {
+            await this.refreshMarketInCache(marketId);
+            return;
+          }
 
-        // Fetch fresh oracle price (single on-chain read)
-        const freshPrice = await readContract(this.client, {
-          address: cachedMarket.params.oracle,
-          abi: oracleAbi,
-          functionName: "price",
-        });
-        this.positionCache.updateOraclePrice(marketId, freshPrice);
+          const freshPrice = await readContract(this.client, {
+            address: cachedMarket.params.oracle,
+            abi: oracleAbi,
+            functionName: "price",
+          });
+          this.positionCache.updateOraclePrice(marketId, freshPrice);
 
-        // Sync any unknown positions from chain before checking HF
-        const eventsForMarket = events.filter((e) => e.marketId === marketId);
-        for (const event of eventsForMarket) {
-          const cached = this.positionCache.get(marketId, event.user);
-          if (!cached || cached.collateral === 0n) {
-            // Position not in cache — read from chain
-            try {
-              const position = await this.readPositionFromChain(marketId, event.user);
-              if (position) {
-                this.positionCache.upsert(marketId, event.user, position);
-                console.log(
-                  `${this.logTag}  📥 Synced ${event.user} from chain: collateral=${position.collateral}, borrowShares=${position.borrowShares}`,
-                );
+          const eventsForMarket = events.filter((e) => e.marketId === marketId);
+          for (const event of eventsForMarket) {
+            const cached = this.positionCache.get(marketId, event.user);
+            if (!cached || cached.collateral === 0n) {
+              try {
+                const position = await this.readPositionFromChain(marketId, event.user);
+                if (position) {
+                  this.positionCache.upsert(marketId, event.user, position);
+                  console.log(
+                    `${this.logTag}  📥 Synced ${event.user} from chain: collateral=${position.collateral}, borrowShares=${position.borrowShares}`,
+                  );
+                }
+              } catch {
+                // Ignore chain read errors
               }
-            } catch {
-              // Ignore chain read errors
             }
           }
-        }
 
-        // Check all positions in this market for HF < 1
-        const atRisk = this.positionCache.findAtRiskPositions(marketId, 1, freshPrice);
+          const atRisk = this.positionCache.findAtRiskPositions(marketId, 1, freshPrice);
 
-        if (atRisk.length === 0) {
-          console.log(`${this.logTag}  Market ${marketId.slice(0, 10)}... — no at-risk positions`);
-          continue;
-        }
-
-        console.log(
-          `${this.logTag}  Market ${marketId.slice(0, 10)}... — ${atRisk.length} at-risk position(s)!`,
-        );
-
-        // For each at-risk position, build a full AccrualPosition and attempt liquidation
-        for (const { position: cachedPos, hf } of atRisk) {
-          const accrualPos = this.positionCache.buildAccrualPosition(
-            marketId,
-            cachedPos.user,
-            freshPrice,
-          );
-          if (!accrualPos) continue;
+          if (atRisk.length === 0) {
+            console.log(
+              `${this.logTag}  Market ${marketId.slice(0, 10)}... — no at-risk positions`,
+            );
+            return;
+          }
 
           console.log(
-            `${this.logTag}  🎯 ${cachedPos.user} HF=${hf.toFixed(4)} — attempting liquidation`,
+            `${this.logTag}  Market ${marketId.slice(0, 10)}... — ${atRisk.length} at-risk position(s)!`,
           );
 
-          // Use existing liquidation path (with full profit checks)
-          await this.liquidate(accrualPos);
+          for (const { position: cachedPos, hf } of atRisk) {
+            const accrualPos = this.positionCache.buildAccrualPosition(
+              marketId,
+              cachedPos.user,
+              freshPrice,
+            );
+            if (!accrualPos) continue;
+
+            console.log(
+              `${this.logTag}  🎯 ${cachedPos.user} HF=${hf.toFixed(4)} — attempting liquidation`,
+            );
+
+            await this.liquidate(accrualPos);
+            this._liquidationsAttempted++;
+          }
+        } catch (e) {
+          this._rpcErrors++;
+          this._lastError = String(e);
+          console.error(`${this.logTag}Error processing market ${marketId.slice(0, 10)}...:`, e);
         }
-      } catch (e) {
-        console.error(`${this.logTag}Error processing market ${marketId.slice(0, 10)}...:`, e);
-      }
-    }
+      }),
+    );
   }
 
   /**
@@ -475,6 +504,7 @@ export class LiquidationBot {
   // ─── Slow path: full API refresh (original behavior) ───
 
   async run() {
+    this._lastCheckTimestamp = Math.floor(Date.now() / 1000);
     await this.fetchMarkets();
 
     const { liquidatablePositions, preLiquidatablePositions } =
@@ -493,10 +523,20 @@ export class LiquidationBot {
       });
     }
 
-    await Promise.all([
-      ...liquidatablePositions.map((position) => this.liquidate(position)),
-      ...preLiquidatablePositions.map((position) => this.preLiquidate(position)),
-    ]);
+    // Sort by estimated profit (borrowAssets) descending — high-value positions first
+    liquidatablePositions.sort((a, b) => {
+      const aProfit = a.borrowAssets ?? 0n;
+      const bProfit = b.borrowAssets ?? 0n;
+      return bProfit > aProfit ? 1 : bProfit < aProfit ? -1 : 0;
+    });
+
+    // Serial execution to ensure high-value positions are prioritized
+    for (const position of liquidatablePositions) {
+      await this.liquidate(position);
+    }
+    for (const position of preLiquidatablePositions) {
+      await this.preLiquidate(position);
+    }
   }
 
   private async liquidate(position: AccrualPosition) {
@@ -518,6 +558,17 @@ export class LiquidationBot {
 
     if (!this.checkCooldown(MarketUtils.getMarketId(marketParams), position.user)) return;
 
+    this._liquidationsAttempted++;
+
+    // Bad debt pre-filter: skip early if collateral value < debt and we don't realize bad debt.
+    // Avoids wasting gas on simulation for positions that can't be profitable.
+    if (!this.alwaysRealizeBadDebt && badDebtPosition) {
+      console.log(
+        `${this.logTag}⏭️ Skip ${position.user}: bad debt (collateral fully seizable, no bonus)`,
+      );
+      return;
+    }
+
     if (this.useFlashLoan) {
       await this.liquidateWithFlashLoan(position, badDebtPosition);
       return;
@@ -528,15 +579,27 @@ export class LiquidationBot {
     const encoder = new LiquidationEncoder(executorAddress, client);
 
     if (
-      !(await this.convertCollateralToLoan(
-        marketParams,
+      !(await sharedConvertCollateralToLoan(
+        this.sharedDeps,
+        getAddress(marketParams.collateralToken),
+        getAddress(marketParams.loanToken),
         this.decreaseSeizableCollateral(seizableCollateral, badDebtPosition),
         encoder,
       ))
     )
       return;
 
-    encoder.erc20Approve(marketParams.loanToken, this.chainAddresses.morpho, maxUint256);
+    // Only approve if allowance is insufficient (saves ~5k-21k gas per tx)
+    const morphoAddress = this.chainAddresses.morpho;
+    const currentAllowance = await readContract(this.client, {
+      address: marketParams.loanToken,
+      abi: erc20Abi,
+      functionName: "allowance",
+      args: [executorAddress, morphoAddress],
+    });
+    if (currentAllowance < seizableCollateral) {
+      encoder.erc20Approve(marketParams.loanToken, morphoAddress, maxUint256);
+    }
 
     encoder.morphoBlueLiquidate(
       this.chainAddresses.morpho,
@@ -557,17 +620,43 @@ export class LiquidationBot {
     const calls = encoder.flush();
 
     try {
-      const success = await this.handleTx(encoder, calls, marketParams, badDebtPosition);
+      const success = await simulateAndExec(
+        this.sharedDeps,
+        encoder,
+        calls,
+        marketParams.loanToken,
+        badDebtPosition,
+        undefined,
+        undefined,
+        getAddress(marketParams.collateralToken),
+      );
 
-      if (success)
+      if (success) {
+        this._liquidationsSucceeded++;
+        const collateralUsd =
+          (await priceAsset(
+            this.sharedDeps,
+            getAddress(marketParams.collateralToken),
+            seizableCollateral,
+          )) ?? 0;
+        liquidationTracker.report({
+          protocol: this.logTag,
+          collateralToken: getAddress(marketParams.collateralToken),
+          collateralAmount: seizableCollateral,
+          collateralUsdEstimate: collateralUsd,
+          timestamp: Date.now(),
+        });
         console.log(
           `${this.logTag}Liquidated ${position.user} on ${MarketUtils.getMarketId(marketParams)}`,
         );
-      else
+      } else {
         console.log(
           `${this.logTag}ℹ️ Skipped ${position.user} on ${MarketUtils.getMarketId(marketParams)} (not profitable)`,
         );
+      }
     } catch (error) {
+      this._liquidationsFailed++;
+      this._lastError = String(error);
       console.error(
         `${this.logTag}Failed to liquidate ${position.user} on ${MarketUtils.getMarketId(marketParams)}`,
         error,
@@ -590,8 +679,6 @@ export class LiquidationBot {
     const marketParams = position.market.params;
     const seizableCollateral = position.seizableCollateral ?? 0n;
     const { client, executorAddress } = this;
-
-    const encoder = new LiquidationEncoder(executorAddress, client);
 
     // Flash loan amount = the debt to repay
     const flashLoanAmount = position.borrowAssets ?? 0n;
@@ -636,8 +723,10 @@ export class LiquidationBot {
     // Step 1: Build DEX swap calls (collateral → loan token)
     // These are built on a temporary encoder to capture the raw calls
     const tempEncoder = new LiquidationEncoder(executorAddress, client);
-    const swapSuccess = await this.convertCollateralToLoan(
-      marketParams,
+    const swapSuccess = await sharedConvertCollateralToLoan(
+      this.sharedDeps,
+      getAddress(marketParams.collateralToken),
+      getAddress(marketParams.loanToken),
       this.decreaseSeizableCollateral(seizableCollateral, badDebtPosition),
       tempEncoder,
     );
@@ -656,7 +745,16 @@ export class LiquidationBot {
     // Order: approve → liquidate → DEX swap → skim profit to treasury
     const callbackEncoder = new LiquidationEncoder(executorAddress, client);
 
-    callbackEncoder.erc20Approve(marketParams.loanToken, this.chainAddresses.morpho, maxUint256);
+    // Only approve if allowance is insufficient (saves ~5k-21k gas per tx)
+    const currentAllowance = await readContract(this.client, {
+      address: marketParams.loanToken,
+      abi: erc20Abi,
+      functionName: "allowance",
+      args: [executorAddress, this.chainAddresses.morpho],
+    });
+    if (currentAllowance < flashLoanAmount) {
+      callbackEncoder.erc20Approve(marketParams.loanToken, this.chainAddresses.morpho, maxUint256);
+    }
     callbackEncoder.morphoBlueLiquidate(
       this.chainAddresses.morpho,
       {
@@ -689,34 +787,43 @@ export class LiquidationBot {
 
     const callbackCalls = callbackEncoder.flush();
 
-    // Step 3: Wrap everything in a single Balancer flash loan call.
-    // The executor auto-appends ERC20 transfers back to the Vault after callbackCalls.
-    encoder.balancerFlashLoan(
-      BALANCER_VAULT_ADDRESS,
-      [{ asset: marketParams.loanToken, amount: flashLoanAmount }],
-      callbackCalls,
-    );
-
-    const calls = encoder.flush();
-
+    // Step 3: Wrap with flash loan (with fallback providers) and simulate + execute.
     try {
-      const success = await this.handleFlashLoanSimulationAndExec(
-        encoder,
-        calls,
-        marketParams,
+      const success = await simulateAndExecFlashLoanWithFallback(
+        this.sharedDeps,
+        callbackCalls,
+        marketParams.loanToken,
         badDebtPosition,
         flashLoanAmount,
+        getAddress(marketParams.collateralToken),
       );
 
-      if (success)
+      if (success) {
+        this._liquidationsSucceeded++;
+        const collateralUsd =
+          (await priceAsset(
+            this.sharedDeps,
+            getAddress(marketParams.collateralToken),
+            seizableCollateral,
+          )) ?? 0;
+        liquidationTracker.report({
+          protocol: this.logTag,
+          collateralToken: getAddress(marketParams.collateralToken),
+          collateralAmount: seizableCollateral,
+          collateralUsdEstimate: collateralUsd,
+          timestamp: Date.now(),
+        });
         console.log(
           `${this.logTag}[FlashLoan] Liquidated ${position.user} on ${MarketUtils.getMarketId(marketParams)}`,
         );
-      else
+      } else {
         console.log(
           `${this.logTag}[FlashLoan] Skipped ${position.user} on ${MarketUtils.getMarketId(marketParams)} (not profitable)`,
         );
+      }
     } catch (error) {
+      this._liquidationsFailed++;
+      this._lastError = String(error);
       console.error(
         `${this.logTag}[FlashLoan] Failed to liquidate ${position.user} on ${MarketUtils.getMarketId(marketParams)}`,
         error,
@@ -745,13 +852,33 @@ export class LiquidationBot {
 
     if (!this.checkCooldown(MarketUtils.getMarketId(marketParams), position.user)) return;
 
+    this._liquidationsAttempted++;
+
     const { client, executorAddress } = this;
 
     const encoder = new LiquidationEncoder(executorAddress, client);
 
-    if (!(await this.convertCollateralToLoan(marketParams, seizableCollateral, encoder))) return;
+    if (
+      !(await sharedConvertCollateralToLoan(
+        this.sharedDeps,
+        getAddress(marketParams.collateralToken),
+        getAddress(marketParams.loanToken),
+        seizableCollateral,
+        encoder,
+      ))
+    )
+      return;
 
-    encoder.erc20Approve(marketParams.loanToken, position.preLiquidation, maxUint256);
+    // Only approve if allowance is insufficient (saves ~5k-21k gas per tx)
+    const currentAllowance = await readContract(this.client, {
+      address: marketParams.loanToken,
+      abi: erc20Abi,
+      functionName: "allowance",
+      args: [executorAddress, position.preLiquidation],
+    });
+    if (currentAllowance < seizableCollateral) {
+      encoder.erc20Approve(marketParams.loanToken, position.preLiquidation, maxUint256);
+    }
 
     encoder.preLiquidate(
       position.preLiquidation,
@@ -765,342 +892,48 @@ export class LiquidationBot {
     const calls = encoder.flush();
 
     try {
-      const success = await this.handleTx(encoder, calls, marketParams, false);
+      const success = await simulateAndExec(
+        this.sharedDeps,
+        encoder,
+        calls,
+        marketParams.loanToken,
+        false,
+        undefined,
+        undefined,
+        getAddress(marketParams.collateralToken),
+      );
 
-      if (success)
+      if (success) {
+        this._liquidationsSucceeded++;
+        const collateralUsd =
+          (await priceAsset(
+            this.sharedDeps,
+            getAddress(marketParams.collateralToken),
+            seizableCollateral,
+          )) ?? 0;
+        liquidationTracker.report({
+          protocol: this.logTag,
+          collateralToken: getAddress(marketParams.collateralToken),
+          collateralAmount: seizableCollateral,
+          collateralUsdEstimate: collateralUsd,
+          timestamp: Date.now(),
+        });
         console.log(
           `${this.logTag}Pre-liquidated ${position.user} on ${MarketUtils.getMarketId(marketParams)}`,
         );
-      else
+      } else {
         console.log(
           `${this.logTag}ℹ️ Skipped ${position.user} on ${MarketUtils.getMarketId(marketParams)} (not profitable)`,
         );
+      }
     } catch (error) {
+      this._liquidationsFailed++;
+      this._lastError = String(error);
       console.error(
         `${this.logTag}Failed to pre-liquidate ${position.user} on ${MarketUtils.getMarketId(marketParams)}`,
         error,
       );
     }
-  }
-
-  private async handleTx(
-    encoder: LiquidationEncoder,
-    calls: Hex[],
-    marketParams: IMarketParams,
-    badDebtPosition: boolean,
-    flashLoanAmount?: bigint,
-  ) {
-    const functionData = {
-      abi: executorAbi,
-      functionName: "exec_606BaXt",
-      args: [calls],
-    } as const;
-
-    const [{ results }, gasPrice] = await Promise.all([
-      simulateCalls(this.client, {
-        account: this.client.account.address,
-        calls: [
-          {
-            to: marketParams.loanToken,
-            abi: erc20Abi,
-            functionName: "balanceOf",
-            args: [this.client.account.address],
-          },
-          { to: encoder.address, ...functionData },
-          {
-            to: marketParams.loanToken,
-            abi: erc20Abi,
-            functionName: "balanceOf",
-            args: [this.client.account.address],
-          },
-        ],
-      }),
-      getGasPrice(this.client),
-    ]);
-
-    if (results[1].status !== "success") {
-      console.warn(`${this.logTag}Transaction failed in simulation: ${results[1].error}`);
-      return;
-    }
-
-    if (
-      !(await this.checkProfit(
-        marketParams.loanToken,
-        {
-          beforeTx: results[0].result,
-          afterTx: results[2].result,
-        },
-        {
-          used: results[1].gasUsed,
-          price: gasPrice,
-        },
-        badDebtPosition,
-        flashLoanAmount,
-      ))
-    )
-      return false;
-
-    // TX EXECUTION
-
-    if (this.flashbotAccount) {
-      const signedBundle = await Flashbots.signBundle([
-        {
-          transaction: { to: encoder.address, ...functionData },
-          client: this.client,
-        },
-      ]);
-
-      await Flashbots.sendRawBundle(
-        signedBundle,
-        (await getBlockNumber(this.client)) + 1n,
-        this.flashbotAccount,
-      );
-      return true;
-    } else {
-      await writeContract(this.client, { address: encoder.address, ...functionData });
-    }
-
-    return true;
-  }
-
-  /**
-   * Simulate flash loan tx, check profit (treasury balance change), then execute.
-   * Unlike handleTx, this checks the TREASURY balance (not EOA) because erc20Skim
-   * sends profit to treasury.
-   */
-  private async handleFlashLoanSimulationAndExec(
-    encoder: LiquidationEncoder,
-    calls: Hex[],
-    marketParams: IMarketParams,
-    badDebtPosition: boolean,
-    flashLoanAmount: bigint,
-  ) {
-    const functionData = {
-      abi: executorAbi,
-      functionName: "exec_606BaXt",
-      args: [calls],
-    } as const;
-
-    // Simulate: check treasury balance before/after (profit lands at treasury via erc20Skim)
-    const [{ results }, gasPrice] = await Promise.all([
-      simulateCalls(this.client, {
-        account: this.client.account.address,
-        calls: [
-          {
-            to: marketParams.loanToken,
-            abi: erc20Abi,
-            functionName: "balanceOf",
-            args: [this.treasuryAddress],
-          },
-          { to: encoder.address, ...functionData },
-          {
-            to: marketParams.loanToken,
-            abi: erc20Abi,
-            functionName: "balanceOf",
-            args: [this.treasuryAddress],
-          },
-        ],
-      }),
-      getGasPrice(this.client),
-    ]);
-
-    if (results[1].status !== "success") {
-      console.warn(`${this.logTag}[FlashLoan] Simulation failed: ${results[1].error}`);
-      return false;
-    }
-
-    if (
-      !(await this.checkProfit(
-        marketParams.loanToken,
-        {
-          beforeTx: results[0].result,
-          afterTx: results[2].result,
-        },
-        {
-          used: results[1].gasUsed,
-          price: gasPrice,
-        },
-        badDebtPosition,
-        flashLoanAmount,
-      ))
-    )
-      return false;
-
-    // SECURITY (C3/NC2): Apply slippage safety margin to simulated profit.
-    // Between simulation and execution, on-chain state may change (price moves, competing liquidations).
-    // Require that simulated profit exceeds BOTH slippage margin AND estimated gas cost.
-    const simulatedProfit = (results[2].result ?? 0n) - (results[0].result ?? 0n);
-    const slippageMargin = (flashLoanAmount * FLASH_LOAN_SLIPPAGE_BPS) / BPS_DENOMINATOR;
-    // SECURITY (NC2): Include gas cost in threshold to prevent loss in high-gas environments
-    const estimatedGasCost = results[1].gasUsed * gasPrice;
-    const minProfitThreshold =
-      slippageMargin > estimatedGasCost ? slippageMargin : estimatedGasCost;
-    if (simulatedProfit < minProfitThreshold) {
-      console.warn(
-        `${this.logTag}[FlashLoan] Simulated profit (${simulatedProfit}) below threshold (${minProfitThreshold}), ` +
-          `slippageMargin=${slippageMargin}, gasCost=${estimatedGasCost}, skipping`,
-      );
-      return false;
-    }
-
-    // Execute via executor
-    if (this.flashbotAccount) {
-      const signedBundle = await Flashbots.signBundle([
-        {
-          transaction: { to: encoder.address, ...functionData },
-          client: this.client,
-        },
-      ]);
-      await Flashbots.sendRawBundle(
-        signedBundle,
-        (await getBlockNumber(this.client)) + 1n,
-        this.flashbotAccount,
-      );
-    } else {
-      await writeContract(this.client, { address: encoder.address, ...functionData });
-    }
-
-    return true;
-  }
-
-  private async convertCollateralToLoan(
-    marketParams: IMarketParams,
-    seizableCollateral: bigint,
-    encoder: LiquidationEncoder,
-  ) {
-    let toConvert = {
-      src: getAddress(marketParams.collateralToken),
-      dst: getAddress(marketParams.loanToken),
-      srcAmount: seizableCollateral,
-    };
-
-    for (const venue of this.liquidityVenues) {
-      // SECURITY (NH1): Snapshot encoder state before each venue attempt.
-      // flush() is destructive (returns calls + clears internal buffer).
-      // We re-add savedCalls immediately, then try the venue.
-      // If the venue throws, we flush (discard dirty state) and re-add savedCalls.
-      const savedCalls = encoder.flush();
-      // Re-add saved calls to encoder
-      for (const call of savedCalls) {
-        encoder.pushCall(encoder.address, 0n, call);
-      }
-
-      try {
-        const routeSupported = await venue.supportsRoute(encoder, toConvert.src, toConvert.dst);
-        if (routeSupported) {
-          const snapshot = { ...toConvert };
-          toConvert = await venue.convert(encoder, toConvert);
-          // If convert was a no-op, the encoder state is unchanged — continue to next venue
-          if (toConvert.src === snapshot.src && toConvert.dst === snapshot.dst) {
-            continue;
-          }
-        } else {
-          // SECURITY (NM7): supportsRoute may have pushed calls to encoder internally.
-          // Flush to discard any residual calls, then restore clean state.
-          encoder.flush();
-          for (const call of savedCalls) {
-            encoder.pushCall(encoder.address, 0n, call);
-          }
-        }
-      } catch (error) {
-        console.error(`${this.logTag}Error converting ${toConvert.src} to ${toConvert.dst}`, error);
-        // SECURITY (NH1): Encoder may be dirty — flush to discard dirty state, then restore
-        encoder.flush();
-        for (const call of savedCalls) {
-          encoder.pushCall(encoder.address, 0n, call);
-        }
-        continue;
-      }
-
-      if (toConvert.src === toConvert.dst) return true;
-    }
-
-    return false;
-  }
-
-  private async price(asset: Address, amount: bigint, pricers: Pricer[]) {
-    let price: number | undefined = undefined;
-
-    for (const pricer of pricers) {
-      price = await pricer.price(this.client, asset);
-      if (price !== undefined) break;
-    }
-
-    if (price === undefined) return undefined;
-
-    const decimals =
-      asset === this.wNative
-        ? 18
-        : await readContract(this.client, {
-            address: asset,
-            abi: erc20Abi,
-            functionName: "decimals",
-          });
-
-    return parseFloat(formatUnits(amount, decimals)) * price;
-  }
-
-  private async checkProfit(
-    loanAsset: Address,
-    loanAssetBalance: {
-      beforeTx: bigint | undefined;
-      afterTx: bigint | undefined;
-    },
-    gas: {
-      used: bigint;
-      price: bigint;
-    },
-    badDebtPosition: boolean,
-    flashLoanAmount?: bigint,
-  ) {
-    if (this.alwaysRealizeBadDebt && badDebtPosition) return true;
-    // SECURITY (H3): If no pricers configured, REFUSE to execute — do not skip profit check.
-    // Running without price feeds means we cannot verify profitability, so treat as unsafe.
-    if (this.pricers === undefined || this.pricers.length === 0) {
-      console.error(
-        `${this.logTag}⛔ No pricers configured — refusing to execute trade (cannot verify profitability). ` +
-          `Please configure pricers in chain config or set ALWAYS_REALIZE_BAD_DEBT=true to bypass.`,
-      );
-      return false;
-    }
-
-    if (loanAssetBalance.beforeTx === undefined || loanAssetBalance.afterTx === undefined)
-      return false;
-
-    let loanAssetProfit = loanAssetBalance.afterTx - loanAssetBalance.beforeTx;
-
-    // Deduct flash loan fee from profit
-    if (flashLoanAmount !== undefined && flashLoanAmount > 0n) {
-      const flashLoanFee = this.calculateFlashLoanFee(flashLoanAmount);
-      loanAssetProfit -= flashLoanFee;
-    }
-
-    if (loanAssetProfit <= 0n) return false;
-
-    const [loanAssetProfitUsd, gasUsedUsd] = await Promise.all([
-      this.price(loanAsset, loanAssetProfit, this.pricers),
-      this.price(this.wNative, gas.used * gas.price, this.pricers),
-    ]);
-
-    if (loanAssetProfitUsd === undefined || gasUsedUsd === undefined) return false;
-
-    const profitUsd = loanAssetProfitUsd - gasUsedUsd;
-
-    return profitUsd > 0;
-  }
-
-  /**
-   * Calculate flash loan fee based on provider.
-   * Balancer V2: 0% fee (protocol currently charges nothing)
-   * Aave V3: 0.05% (5 bps) fee
-   */
-  private calculateFlashLoanFee(amount: bigint): bigint {
-    if (this.flashLoanProvider === "balancer") {
-      // Balancer V2 flash loans have 0% fee — BALANCER_FLASH_LOAN_FEE_BPS is 0n
-      return (amount * BALANCER_FLASH_LOAN_FEE_BPS) / BPS_DENOMINATOR;
-    }
-    // Aave V3: 0.05% = 5 / 10000
-    return (amount * 5n) / 10000n;
   }
 
   private decreaseSeizableCollateral(seizableCollateral: bigint, badDebtPosition: boolean) {
@@ -1131,21 +964,50 @@ export class LiquidationBot {
     const vaultWhitelist = this.vaultWhitelist;
     console.log(`${this.logTag}📝 Watching markets in the following vaults:`, vaultWhitelist);
 
-    const whitelistedMarketsFromVaults = await this.dataProvider.fetchMarkets(
-      this.client,
-      vaultWhitelist,
-    );
+    try {
+      this._rpcTotal++;
+      const whitelistedMarketsFromVaults = await this.dataProvider.fetchMarkets(
+        this.client,
+        vaultWhitelist,
+      );
 
-    // SECURITY (NH2): 動態重新載入 discovery 層批准的市場，而非僅啟動時靜態載入
-    const dynamicApprovedMarkets = loadApprovedMarketIds(this.chainId);
-    const allAdditional = [
-      ...new Set([...this.additionalMarketsWhitelist, ...dynamicApprovedMarkets]),
-    ];
+      // SECURITY (NH2): 動態重新載入 discovery 層批准的市場，而非僅啟動時靜態載入
+      const dynamicApprovedMarkets = loadApprovedMarketIds(this.chainId);
+      const allAdditional = [
+        ...new Set([...this.additionalMarketsWhitelist, ...dynamicApprovedMarkets]),
+      ];
 
-    this.coveredMarkets = [...whitelistedMarketsFromVaults, ...allAdditional];
+      this.coveredMarkets = [...whitelistedMarketsFromVaults, ...allAdditional];
 
-    console.log(
-      `${this.logTag}📝 Covered markets: ${this.coveredMarkets.length} (vault: ${whitelistedMarketsFromVaults.length}, additional: ${allAdditional.length})`,
-    );
+      console.log(
+        `${this.logTag}📝 Covered markets: ${this.coveredMarkets.length} (vault: ${whitelistedMarketsFromVaults.length}, additional: ${allAdditional.length})`,
+      );
+    } catch (e) {
+      this._rpcErrors++;
+      this._lastError = String(e);
+      console.error(`${this.logTag}Failed to fetch markets:`, e);
+    }
+  }
+
+  /**
+   * Get current bot health status for monitoring endpoints.
+   */
+  getHealthStatus() {
+    const rpcErrorRate = this._rpcTotal > 0 ? this._rpcErrors / this._rpcTotal : 0;
+    return {
+      protocol: "morpho" as const,
+      lastCheckTimestamp: this._lastCheckTimestamp,
+      lastCheckBlock: this._lastCheckBlock,
+      registryAccountCount: this.positionCache.stats.positions,
+      cachedReservesCount: this.coveredMarkets.length,
+      liquidationsAttempted: this._liquidationsAttempted,
+      liquidationsSucceeded: this._liquidationsSucceeded,
+      liquidationsFailed: this._liquidationsFailed,
+      rpcErrors: this._rpcErrors,
+      rpcTotal: this._rpcTotal,
+      rpcErrorRate,
+      lastError: this._lastError,
+      isHealthy: rpcErrorRate < 0.3,
+    };
   }
 }

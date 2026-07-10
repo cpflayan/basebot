@@ -9,6 +9,7 @@
     "test:liquidity-venues": "pnpm build && vitest --dir apps/liquidity-venues",
     "test:pricers": "pnpm build && vitest --dir apps/pricers",
     "test:client": "pnpm build && vitest --dir apps/client",
+    "test:fork-suite": "pnpm build && vitest run apps/client/test/vitest/allBots.fork.test.ts",
     "test:hyperindex": "pnpm --filter @morpho-blue-liquidation-bot/hyperindex test",
     "build": "pnpm build:config && pnpm --parallel --filter @morpho-blue-liquidation-bot/data-providers --filter @morpho-blue-liquidation-bot/liquidity-venues --filter @morpho-blue-liquidation-bot/pricers build",
     "build:config": "pnpm --filter @morpho-blue-liquidation-bot/config build",
@@ -17,6 +18,8 @@
     "build:pricers": "pnpm --filter @morpho-blue-liquidation-bot/pricers build",
     "deploy:executor": "pnpm build && tsx apps/client/src/deployExecutor.ts",
     "liquidate": "pnpm build && tsx apps/client/src/script.ts --env-file=.env",
+    "discovery": "cd morpho-liquidation-discovery && node dist/src/discovery/run.js",
+    "start": "pnpm build && concurrently --names BOT,DISCO -c blue,green \"tsx apps/client/src/script.ts --env-file=.env\" \"cd morpho-liquidation-discovery && node dist/src/discovery/run.js\"",
     "skim": "pnpm build && tsx apps/client/src/skim.ts --env-file=.env"
   },
   "lint-staged": {

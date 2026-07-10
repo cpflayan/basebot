@@ -1,6 +1,6 @@
 import { AERODROME_FACTORY } from "@morpho-blue-liquidation-bot/config";
 import type { ExecutorEncoder } from "executooor-viem";
-import { type Address, encodeFunctionData, erc20Abi, fromHex, zeroAddress } from "viem";
+import { type Address, encodeFunctionData, erc20Abi, zeroAddress } from "viem";
 import { readContract } from "viem/actions";
 
 import { aerodromeFactoryAbi, aerodromePoolAbi } from "../abis/aerodrome";
@@ -35,11 +35,6 @@ export class AerodromeVenue implements LiquidityVenue {
     try {
       const pool = poolInfo.address;
 
-      // Determine token ordering
-      const isSrcToken0 = fromHex(src, "bigint") < fromHex(dst, "bigint");
-      const amount0Out = isSrcToken0 ? 0n : srcAmount;
-      const amount1Out = isSrcToken0 ? srcAmount : 0n;
-
       // Step 1: Transfer collateral to the pool
       encoder.pushCall(
         src,
@@ -51,15 +46,17 @@ export class AerodromeVenue implements LiquidityVenue {
         }),
       );
 
-      // Step 2: Call pool.swap - Solidly style
+      // Step 2: Call pool.swap — Solidly style
       // swap(uint256 amount0Out, uint256 amount1Out, address to, bytes data)
+      // Pass 0, 0 — pool calculates output automatically based on AMM formula
+      // (balance0 * balance1 >= reserve0 * reserve1) after the input transfer above.
       encoder.pushCall(
         pool,
         0n,
         encodeFunctionData({
           abi: aerodromePoolAbi,
           functionName: "swap",
-          args: [amount0Out, amount1Out, encoder.address, "0x"],
+          args: [0n, 0n, encoder.address, "0x"],
         }),
       );
 

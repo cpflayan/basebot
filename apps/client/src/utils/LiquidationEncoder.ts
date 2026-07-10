@@ -178,4 +178,32 @@ export class LiquidationEncoder<
       }),
     );
   }
+
+  // ─── Flash Loan Providers ───
+
+  /**
+   * Morpho Blue flash loan — 0% fee, single-asset.
+   * Callback: onMorphoFlashLoan(uint256,bytes)
+   */
+  public morphoBlueFlashLoan(
+    morphoAddress: Address,
+    asset: Address,
+    amount: bigint,
+    callbackCalls?: Hex[],
+  ) {
+    this.blueFlashLoan(morphoAddress, asset, amount, callbackCalls);
+  }
+
+  /**
+   * Aave V3 flash loan — 0.09% premium on Base.
+   * Callback: executeOperation(address[],uint256[],uint256[],address,bytes)
+   */
+  public aaveFlashLoanWithPremium(
+    aavePoolAddress: Address,
+    requests: { asset: Address; amount: bigint }[],
+    premium: bigint,
+    callbackCalls?: Hex[],
+  ) {
+    this.aaveFlashLoan(aavePoolAddress, requests, premium, callbackCalls);
+  }
 }

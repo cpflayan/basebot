@@ -10,6 +10,7 @@ import type {
   DataProviderName,
   LiquidityVenueName,
   PricerName,
+  FlashLoanProvider,
 } from "./types";
 
 dotenv.config();
@@ -21,7 +22,10 @@ export function chainConfig(chainId: number): ChainConfig {
   }
 
   const { vaultWhitelist, additionalMarketsWhitelist } = config.options;
-  if (vaultWhitelist.length === 0 && additionalMarketsWhitelist.length === 0) {
+  if (
+    (Array.isArray(vaultWhitelist) ? vaultWhitelist.length === 0 : false) &&
+    additionalMarketsWhitelist.length === 0
+  ) {
     throw new Error(
       `Vault whitelist and additional markets whitelist both empty for chainId ${chainId}`,
     );
@@ -71,6 +75,7 @@ export {
   type DataProviderName,
   type LiquidityVenueName,
   type PricerName,
+  type FlashLoanProvider,
 };
 export * from "./dataProviders";
 export * from "./liquidityVenues";
@@ -80,5 +85,6 @@ export {
   POSITION_LIQUIDATION_COOLDOWN_ENABLED,
   MARKETS_FETCHING_COOLDOWN_PERIOD,
   ALWAYS_REALIZE_BAD_DEBT,
+  TOKEN_BLACKLIST_CONFIG,
   loadApprovedMarketIds,
 } from "./config";

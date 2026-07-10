@@ -8,14 +8,13 @@ import type { Config } from "./types";
 
 /// Discovery layer integration — load approved markets from morpho-liquidation-discovery
 
-const DISCOVERY_DATA_DIR = process.env.WHITELIST_DATA_DIR ?? "";
-
 // SECURITY (NM5): 驗證 marketId 格式為 0x + 64 hex chars
 const MARKET_ID_REGEX = /^0x[0-9a-fA-F]{64}$/;
 
 export function loadApprovedMarketIds(chainId: number): `0x${string}`[] {
-  if (!DISCOVERY_DATA_DIR) return [];
-  const filePath = path.join(DISCOVERY_DATA_DIR, `discovered-markets.${chainId}.json`);
+  const discoveryDir = process.env.WHITELIST_DATA_DIR ?? "";
+  if (!discoveryDir) return [];
+  const filePath = path.join(discoveryDir, `discovered-markets.${chainId}.json`);
   if (!fs.existsSync(filePath)) return [];
   try {
     const raw = JSON.parse(fs.readFileSync(filePath, "utf-8"));
@@ -44,6 +43,11 @@ export function loadApprovedMarketIds(chainId: number): `0x${string}`[] {
 
 export const ALWAYS_REALIZE_BAD_DEBT = false; // true if you want to always realize bad debt
 
+/// Token blacklist — comma-separated addresses to skip in liquidations
+export const TOKEN_BLACKLIST_CONFIG = process.env.TOKEN_BLACKLIST
+  ? process.env.TOKEN_BLACKLIST.split(",").map((addr) => addr.trim().toLowerCase())
+  : [];
+
 /// Cooldown mechanisms
 
 export const MARKETS_FETCHING_COOLDOWN_PERIOD = 60 * 60 * 24; // 24 hours (1 day)
@@ -69,13 +73,13 @@ export const chainConfigs: Record<number, Config> = {
       liquidityVenues: [
         "pendlePT",
         "midas",
-        "1inch",
         "erc20Wrapper",
         "erc4626",
         "uniswapV3",
         "uniswapV4",
+        "1inch",
       ],
-      pricers: ["defillama", "chainlink", "uniswapV3"],
+      pricers: ["chainlink", "defillama", "uniswapV3"],
       liquidationBufferBps: 50,
       useFlashbots: true,
       blockInterval: 2,
@@ -91,19 +95,20 @@ export const chainConfigs: Record<number, Config> = {
       liquidityVenues: [
         "pendlePT",
         "midas",
-        "1inch",
         "erc20Wrapper",
         "erc4626",
         "aerodrome",
         "uniswapV3",
         "uniswapV4",
+        "1inch",
       ],
-      pricers: ["defillama", "chainlink", "uniswapV3"],
+      pricers: ["chainlink", "pyth", "defillama", "uniswapV3"],
       liquidationBufferBps: 50,
       useFlashbots: false, // SECURITY (M6): Base 不支持 Flashbots，交易進入公開 mempool，存在三明治攻擊風險
       blockInterval: 10,
       useFlashLoan: true, // SECURITY (M6): Flash loan 在公開 mempool 中可被 sandwich，已於 bot.ts 添加模擬利潤安全邊際
       flashLoanProvider: "balancer",
+      flashLoanFallbackProviders: ["morpho", "aave"],
       treasuryAddress: "0x5faB997dd358c75680fF2b33E403aB81530fE30a",
       cometWatchlist: {
         enabled: true,
@@ -267,6 +272,7 @@ export const chainConfigs: Record<number, Config> = {
         ],
         pollIntervalBlocks: 5,
       },
+      scanRpcUrls: ["https://mainnet.base.org", process.env.ALCHEMY_BASE_RPC ?? ""].filter(Boolean),
     },
   },
   [unichain.id]: {
@@ -276,7 +282,7 @@ export const chainConfigs: Record<number, Config> = {
       dataProvider: "morphoApi",
       vaultWhitelist: "morpho-api",
       additionalMarketsWhitelist: [],
-      liquidityVenues: ["1inch", "erc20Wrapper", "erc4626", "uniswapV3", "uniswapV4"],
+      liquidityVenues: ["erc20Wrapper", "erc4626", "uniswapV3", "uniswapV4", "1inch"],
       liquidationBufferBps: 50,
       useFlashbots: false,
       blockInterval: 5,
@@ -302,7 +308,7 @@ export const chainConfigs: Record<number, Config> = {
       dataProvider: "morphoApi",
       vaultWhitelist: "morpho-api",
       additionalMarketsWhitelist: [],
-      liquidityVenues: ["pendlePT", "1inch", "erc20Wrapper", "erc4626", "uniswapV3", "uniswapV4"],
+      liquidityVenues: ["pendlePT", "erc20Wrapper", "erc4626", "uniswapV3", "uniswapV4", "1inch"],
       liquidationBufferBps: 50,
       useFlashbots: false,
     },

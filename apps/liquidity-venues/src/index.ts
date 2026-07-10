@@ -12,3 +12,4 @@ export * from "./zeroEx";
 export * from "./factory";
 export type { LiquidityVenue } from "./liquidityVenue";
 export type { ToConvert } from "./types";
+export { uniswapV3FactoryAbi, uniswapV3PoolAbi } from "./abis/uniswapV3";

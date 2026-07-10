@@ -1,0 +1,201 @@
+/**
+ * BaseAccountRegistry — shared base class for protocol-specific account registries.
+ *
+ * Provides:
+ *   - In-memory account tracking (Map<address, Set<account>>)
+ *   - Last-scanned-block tracking per address
+ *   - JSON persistence with atomic write (write .tmp → rename)
+ *   - Scan orchestration (initialScan, scanNewEvents)
+ *
+ * Subclasses implement `scanRange()` with protocol-specific event decoding.
+ */
+import fs from "node:fs";
+import path from "node:path";
+
+import {
+  type Address,
+  type Transport,
+  type Chain,
+  type Account,
+  type Client,
+  type WalletClient,
+} from "viem";
+import { getBlockNumber } from "viem/actions";
+
+/** Max blocks per eth_getLogs call — Base 公開 RPC 上限 10,000 */
+const SCAN_BATCH_SIZE = 10_000;
+
+/** Generic client type for read-only scanning */
+export type ScanClient = Client<Transport, Chain> | WalletClient<Transport, Chain, Account>;
+
+interface RegistryState {
+  accounts: Record<string, string[]>;
+  lastScannedBlock: Record<string, number>;
+}
+
+export abstract class BaseAccountRegistry {
+  /** address (lowercase) → Set<account (lowercase)> */
+  protected accounts = new Map<string, Set<Address>>();
+  /** address (lowercase) → last scanned block */
+  protected lastScannedBlock = new Map<string, number>();
+  /** Path for JSON persistence */
+  protected filePath: string;
+  /** Log prefix (e.g. "[CometRegistry]", "[MoonwellRegistry]") */
+  protected abstract readonly logPrefix: string;
+
+  constructor(filePath: string) {
+    this.filePath = filePath;
+  }
+
+  // ─── Persistence ───
+
+  loadFromFile(): void {
+    if (!fs.existsSync(this.filePath)) return;
+    try {
+      const raw = JSON.parse(fs.readFileSync(this.filePath, "utf-8")) as RegistryState;
+      for (const [key, addrs] of Object.entries(raw.accounts ?? {})) {
+        this.accounts.set(key, new Set(addrs as Address[]));
+      }
+      for (const [key, block] of Object.entries(raw.lastScannedBlock ?? {})) {
+        this.lastScannedBlock.set(key, block);
+      }
+      const total = [...this.accounts.values()].reduce((s, set) => s + set.size, 0);
+      console.log(`${this.logPrefix} Loaded ${total} accounts from ${this.filePath}`);
+    } catch (e) {
+      console.error(`${this.logPrefix} Failed to load from ${this.filePath}:`, e);
+    }
+  }
+
+  saveToFile(): void {
+    const dir = path.dirname(this.filePath);
+    if (dir && !fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+
+    const state: RegistryState = {
+      accounts: {},
+      lastScannedBlock: {},
+    };
+    for (const [key, set] of this.accounts) {
+      state.accounts[key] = [...set];
+    }
+    for (const [key, block] of this.lastScannedBlock) {
+      state.lastScannedBlock[key] = block;
+    }
+    const tmpPath = this.filePath + ".tmp";
+    fs.writeFileSync(tmpPath, JSON.stringify(state, null, 2));
+    fs.renameSync(tmpPath, this.filePath);
+  }
+
+  // ─── Scan orchestration ───
+
+  async initialScan(
+    client: ScanClient,
+    contractAddress: Address,
+    deployBlock: number,
+    logTag: string,
+    scanClient?: ScanClient,
+  ): Promise<void> {
+    const rpcClient = scanClient ?? client;
+    const key = contractAddress.toLowerCase();
+    const lastScanned = this.lastScannedBlock.get(key) ?? 0;
+    const fromBlock = Math.max(deployBlock, lastScanned + 1);
+
+    const currentBlock = Number(await getBlockNumber(rpcClient));
+    console.log(
+      `${logTag}🔍 Scanning ${contractAddress.slice(0, 10)}... from block ${fromBlock} to ${currentBlock}`,
+    );
+
+    let scanned = 0;
+    for (let start = fromBlock; start <= currentBlock; start += SCAN_BATCH_SIZE) {
+      const end = Math.min(start + SCAN_BATCH_SIZE - 1, currentBlock);
+      await this.scanRange(rpcClient, contractAddress, start, end, logTag);
+      scanned += end - start + 1;
+    }
+
+    this.lastScannedBlock.set(key, currentBlock);
+    this.saveToFile();
+
+    const count = this.accounts.get(key)?.size ?? 0;
+    console.log(
+      `${logTag}✅ Scan complete: ${scanned} blocks scanned, ${count} unique accounts found`,
+    );
+  }
+
+  async scanNewEvents(
+    client: ScanClient,
+    contractAddress: Address,
+    logTag: string,
+  ): Promise<number> {
+    const key = contractAddress.toLowerCase();
+    const lastScanned = this.lastScannedBlock.get(key);
+    if (lastScanned === undefined) {
+      console.warn(
+        `${logTag}No previous scan found for ${contractAddress.slice(0, 10)}..., skipping`,
+      );
+      return 0;
+    }
+
+    const currentBlock = Number(await getBlockNumber(client));
+    const fromBlock = lastScanned + 1;
+    if (fromBlock > currentBlock) return 0;
+
+    let newAccounts = 0;
+    for (let start = fromBlock; start <= currentBlock; start += SCAN_BATCH_SIZE) {
+      const end = Math.min(start + SCAN_BATCH_SIZE - 1, currentBlock);
+      const added = await this.scanRange(client, contractAddress, start, end, logTag);
+      newAccounts += added;
+    }
+
+    this.lastScannedBlock.set(key, currentBlock);
+    this.saveToFile();
+
+    if (newAccounts > 0) {
+      console.log(
+        `${logTag}📥 Incremental scan: ${newAccounts} new account(s) for ${contractAddress.slice(0, 10)}...`,
+      );
+    }
+
+    return newAccounts;
+  }
+
+  // ─── Abstract: protocol-specific event scanning ───
+
+  protected abstract scanRange(
+    client: ScanClient,
+    contractAddress: Address,
+    fromBlock: number,
+    toBlock: number,
+    logTag: string,
+  ): Promise<number>;
+
+  // ─── Account management ───
+
+  protected addAccount(contractAddress: Address, account: Address): number {
+    const key = contractAddress.toLowerCase();
+    let set = this.accounts.get(key);
+    if (!set) {
+      set = new Set();
+      this.accounts.set(key, set);
+    }
+    const accountKey = account.toLowerCase();
+    if (set.has(accountKey as Address)) return 0;
+    set.add(accountKey as Address);
+    return 1;
+  }
+
+  getAccounts(contractAddress: Address): Address[] {
+    const key = contractAddress.toLowerCase();
+    const set = this.accounts.get(key);
+    if (!set) return [];
+    return [...set] as Address[];
+  }
+
+  get totalAccounts(): number {
+    return [...this.accounts.values()].reduce((s, set) => s + set.size, 0);
+  }
+
+  getLastScannedBlock(contractAddress: Address): number | undefined {
+    return this.lastScannedBlock.get(contractAddress.toLowerCase());
+  }
+}

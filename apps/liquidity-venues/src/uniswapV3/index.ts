@@ -14,7 +14,7 @@ import {
   fromHex,
   zeroAddress,
 } from "viem";
-import { readContract } from "viem/actions";
+import { readContract, multicall } from "viem/actions";
 
 import { uniswapV3FactoryAbi, uniswapV3PoolAbi } from "../abis/uniswapV3";
 import type { LiquidityVenue } from "../liquidityVenue";
@@ -41,18 +41,19 @@ export class UniswapV3Venue implements LiquidityVenue {
     }
 
     try {
-      const liquidities = await Promise.all(
-        pools.map(async (pool) => {
-          return {
-            pool,
-            amount: await readContract(encoder.client, {
-              address: pool,
-              abi: uniswapV3PoolAbi,
-              functionName: "liquidity",
-            }),
-          };
-        }),
-      );
+      const liquidityResults = await multicall(encoder.client, {
+        contracts: pools.map((pool) => ({
+          address: pool,
+          abi: uniswapV3PoolAbi,
+          functionName: "liquidity" as const,
+        })),
+        allowFailure: true,
+      });
+
+      const liquidities = pools.map((pool, i) => ({
+        pool,
+        amount: liquidityResults[i]?.status === "success" ? liquidityResults[i].result : 0n,
+      }));
 
       const biggestPool = liquidities.reduce(
         (max, liquidity) => (max !== null && liquidity.amount > max.amount ? liquidity : max),

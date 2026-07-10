@@ -14,7 +14,10 @@
  *   - Liquidation check: getAccountLiquidity → shortfall > 0 (not isLiquidatable)
  *   - Repay amount: min(borrowBalance × closeFactor, availableBalance)
  */
-import type { MoonwellWatchlistConfig } from "@morpho-blue-liquidation-bot/config";
+import type {
+  MoonwellWatchlistConfig,
+  FlashLoanProvider,
+} from "@morpho-blue-liquidation-bot/config";
 import type { LiquidityVenue } from "@morpho-blue-liquidation-bot/liquidity-venues";
 import type { Pricer } from "@morpho-blue-liquidation-bot/pricers";
 import {
@@ -25,34 +28,27 @@ import {
   type Client,
   type WalletClient,
   type LocalAccount,
+  erc20Abi,
   maxUint256,
-  createPublicClient,
-  http,
 } from "viem";
-import { readContract, watchBlocks } from "viem/actions";
+import { readContract, multicall } from "viem/actions";
 import { base } from "viem/chains";
 
-import { BALANCER_VAULT_ADDRESS } from "./abis/BalancerVault.js";
 import { comptrollerAbi, mTokenAbi, MOONWELL_UNDERLYING_MAP } from "./abis/Moonwell.js";
 import { MoonwellAccountRegistry } from "./moonwellAccountRegistry.js";
 import { PositionLiquidationCooldownMechanism } from "./utils/cooldownMechanisms.js";
 import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
+import { liquidationTracker } from "./utils/liquidationState.js";
+import { createScanClient } from "./utils/rpcFallback.js";
 import {
   type SharedExecutionDeps,
+  TOKEN_BLACKLIST,
   convertCollateralToLoan,
-  simulateAndExecFlashLoan,
+  createBlockPolling,
+  priceAsset,
+  simulateAndExecFlashLoanWithFallback,
   simulateAndExec,
 } from "./utils/sharedExecution.js";
-
-/** Base 官方公開 RPC — 支持 10,000 區塊範圍的 eth_getLogs */
-const BASE_PUBLIC_RPC = "https://mainnet.base.org";
-
-/**
- * Token blacklist — skip markets involving these tokens.
- */
-const TOKEN_BLACKLIST = new Set<string>([
-  "0x35e5db674d8e93a03d814fa0ada70731efe8a4b9", // USR (depegged)
-]);
 
 /** mantissa 精度 (1e18) */
 const MANTISSA = 10n ** 18n;
@@ -74,9 +70,11 @@ export interface MoonwellLiquidationBotInputs {
   positionLiquidationCooldownMechanism?: PositionLiquidationCooldownMechanism;
   flashbotAccount?: LocalAccount;
   useFlashLoan?: boolean;
-  flashLoanProvider?: "balancer" | "aave";
+  flashLoanProvider?: FlashLoanProvider;
+  flashLoanFallbackProviders?: FlashLoanProvider[];
   alwaysRealizeBadDebt?: boolean;
   registryFilePath?: string;
+  scanRpcUrls?: string[];
 }
 
 interface MTokenInfo {
@@ -99,7 +97,8 @@ export class MoonwellLiquidationBot {
   private cooldown?: PositionLiquidationCooldownMechanism;
   private flashbotAccount?: LocalAccount;
   private useFlashLoan: boolean;
-  private flashLoanProvider: "balancer" | "aave";
+  private flashLoanProvider: FlashLoanProvider;
+  private flashLoanFallbackProviders: FlashLoanProvider[];
   private alwaysRealizeBadDebt: boolean;
   private registry: MoonwellAccountRegistry;
   private pollIntervalBlocks: number;
@@ -135,6 +134,9 @@ export class MoonwellLiquidationBot {
   private _liquidationsFailed = 0;
   private _lastCheckTimestamp = 0;
   private _lastCheckBlock = 0;
+  private _rpcErrors = 0;
+  private _rpcTotal = 0;
+  private _lastError?: string;
 
   constructor(inputs: MoonwellLiquidationBotInputs) {
     this.logTag = inputs.logTag;
@@ -150,6 +152,7 @@ export class MoonwellLiquidationBot {
     this.flashbotAccount = inputs.flashbotAccount;
     this.useFlashLoan = inputs.useFlashLoan ?? false;
     this.flashLoanProvider = inputs.flashLoanProvider ?? "balancer";
+    this.flashLoanFallbackProviders = inputs.flashLoanFallbackProviders ?? [];
     this.alwaysRealizeBadDebt = inputs.alwaysRealizeBadDebt ?? false;
     this.pollIntervalBlocks = inputs.moonwellWatchlist.pollIntervalBlocks ?? 5;
 
@@ -175,13 +178,11 @@ export class MoonwellLiquidationBot {
       flashbotAccount: this.flashbotAccount,
       alwaysRealizeBadDebt: this.alwaysRealizeBadDebt,
       flashLoanProvider: this.flashLoanProvider,
+      flashLoanFallbackProviders: this.flashLoanFallbackProviders,
     };
 
     // Read-only client on Base public RPC for historical scanning
-    this.scanClient = createPublicClient({
-      chain: base,
-      transport: http(BASE_PUBLIC_RPC),
-    });
+    this.scanClient = createScanClient(base, inputs.scanRpcUrls ?? ["https://mainnet.base.org"]);
   }
 
   // ─── Initialization ───
@@ -277,6 +278,7 @@ export class MoonwellLiquidationBot {
    */
   private async cacheComptrollerParams(): Promise<void> {
     try {
+      this._rpcTotal += 2;
       const [cf, li] = await Promise.all([
         readContract(this.client, {
           address: this.comptroller,
@@ -295,6 +297,8 @@ export class MoonwellLiquidationBot {
         `${this.logTag}📋 Comptroller params: closeFactor=${Number(cf) / 1e18}, liquidationIncentive=${Number(li) / 1e18}`,
       );
     } catch (e) {
+      this._rpcErrors += 2;
+      this._lastError = String(e);
       // Fallback to standard Compound V2 defaults
       this.closeFactor = 5n * 10n ** 17n; // 0.5e18 = 50%
       this.liquidationIncentive = 11n * 10n ** 17n; // 1.1e18 = 10% bonus
@@ -315,6 +319,7 @@ export class MoonwellLiquidationBot {
 
     const results = await Promise.allSettled(
       this.mTokenList.map(async (mToken) => {
+        this._rpcTotal++;
         const rf = await readContract(this.client, {
           address: mToken.address,
           abi: mTokenAbi,
@@ -353,40 +358,20 @@ export class MoonwellLiquidationBot {
    * Returns an unwatch function.
    */
   startPolling(): () => void {
-    let blockCount = 0;
-    let running = false;
-
-    const unwatch = watchBlocks(this.client, {
-      onBlock: () => {
-        blockCount++;
-        if (blockCount % this.pollIntervalBlocks !== 0) return;
-        if (running) return; // Prevent overlapping runs
-        running = true;
-
-        this.checkAllMarkets()
-          .catch((e: unknown) => {
-            console.error(`${this.logTag}Error in checkAllMarkets:`, e);
-          })
-          .finally(() => {
-            running = false;
-          });
-      },
-      onError: (error: Error) => {
-        console.error(`${this.logTag}watchBlocks error:`, error);
-      },
+    return createBlockPolling({
+      logTag: this.logTag,
+      client: this.client,
+      pollIntervalBlocks: this.pollIntervalBlocks,
+      onTick: () => this.checkAllMarkets(),
     });
-
-    console.log(
-      `${this.logTag}📡 Moonwell polling started (every ${this.pollIntervalBlocks} blocks)`,
-    );
-
-    return unwatch;
   }
 
   /**
    * Core check loop: for each mToken, scan new events, then check getAccountLiquidity for all known accounts.
    */
   async checkAllMarkets(): Promise<void> {
+    this._lastCheckTimestamp = Math.floor(Date.now() / 1000);
+
     // Incremental scan for new accounts across all mTokens
     for (const mToken of this.mTokenList) {
       try {
@@ -439,30 +424,42 @@ export class MoonwellLiquidationBot {
   private async batchCheckShortfall(
     accounts: Address[],
   ): Promise<{ account: Address; shortfall: bigint }[]> {
-    const results = await Promise.allSettled(
-      accounts.map(async (account) => {
-        const [error, , shortfall] = await readContract(this.client, {
-          address: this.comptroller,
-          abi: comptrollerAbi,
-          functionName: "getAccountLiquidity",
-          args: [account],
-        });
-        // error === 0 means success, shortfall > 0 means liquidatable
-        return error === 0n && shortfall > 0n ? { account, shortfall } : null;
-      }),
-    );
+    const BATCH_SIZE = 50;
+    const liquidatable: { account: Address; shortfall: bigint }[] = [];
 
-    return results
-      .filter(
-        (
-          r,
-        ): r is PromiseFulfilledResult<{
-          account: Address;
-          shortfall: bigint;
-        } | null> => r.status === "fulfilled",
-      )
-      .map((r) => r.value)
-      .filter((a): a is { account: Address; shortfall: bigint } => a !== null);
+    for (let i = 0; i < accounts.length; i += BATCH_SIZE) {
+      const batch = accounts.slice(i, i + BATCH_SIZE);
+      try {
+        this._rpcTotal += batch.length;
+        const results = await multicall(this.client, {
+          contracts: batch.map((account) => ({
+            address: this.comptroller,
+            abi: comptrollerAbi,
+            functionName: "getAccountLiquidity" as const,
+            args: [account] as const,
+          })),
+          allowFailure: true,
+        });
+
+        for (let j = 0; j < results.length; j++) {
+          const result = results[j]!;
+          if (result.status !== "success") {
+            this._rpcErrors++;
+            continue;
+          }
+          const [error, , shortfall] = result.result;
+          if (error === 0n && shortfall > 0n) {
+            liquidatable.push({ account: batch[j]!, shortfall });
+          }
+        }
+      } catch (e) {
+        this._rpcErrors += batch.length;
+        this._lastError = String(e);
+        console.warn(`${this.logTag}⚠️ batchCheckShortfall batch ${i / BATCH_SIZE} failed:`, e);
+      }
+    }
+
+    return liquidatable;
   }
 
   // ─── Liquidation execution ───
@@ -486,6 +483,8 @@ export class MoonwellLiquidationBot {
     }
 
     console.log(`${this.logTag}  🎯 ${account} — attempting Moonwell liquidation`);
+
+    this._liquidationsAttempted++;
 
     // Find all borrow positions, sorted by balance descending
     const borrowPositions = await this.findAllBorrowPositions(account);
@@ -548,6 +547,7 @@ export class MoonwellLiquidationBot {
         }
         // Success — reset failure counter and stop trying other borrow positions
         this.simulationFailures.set(accountKey, 0);
+        this._liquidationsSucceeded++;
         return;
       } catch (error) {
         console.warn(
@@ -558,6 +558,8 @@ export class MoonwellLiquidationBot {
     }
 
     // All borrow positions exhausted — record failure
+    this._liquidationsFailed++;
+    this._lastError = "all borrow positions exhausted";
     const failures = (this.simulationFailures.get(accountKey) ?? 0) + 1;
     this.simulationFailures.set(accountKey, failures);
 
@@ -589,11 +591,18 @@ export class MoonwellLiquidationBot {
     collateralUnderlying: Address,
     repayAmount: bigint,
   ): Promise<void> {
-    const encoder = new LiquidationEncoder(this.executorAddress, this.client);
     const callbackEncoder = new LiquidationEncoder(this.executorAddress, this.client);
 
-    // Step 1: Approve borrow mToken to spend flash loan funds
-    callbackEncoder.erc20Approve(borrowUnderlying, borrowMToken, maxUint256);
+    // Step 1: Approve borrow mToken to spend flash loan funds — only if needed
+    const currentAllowance = await readContract(this.client, {
+      address: borrowUnderlying,
+      abi: erc20Abi,
+      functionName: "allowance",
+      args: [this.executorAddress, borrowMToken],
+    });
+    if (currentAllowance < repayAmount) {
+      callbackEncoder.erc20Approve(borrowUnderlying, borrowMToken, maxUint256);
+    }
 
     // Step 2: liquidateBorrow — repay debt, seize collateral mToken
     callbackEncoder.moonwellLiquidateBorrow(borrowMToken, collateralMToken, account, repayAmount);
@@ -619,26 +628,26 @@ export class MoonwellLiquidationBot {
 
     const callbackCalls = callbackEncoder.flush();
 
-    // Step 6: Wrap in Balancer flash loan
-    encoder.balancerFlashLoan(
-      BALANCER_VAULT_ADDRESS,
-      [{ asset: borrowUnderlying, amount: repayAmount }],
-      callbackCalls,
-    );
-
-    const calls = encoder.flush();
-
     try {
-      const success = await simulateAndExecFlashLoan(
+      const success = await simulateAndExecFlashLoanWithFallback(
         this.sharedDeps,
-        encoder,
-        calls,
+        callbackCalls,
         borrowUnderlying,
         false,
         repayAmount,
+        collateralUnderlying,
       );
 
       if (success) {
+        const collateralUsd =
+          (await priceAsset(this.sharedDeps, collateralUnderlying, repayAmount)) ?? 0;
+        liquidationTracker.report({
+          protocol: this.logTag,
+          collateralToken: collateralUnderlying,
+          collateralAmount: repayAmount,
+          collateralUsdEstimate: collateralUsd,
+          timestamp: Date.now(),
+        });
         console.log(
           `${this.logTag}[FlashLoan] Liquidated ${account} via ${borrowMToken.slice(0, 10)}... (repay=${repayAmount})`,
         );
@@ -663,8 +672,16 @@ export class MoonwellLiquidationBot {
   ): Promise<void> {
     const encoder = new LiquidationEncoder(this.executorAddress, this.client);
 
-    // Approve borrow mToken
-    encoder.erc20Approve(borrowUnderlying, borrowMToken, maxUint256);
+    // Approve borrow mToken — only if allowance insufficient
+    const currentAllowance = await readContract(this.client, {
+      address: borrowUnderlying,
+      abi: erc20Abi,
+      functionName: "allowance",
+      args: [this.executorAddress, borrowMToken],
+    });
+    if (currentAllowance < repayAmount) {
+      encoder.erc20Approve(borrowUnderlying, borrowMToken, maxUint256);
+    }
 
     // liquidateBorrow
     encoder.moonwellLiquidateBorrow(borrowMToken, collateralMToken, account, repayAmount);
@@ -695,9 +712,21 @@ export class MoonwellLiquidationBot {
         calls,
         borrowUnderlying,
         false,
+        undefined,
+        undefined,
+        collateralUnderlying,
       );
 
       if (success) {
+        const collateralUsd =
+          (await priceAsset(this.sharedDeps, collateralUnderlying, repayAmount)) ?? 0;
+        liquidationTracker.report({
+          protocol: this.logTag,
+          collateralToken: collateralUnderlying,
+          collateralAmount: repayAmount,
+          collateralUsdEstimate: collateralUsd,
+          timestamp: Date.now(),
+        });
         console.log(
           `${this.logTag}Liquidated ${account} via ${borrowMToken.slice(0, 10)}... (repay=${repayAmount})`,
         );
@@ -718,27 +747,39 @@ export class MoonwellLiquidationBot {
   private async findAllBorrowPositions(
     account: Address,
   ): Promise<{ borrowMToken: Address; borrowBalance: bigint }[]> {
-    const results = await Promise.allSettled(
-      this.mTokenList.map(async (mToken) => {
-        const borrowBal = await readContract(this.client, {
+    try {
+      this._rpcTotal += this.mTokenList.length;
+      const results = await multicall(this.client, {
+        contracts: this.mTokenList.map((mToken) => ({
           address: mToken.address,
           abi: mTokenAbi,
-          functionName: "borrowBalanceStored",
-          args: [account],
-        });
-        return { borrowMToken: mToken.address, borrowBalance: borrowBal };
-      }),
-    );
+          functionName: "borrowBalanceStored" as const,
+          args: [account] as const,
+        })),
+        allowFailure: true,
+      });
 
-    return results
-      .filter(
-        (r): r is PromiseFulfilledResult<{ borrowMToken: Address; borrowBalance: bigint }> =>
-          r.status === "fulfilled" && r.value.borrowBalance > 0n,
-      )
-      .map((r) => r.value)
-      .sort((a, b) =>
-        b.borrowBalance > a.borrowBalance ? 1 : b.borrowBalance < a.borrowBalance ? -1 : 0,
-      );
+      return results
+        .map((r, i) => {
+          if (r.status !== "success") {
+            this._rpcErrors++;
+            return null;
+          }
+          const borrowBalance = r.result;
+          return borrowBalance > 0n
+            ? { borrowMToken: this.mTokenList[i]!.address, borrowBalance }
+            : null;
+        })
+        .filter((r): r is { borrowMToken: Address; borrowBalance: bigint } => r !== null)
+        .sort((a, b) =>
+          b.borrowBalance > a.borrowBalance ? 1 : b.borrowBalance < a.borrowBalance ? -1 : 0,
+        );
+    } catch (e) {
+      this._rpcErrors += this.mTokenList.length;
+      this._lastError = String(e);
+      console.warn(`${this.logTag}⚠️ findAllBorrowPositions multicall failed:`, e);
+      return [];
+    }
   }
 
   /**
@@ -748,24 +789,33 @@ export class MoonwellLiquidationBot {
     let bestMToken: Address | null = null;
     let maxBalance = 0n;
 
-    const results = await Promise.allSettled(
-      this.mTokenList.map(async (mToken) => {
-        const bal = await readContract(this.client, {
+    try {
+      this._rpcTotal += this.mTokenList.length;
+      const results = await multicall(this.client, {
+        contracts: this.mTokenList.map((mToken) => ({
           address: mToken.address,
           abi: mTokenAbi,
-          functionName: "balanceOf",
-          args: [account],
-        });
-        return { mToken: mToken.address, balance: bal };
-      }),
-    );
+          functionName: "balanceOf" as const,
+          args: [account] as const,
+        })),
+        allowFailure: true,
+      });
 
-    for (const result of results) {
-      if (result.status !== "fulfilled") continue;
-      if (result.value.balance > maxBalance) {
-        maxBalance = result.value.balance;
-        bestMToken = result.value.mToken;
+      for (let i = 0; i < results.length; i++) {
+        const result = results[i]!;
+        if (result.status !== "success") {
+          this._rpcErrors++;
+          continue;
+        }
+        if (result.result > maxBalance) {
+          maxBalance = result.result;
+          bestMToken = this.mTokenList[i]!.address;
+        }
       }
+    } catch (e) {
+      this._rpcErrors += this.mTokenList.length;
+      this._lastError = String(e);
+      console.warn(`${this.logTag}⚠️ findBestCollateral multicall failed:`, e);
     }
 
     return bestMToken;
@@ -790,26 +840,31 @@ export class MoonwellLiquidationBot {
    * Records baseline exchange rates for detecting changes in subsequent checks.
    */
   private async initOracleTimestamps(): Promise<void> {
-    const results = await Promise.allSettled(
-      this.mTokenList.map(async (mToken) => {
-        const exchangeRate = await readContract(this.client, {
+    try {
+      const results = await multicall(this.client, {
+        contracts: this.mTokenList.map((mToken) => ({
           address: mToken.address,
           abi: mTokenAbi,
-          functionName: "exchangeRateStored",
-        });
-        return { mToken: mToken.address, exchangeRate };
-      }),
-    );
+          functionName: "exchangeRateStored" as const,
+        })),
+        allowFailure: true,
+      });
 
-    for (const result of results) {
-      if (result.status === "fulfilled") {
-        this.lastOracleUpdates.set(result.value.mToken, result.value.exchangeRate);
+      for (let i = 0; i < results.length; i++) {
+        const result = results[i]!;
+        if (result.status === "success") {
+          this.lastOracleUpdates.set(this.mTokenList[i]!.address, result.result);
+        }
       }
-    }
 
-    console.log(
-      `${this.logTag}📡 Oracle tracking initialized: ${this.lastOracleUpdates.size} market(s) baseline recorded`,
-    );
+      console.log(
+        `${this.logTag}📡 Oracle tracking initialized: ${this.lastOracleUpdates.size} market(s) baseline recorded`,
+      );
+    } catch (e) {
+      this._rpcErrors++;
+      this._lastError = String(e);
+      console.warn(`${this.logTag}⚠️ initOracleTimestamps multicall failed:`, e);
+    }
   }
 
   /**
@@ -819,31 +874,38 @@ export class MoonwellLiquidationBot {
   private async detectOracleUpdates(): Promise<void> {
     this.hotMarkets.clear();
 
-    // Simple heuristic: check if any market's exchange rate changed since last check
-    // This is more reliable than trying to read oracle feeds directly
-    const results = await Promise.allSettled(
-      this.mTokenList.map(async (mToken) => {
-        const exchangeRate = await readContract(this.client, {
+    if (this.mTokenList.length === 0) return;
+
+    try {
+      this._rpcTotal += this.mTokenList.length;
+      const results = await multicall(this.client, {
+        contracts: this.mTokenList.map((mToken) => ({
           address: mToken.address,
           abi: mTokenAbi,
-          functionName: "exchangeRateStored",
-        });
-        return { mToken: mToken.address, exchangeRate };
-      }),
-    );
+          functionName: "exchangeRateStored" as const,
+        })),
+        allowFailure: true,
+      });
 
-    // Compare with cached values — if exchange rate changed, the oracle likely updated
-    for (const result of results) {
-      if (result.status !== "fulfilled") continue;
-      const { mToken, exchangeRate } = result.value;
-      const lastRate = this.lastOracleUpdates.get(mToken);
+      for (let i = 0; i < results.length; i++) {
+        const result = results[i]!;
+        if (result.status !== "success") {
+          this._rpcErrors++;
+          continue;
+        }
+        const exchangeRate = result.result;
+        const mToken = this.mTokenList[i]!.address;
+        const lastRate = this.lastOracleUpdates.get(mToken);
 
-      if (lastRate !== undefined && lastRate !== exchangeRate) {
-        // Exchange rate changed — this market is "hot"
-        this.hotMarkets.add(mToken);
+        if (lastRate !== undefined && lastRate !== exchangeRate) {
+          this.hotMarkets.add(mToken);
+        }
+        this.lastOracleUpdates.set(mToken, exchangeRate);
       }
-
-      this.lastOracleUpdates.set(mToken, exchangeRate);
+    } catch (e) {
+      this._rpcErrors += this.mTokenList.length;
+      this._lastError = String(e);
+      console.warn(`${this.logTag}⚠️ detectOracleUpdates multicall failed:`, e);
     }
 
     if (this.hotMarkets.size > 0) {
@@ -873,6 +935,7 @@ export class MoonwellLiquidationBot {
    * Get current bot health status for monitoring endpoints.
    */
   getHealthStatus() {
+    const rpcErrorRate = this._rpcTotal > 0 ? this._rpcErrors / this._rpcTotal : 0;
     return {
       protocol: "moonwell" as const,
       lastCheckTimestamp: this._lastCheckTimestamp,
@@ -881,8 +944,11 @@ export class MoonwellLiquidationBot {
       liquidationsAttempted: this._liquidationsAttempted,
       liquidationsSucceeded: this._liquidationsSucceeded,
       liquidationsFailed: this._liquidationsFailed,
-      rpcErrorRate: 0,
-      isHealthy: true,
+      rpcErrors: this._rpcErrors,
+      rpcTotal: this._rpcTotal,
+      rpcErrorRate,
+      lastError: this._lastError,
+      isHealthy: rpcErrorRate < 0.3,
     };
   }
 }

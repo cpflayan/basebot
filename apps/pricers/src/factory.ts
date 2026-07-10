@@ -4,6 +4,7 @@ import { ChainlinkPricer } from "./chainlink";
 import { DefiLlamaPricer } from "./defillama";
 import { MorphoApi } from "./morphoApi";
 import { Pricer } from "./pricer";
+import { PythPricer } from "./pyth";
 import { UniswapV3Pricer } from "./uniswapV3";
 
 /**
@@ -19,6 +20,8 @@ export function createPricer(pricerName: PricerName): Pricer {
       return new ChainlinkPricer();
     case "morphoApi":
       return new MorphoApi();
+    case "pyth":
+      return new PythPricer();
     case "uniswapV3":
       return new UniswapV3Pricer();
     default:

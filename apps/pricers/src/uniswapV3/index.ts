@@ -18,20 +18,28 @@ import {
 import { readContract } from "viem/actions";
 
 import { uniswapV3FactoryAbi, uniswapV3PoolAbi } from "../abis/uniswapV3";
-import type { Pricer } from "../pricer";
+import type { Pricer, PriceMeta } from "../pricer";
 
 export class UniswapV3Pricer implements Pricer {
   private pools: Record<Address, Record<Address, Address[]>> = {};
   private decimals: Record<Address, number> = {};
 
   async price(client: Client<Transport, Chain, Account>, asset: Address) {
+    const meta = await this.priceWithMeta(client, asset);
+    return meta?.price;
+  }
+
+  async priceWithMeta(
+    client: Client<Transport, Chain, Account>,
+    asset: Address,
+  ): Promise<PriceMeta | undefined> {
     const usdReference = USD_REFERENCE[client.chain.id];
 
     if (usdReference === undefined) return;
 
     /// TODO: allow multiple USD references
 
-    if (asset === usdReference) return 1;
+    if (asset === usdReference) return { price: 1 };
 
     const pools =
       this.getCachedPools(asset, usdReference) ??
@@ -81,12 +89,14 @@ export class UniswapV3Pricer implements Pricer {
       const sqrtPriceX96 = slot0[0];
       const price = Number(
         formatUnits(
-          (sqrtPriceX96 / 2n ** 96n) ** 2n * 10n ** BigInt(token0Decimals),
+          (sqrtPriceX96 ** 2n * 10n ** BigInt(token0Decimals)) / 2n ** 192n,
           token1Decimals,
         ),
       );
 
-      return token0 === asset ? price : 1 / price;
+      // UniswapV3 reads on-chain slot0 — price is always as-of latest block,
+      // no updatedAt since there's no independent timestamp to report.
+      return { price: token0 === asset ? price : 1 / price };
     } catch (error) {
       console.log(`Error pricing ${asset} on UniswapV3`);
       console.error(error);

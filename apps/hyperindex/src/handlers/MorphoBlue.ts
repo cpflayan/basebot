@@ -2,6 +2,32 @@ import { Morpho } from "generated";
 import { getAddress } from "viem";
 import { marketId, positionId, authorizationId } from "../utils/ids.js";
 
+// ─── Helpers ───
+
+/**
+ * Get or create a position entry with zero-initialized defaults.
+ * DRY: eliminates the repeated 7-line getOrCreate boilerplate across 7 handlers.
+ */
+async function getOrCreatePosition(
+  context: { Position: { getOrCreate: (args: Record<string, unknown>) => Promise<Record<string, unknown>> } },
+  chainId: number,
+  marketHexId: string,
+  user: string,
+) {
+  const pId = positionId(chainId, marketHexId, user);
+  return context.Position.getOrCreate({
+    id: pId,
+    chainId,
+    market_id: marketHexId,
+    user: getAddress(user),
+    supplyShares: 0n,
+    borrowShares: 0n,
+    collateral: 0n,
+  });
+}
+
+// ─── Market-level handlers ───
+
 Morpho.CreateMarket.handler(async ({ event, context }) => {
   const id = marketId(event.chainId, event.params.id);
 
@@ -49,6 +75,8 @@ Morpho.AccrueInterest.handler(async ({ event, context }) => {
   });
 });
 
+// ─── Position-level handlers ───
+
 Morpho.Supply.handler(async ({ event, context }) => {
   const mId = marketId(event.chainId, event.params.id);
   const market = await context.Market.get(mId);
@@ -60,16 +88,7 @@ Morpho.Supply.handler(async ({ event, context }) => {
     });
   }
 
-  const pId = positionId(event.chainId, event.params.id, event.params.onBehalf);
-  const position = await context.Position.getOrCreate({
-    id: pId,
-    chainId: event.chainId,
-    market_id: mId,
-    user: getAddress(event.params.onBehalf),
-    supplyShares: 0n,
-    borrowShares: 0n,
-    collateral: 0n,
-  });
+  const position = await getOrCreatePosition(context, event.chainId, mId, event.params.onBehalf);
   context.Position.set({
     ...position,
     supplyShares: position.supplyShares + event.params.shares,
@@ -87,16 +106,7 @@ Morpho.Withdraw.handler(async ({ event, context }) => {
     });
   }
 
-  const pId = positionId(event.chainId, event.params.id, event.params.onBehalf);
-  const position = await context.Position.getOrCreate({
-    id: pId,
-    chainId: event.chainId,
-    market_id: mId,
-    user: getAddress(event.params.onBehalf),
-    supplyShares: 0n,
-    borrowShares: 0n,
-    collateral: 0n,
-  });
+  const position = await getOrCreatePosition(context, event.chainId, mId, event.params.onBehalf);
   context.Position.set({
     ...position,
     supplyShares: position.supplyShares - event.params.shares,
@@ -105,16 +115,7 @@ Morpho.Withdraw.handler(async ({ event, context }) => {
 
 Morpho.SupplyCollateral.handler(async ({ event, context }) => {
   const mId = marketId(event.chainId, event.params.id);
-  const pId = positionId(event.chainId, event.params.id, event.params.onBehalf);
-  const position = await context.Position.getOrCreate({
-    id: pId,
-    chainId: event.chainId,
-    market_id: mId,
-    user: getAddress(event.params.onBehalf),
-    supplyShares: 0n,
-    borrowShares: 0n,
-    collateral: 0n,
-  });
+  const position = await getOrCreatePosition(context, event.chainId, mId, event.params.onBehalf);
   context.Position.set({
     ...position,
     collateral: position.collateral + event.params.assets,
@@ -123,16 +124,7 @@ Morpho.SupplyCollateral.handler(async ({ event, context }) => {
 
 Morpho.WithdrawCollateral.handler(async ({ event, context }) => {
   const mId = marketId(event.chainId, event.params.id);
-  const pId = positionId(event.chainId, event.params.id, event.params.onBehalf);
-  const position = await context.Position.getOrCreate({
-    id: pId,
-    chainId: event.chainId,
-    market_id: mId,
-    user: getAddress(event.params.onBehalf),
-    supplyShares: 0n,
-    borrowShares: 0n,
-    collateral: 0n,
-  });
+  const position = await getOrCreatePosition(context, event.chainId, mId, event.params.onBehalf);
   context.Position.set({
     ...position,
     collateral: position.collateral - event.params.assets,
@@ -150,16 +142,7 @@ Morpho.Borrow.handler(async ({ event, context }) => {
     });
   }
 
-  const pId = positionId(event.chainId, event.params.id, event.params.onBehalf);
-  const position = await context.Position.getOrCreate({
-    id: pId,
-    chainId: event.chainId,
-    market_id: mId,
-    user: getAddress(event.params.onBehalf),
-    supplyShares: 0n,
-    borrowShares: 0n,
-    collateral: 0n,
-  });
+  const position = await getOrCreatePosition(context, event.chainId, mId, event.params.onBehalf);
   context.Position.set({
     ...position,
     borrowShares: position.borrowShares + event.params.shares,
@@ -177,16 +160,7 @@ Morpho.Repay.handler(async ({ event, context }) => {
     });
   }
 
-  const pId = positionId(event.chainId, event.params.id, event.params.onBehalf);
-  const position = await context.Position.getOrCreate({
-    id: pId,
-    chainId: event.chainId,
-    market_id: mId,
-    user: getAddress(event.params.onBehalf),
-    supplyShares: 0n,
-    borrowShares: 0n,
-    collateral: 0n,
-  });
+  const position = await getOrCreatePosition(context, event.chainId, mId, event.params.onBehalf);
   context.Position.set({
     ...position,
     borrowShares: position.borrowShares - event.params.shares,
@@ -208,16 +182,7 @@ Morpho.Liquidate.handler(async ({ event, context }) => {
     });
   }
 
-  const pId = positionId(event.chainId, event.params.id, event.params.borrower);
-  const position = await context.Position.getOrCreate({
-    id: pId,
-    chainId: event.chainId,
-    market_id: mId,
-    user: getAddress(event.params.borrower),
-    supplyShares: 0n,
-    borrowShares: 0n,
-    collateral: 0n,
-  });
+  const position = await getOrCreatePosition(context, event.chainId, mId, event.params.borrower);
   context.Position.set({
     ...position,
     collateral: position.collateral - event.params.seizedAssets,

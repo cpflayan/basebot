@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import path from "node:path";
+
 import { AccrualPosition, Market } from "@morpho-org/blue-sdk";
 import type { Address, Hex } from "viem";
 
@@ -250,6 +253,89 @@ export class PositionCache {
       positions: this.positions.size,
       markets: this.markets.size,
     };
+  }
+
+  // ─── Serialization / Persistence ───
+
+  serialize(): string {
+    const data = {
+      version: 1,
+      timestamp: Date.now(),
+      positions: [...this.positions.entries()].map(([key, pos]) => ({
+        key,
+        user: pos.user,
+        marketId: pos.marketId,
+        collateral: pos.collateral.toString(),
+        borrowShares: pos.borrowShares.toString(),
+        supplyShares: pos.supplyShares.toString(),
+        updatedAt: pos.updatedAt,
+      })),
+      markets: [...this.markets.entries()].map(([marketId, m]) => ({
+        marketId,
+        params: m.params,
+        totalSupplyAssets: m.totalSupplyAssets.toString(),
+        totalSupplyShares: m.totalSupplyShares.toString(),
+        totalBorrowAssets: m.totalBorrowAssets.toString(),
+        totalBorrowShares: m.totalBorrowShares.toString(),
+        lastUpdate: m.lastUpdate.toString(),
+        fee: m.fee.toString(),
+        rateAtTarget: m.rateAtTarget.toString(),
+        price: m.price.toString(),
+        fetchedAt: m.fetchedAt,
+      })),
+    };
+    return JSON.stringify(data);
+  }
+
+  deserialize(json: string): void {
+    const data = JSON.parse(json);
+    this.clear();
+
+    for (const pos of data.positions) {
+      this.set({
+        user: pos.user,
+        marketId: pos.marketId,
+        collateral: BigInt(pos.collateral),
+        borrowShares: BigInt(pos.borrowShares),
+        supplyShares: BigInt(pos.supplyShares),
+        updatedAt: pos.updatedAt,
+      });
+    }
+
+    for (const m of data.markets) {
+      this.setMarket({
+        marketId: m.marketId,
+        params: m.params,
+        totalSupplyAssets: BigInt(m.totalSupplyAssets),
+        totalSupplyShares: BigInt(m.totalSupplyShares),
+        totalBorrowAssets: BigInt(m.totalBorrowAssets),
+        totalBorrowShares: BigInt(m.totalBorrowShares),
+        lastUpdate: BigInt(m.lastUpdate),
+        fee: BigInt(m.fee),
+        rateAtTarget: BigInt(m.rateAtTarget),
+        price: BigInt(m.price),
+        fetchedAt: m.fetchedAt,
+      });
+    }
+  }
+
+  saveToFile(filePath: string): void {
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const tmpPath = filePath + ".tmp";
+    fs.writeFileSync(tmpPath, this.serialize(), "utf-8");
+    fs.renameSync(tmpPath, filePath); // atomic replace
+  }
+
+  loadFromFile(filePath: string): boolean {
+    if (!fs.existsSync(filePath)) return false;
+    try {
+      const json = fs.readFileSync(filePath, "utf-8");
+      this.deserialize(json);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   // ─── Helpers ───

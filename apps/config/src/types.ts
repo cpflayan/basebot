@@ -13,7 +13,7 @@ export type LiquidityVenueName =
   | "uniswapV4"
   | "zeroEx";
 
-export type PricerName = "chainlink" | "defillama" | "morphoApi" | "uniswapV3";
+export type PricerName = "chainlink" | "defillama" | "morphoApi" | "pyth" | "uniswapV3";
 
 export type DataProviderName = "morphoApi" | "hyperIndex";
 
@@ -23,7 +23,7 @@ export interface Config {
   options: Options;
 }
 
-export type FlashLoanProvider = "balancer" | "aave";
+export type FlashLoanProvider = "balancer" | "morpho" | "aave";
 
 export interface Options {
   dataProvider: DataProviderName;
@@ -38,9 +38,12 @@ export interface Options {
   watchBlocksRetryDelayMs?: number;
   useFlashLoan?: boolean;
   flashLoanProvider?: FlashLoanProvider;
+  flashLoanFallbackProviders?: FlashLoanProvider[];
   cometWatchlist?: CometWatchlistConfig;
   moonwellWatchlist?: MoonwellWatchlistConfig;
   aaveWatchlist?: AaveWatchlistConfig;
+  /** Fallback RPC URLs for scan clients (historical event scanning) */
+  scanRpcUrls?: string[];
 }
 
 export interface CometWatchlistConfig {

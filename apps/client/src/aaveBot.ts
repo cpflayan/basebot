@@ -16,7 +16,7 @@
  *   - Dynamic close factor based on health factor level
  *   - liquidationCall targets a specific (collateral, debt) pair
  */
-import type { AaveWatchlistConfig } from "@morpho-blue-liquidation-bot/config";
+import type { AaveWatchlistConfig, FlashLoanProvider } from "@morpho-blue-liquidation-bot/config";
 import type { LiquidityVenue } from "@morpho-blue-liquidation-bot/liquidity-venues";
 import type { Pricer } from "@morpho-blue-liquidation-bot/pricers";
 import {
@@ -28,10 +28,8 @@ import {
   type WalletClient,
   type LocalAccount,
   maxUint256,
-  createPublicClient,
-  http,
 } from "viem";
-import { readContract, watchBlocks, multicall } from "viem/actions";
+import { readContract, multicall } from "viem/actions";
 import { base } from "viem/chains";
 
 import { AaveAccountRegistry } from "./aaveAccountRegistry.js";
@@ -40,7 +38,6 @@ import {
   aaveReserveConfigurationAbi,
   HEALTH_FACTOR_THRESHOLD,
 } from "./abis/AaveV3.js";
-import { BALANCER_VAULT_ADDRESS } from "./abis/BalancerVault.js";
 import {
   selectBestLiquidationPair,
   type LiquidationPair,
@@ -49,23 +46,17 @@ import {
 import { PositionLiquidationCooldownMechanism } from "./utils/cooldownMechanisms.js";
 import { findDeployBlock } from "./utils/findDeployBlock.js";
 import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
+import { liquidationTracker } from "./utils/liquidationState.js";
+import { createScanClient } from "./utils/rpcFallback.js";
 import {
   type SharedExecutionDeps,
+  TOKEN_BLACKLIST as DEFAULT_TOKEN_BLACKLIST,
   convertCollateralToLoan,
-  simulateAndExecFlashLoan,
+  createBlockPolling,
+  priceAsset,
+  simulateAndExecFlashLoanWithFallback,
   simulateAndExec,
 } from "./utils/sharedExecution.js";
-
-/** Base 官方公開 RPC — 支持 10,000 區塊範圍的 eth_getLogs */
-const BASE_PUBLIC_RPC = "https://mainnet.base.org";
-
-/**
- * Default token blacklist — skip positions involving these tokens.
- * Merged with config-provided tokenBlacklist at runtime.
- */
-const DEFAULT_TOKEN_BLACKLIST = new Set<string>([
-  "0x35e5db674d8e93a03d814fa0ada70731efe8a4b9", // USR (depegged)
-]);
 
 export interface AaveLiquidationBotInputs {
   logTag: string;
@@ -80,9 +71,11 @@ export interface AaveLiquidationBotInputs {
   positionLiquidationCooldownMechanism?: PositionLiquidationCooldownMechanism;
   flashbotAccount?: LocalAccount;
   useFlashLoan?: boolean;
-  flashLoanProvider?: "balancer" | "aave";
+  flashLoanProvider?: FlashLoanProvider;
+  flashLoanFallbackProviders?: FlashLoanProvider[];
   alwaysRealizeBadDebt?: boolean;
   registryFilePath?: string;
+  scanRpcUrls?: string[];
 }
 
 export class AaveLiquidationBot {
@@ -100,7 +93,8 @@ export class AaveLiquidationBot {
   private cooldown?: PositionLiquidationCooldownMechanism;
   private flashbotAccount?: LocalAccount;
   private useFlashLoan: boolean;
-  private flashLoanProvider: "balancer" | "aave";
+  private flashLoanProvider: FlashLoanProvider;
+  private flashLoanFallbackProviders: FlashLoanProvider[];
   private alwaysRealizeBadDebt: boolean;
   private registry: AaveAccountRegistry;
   private pollIntervalBlocks: number;
@@ -143,6 +137,7 @@ export class AaveLiquidationBot {
     this.flashbotAccount = inputs.flashbotAccount;
     this.useFlashLoan = inputs.useFlashLoan ?? false;
     this.flashLoanProvider = inputs.flashLoanProvider ?? "balancer";
+    this.flashLoanFallbackProviders = inputs.flashLoanFallbackProviders ?? [];
     this.alwaysRealizeBadDebt = inputs.alwaysRealizeBadDebt ?? false;
     this.pollIntervalBlocks = inputs.aaveWatchlist.pollIntervalBlocks ?? 5;
     this.minHealthFactorBuffer = inputs.aaveWatchlist.minHealthFactorBuffer ?? 0n;
@@ -171,13 +166,11 @@ export class AaveLiquidationBot {
       flashbotAccount: this.flashbotAccount,
       alwaysRealizeBadDebt: this.alwaysRealizeBadDebt,
       flashLoanProvider: this.flashLoanProvider,
+      flashLoanFallbackProviders: this.flashLoanFallbackProviders,
     };
 
     // Read-only client on Base public RPC for historical scanning
-    this.scanClient = createPublicClient({
-      chain: base,
-      transport: http(BASE_PUBLIC_RPC),
-    });
+    this.scanClient = createScanClient(base, inputs.scanRpcUrls ?? ["https://mainnet.base.org"]);
   }
 
   // ─── Initialization ───
@@ -316,33 +309,12 @@ export class AaveLiquidationBot {
    * Returns an unwatch function.
    */
   startPolling(): () => void {
-    let blockCount = 0;
-    let running = false;
-
-    const unwatch = watchBlocks(this.client, {
-      onBlock: (block) => {
-        blockCount++;
-        this._lastCheckBlock = Number(block.number ?? 0);
-        if (blockCount % this.pollIntervalBlocks !== 0) return;
-        if (running) return; // Prevent overlapping runs
-        running = true;
-
-        this.checkAave()
-          .catch((e: unknown) => {
-            console.error(`${this.logTag}Error in checkAave:`, e);
-          })
-          .finally(() => {
-            running = false;
-          });
-      },
-      onError: (error: Error) => {
-        console.error(`${this.logTag}watchBlocks error:`, error);
-      },
+    return createBlockPolling({
+      logTag: this.logTag,
+      client: this.client,
+      pollIntervalBlocks: this.pollIntervalBlocks,
+      onTick: () => this.checkAave(),
     });
-
-    console.log(`${this.logTag}📡 Aave polling started (every ${this.pollIntervalBlocks} blocks)`);
-
-    return unwatch;
   }
 
   // ─── Health status ───
@@ -499,6 +471,12 @@ export class AaveLiquidationBot {
 
     const badDebtPosition = pair.isBadDebt;
 
+    // Bad debt pre-filter: skip early if position is underwater and we don't realize bad debt
+    if (!this.alwaysRealizeBadDebt && badDebtPosition) {
+      console.log(`${this.logTag}⏭️ Skip ${account}: bad debt (underwater position)`);
+      return;
+    }
+
     if (this.useFlashLoan) {
       await this.liquidateWithFlashLoan(account, pair, badDebtPosition);
     } else {
@@ -552,10 +530,22 @@ export class AaveLiquidationBot {
         calls,
         pair.debtAsset,
         badDebtPosition,
+        undefined,
+        undefined,
+        pair.collateralAsset,
       );
 
       if (success) {
         this._liquidationsSucceeded++;
+        const collateralUsd =
+          (await priceAsset(this.sharedDeps, pair.collateralAsset, pair.seizableCollateral)) ?? 0;
+        liquidationTracker.report({
+          protocol: this.logTag,
+          collateralToken: pair.collateralAsset,
+          collateralAmount: pair.seizableCollateral,
+          collateralUsdEstimate: collateralUsd,
+          timestamp: Date.now(),
+        });
         console.log(`${this.logTag}Liquidated ${account} on Aave Pool (direct)`);
       } else {
         this._liquidationsFailed++;
@@ -580,7 +570,6 @@ export class AaveLiquidationBot {
     pair: LiquidationPair,
     badDebtPosition: boolean,
   ): Promise<void> {
-    const encoder = new LiquidationEncoder(this.executorAddress, this.client);
     const callbackEncoder = new LiquidationEncoder(this.executorAddress, this.client);
 
     const flashLoanAmount = pair.debtToCover;
@@ -620,27 +609,28 @@ export class AaveLiquidationBot {
 
     const callbackCalls = callbackEncoder.flush();
 
-    // ── Wrap in Balancer flash loan (0% fee) ──
-    encoder.balancerFlashLoan(
-      BALANCER_VAULT_ADDRESS,
-      [{ asset: pair.debtAsset, amount: flashLoanAmount }],
-      callbackCalls,
-    );
-
-    const calls = encoder.flush();
-
+    // Step 5: Wrap with flash loan (with fallback providers) and simulate + execute.
     try {
-      const success = await simulateAndExecFlashLoan(
+      const success = await simulateAndExecFlashLoanWithFallback(
         this.sharedDeps,
-        encoder,
-        calls,
+        callbackCalls,
         pair.debtAsset,
         badDebtPosition,
         flashLoanAmount,
+        pair.collateralAsset,
       );
 
       if (success) {
         this._liquidationsSucceeded++;
+        const collateralUsd =
+          (await priceAsset(this.sharedDeps, pair.collateralAsset, pair.seizableCollateral)) ?? 0;
+        liquidationTracker.report({
+          protocol: this.logTag,
+          collateralToken: pair.collateralAsset,
+          collateralAmount: pair.seizableCollateral,
+          collateralUsdEstimate: collateralUsd,
+          timestamp: Date.now(),
+        });
         console.log(`${this.logTag}[FlashLoan] Liquidated ${account} on Aave Pool`);
       } else {
         this._liquidationsFailed++;

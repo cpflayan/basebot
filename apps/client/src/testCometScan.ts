@@ -4,6 +4,7 @@
  *
  * Usage: pnpm tsx apps/client/src/testCometScan.ts
  */
+import { chainConfigs } from "@morpho-blue-liquidation-bot/config";
 import { createPublicClient, http, type Address } from "viem";
 import { getBlockNumber, getCode } from "viem/actions";
 import { base } from "viem/chains";
@@ -13,33 +14,18 @@ import { CometAccountRegistry } from "./cometAccountRegistry.js";
 // Base 官方公開 RPC
 const BASE_PUBLIC_RPC = "https://mainnet.base.org";
 
-// Comet 配置（與 config.ts 一致）
-const COMETS = [
-  {
-    name: "USDC Comet",
-    address: "0xb125E6687d4313864e53df431d5425969c15Eb2F" as Address,
-    baseAsset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as Address,
-    deployBlock: 2325257,
-  },
-  {
-    name: "WETH Comet",
-    address: "0x46e6b214b524310239732D51387075E0e70970bf" as Address,
-    baseAsset: "0x4200000000000000000000000000000000000006" as Address,
-    deployBlock: 8535851,
-  },
-  {
-    name: "USDbC Comet",
-    address: "0x9c4ec768c28520B50860ea7a15bd7213a9fF58bf" as Address,
-    baseAsset: "0xd9aAEc86B65D86f6A7B5B6b079c1DF84e8b3A5e3" as Address,
-    deployBlock: 1370556,
-  },
-  {
-    name: "AERO Comet",
-    address: "0x784efeB622244d2348d4F2522f8860B96fbEcE89" as Address,
-    baseAsset: "0x940181a94A35A4569E4529A3CDfB74e38FD98631" as Address,
-    deployBlock: 11956808,
-  },
-];
+// 從 config.ts 讀取 Comet 配置，避免硬編碼不一致
+const rawComets =
+  (
+    chainConfigs[8453]?.options as {
+      cometWatchlist?: { comets: { address: Address; baseAsset: Address; deployBlock: number }[] };
+    }
+  )?.cometWatchlist?.comets ?? [];
+
+const COMETS = rawComets.map((c, i) => ({
+  name: ["USDC", "WETH", "USDbC", "AERO"][i] ?? `Comet-${i}`,
+  ...c,
+}));
 
 async function main() {
   const client = createPublicClient({

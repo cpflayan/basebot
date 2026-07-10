@@ -97,6 +97,7 @@ export const launchBot = async (
     alwaysRealizeBadDebt: ALWAYS_REALIZE_BAD_DEBT,
     useFlashLoan: config.useFlashLoan,
     flashLoanProvider: config.flashLoanProvider,
+    flashLoanFallbackProviders: config.flashLoanFallbackProviders,
   };
 
   const bot = new LiquidationBot(inputs);
@@ -139,100 +140,124 @@ export const launchBot = async (
 
   startWatching();
 
-  // ─── Compound V3 Comet Bot (parallel to Morpho) ───
+  // Register Morpho bot with health server
+  const healthServerMorpho = getHealthServer();
+  healthServerMorpho.registerBot("morpho", () => bot.getHealthStatus());
+
+  // ─── Compound V3 Comet + Moonwell + Aave Bots (parallel initialization) ───
+
+  const initTasks: Promise<void>[] = [];
 
   if (config.cometWatchlist?.enabled) {
-    try {
-      const cometBot = new CometLiquidationBot({
-        logTag: `[${config.chain.name} comet]: `,
-        client,
-        cometWatchlist: config.cometWatchlist,
-        executorAddress: config.executorAddress,
-        treasuryAddress,
-        liquidityVenues,
-        pricers,
-        wNative: config.wNative,
-        chainId: config.chainId,
-        positionLiquidationCooldownMechanism,
-        flashbotAccount,
-        useFlashLoan: config.useFlashLoan,
-        flashLoanProvider: config.flashLoanProvider,
-        alwaysRealizeBadDebt: ALWAYS_REALIZE_BAD_DEBT,
-      });
+    initTasks.push(
+      (async () => {
+        try {
+          const cometBot = new CometLiquidationBot({
+            logTag: `[${config.chain.name} comet]: `,
+            client,
+            cometWatchlist: config.cometWatchlist!,
+            executorAddress: config.executorAddress,
+            treasuryAddress,
+            liquidityVenues,
+            pricers,
+            wNative: config.wNative,
+            chainId: config.chainId,
+            positionLiquidationCooldownMechanism,
+            flashbotAccount,
+            useFlashLoan: config.useFlashLoan,
+            flashLoanProvider: config.flashLoanProvider,
+            flashLoanFallbackProviders: config.flashLoanFallbackProviders,
+            alwaysRealizeBadDebt: ALWAYS_REALIZE_BAD_DEBT,
+            scanRpcUrls: config.scanRpcUrls,
+          });
 
-      await cometBot.initialize();
-      cometBot.startPolling();
-      console.log(`${logTag}✅ Comet liquidation bot started`);
-    } catch (e) {
-      console.error(`${logTag}Failed to start Comet bot:`, e);
-    }
+          await cometBot.initialize();
+          cometBot.startPolling();
+          console.log(`${logTag}✅ Comet liquidation bot started`);
+
+          const healthServer = getHealthServer();
+          healthServer.registerBot("comet", () => cometBot.getHealthStatus());
+        } catch (e) {
+          console.error(`${logTag}Failed to start Comet bot:`, e);
+        }
+      })(),
+    );
   }
-
-  // ─── Moonwell (Compound V2) Bot (parallel to Morpho + Comet) ───
 
   if (config.moonwellWatchlist?.enabled) {
-    try {
-      const moonwellBot = new MoonwellLiquidationBot({
-        logTag: `[${config.chain.name} moonwell]: `,
-        client,
-        moonwellWatchlist: config.moonwellWatchlist,
-        executorAddress: config.executorAddress,
-        treasuryAddress,
-        liquidityVenues,
-        pricers,
-        wNative: config.wNative,
-        chainId: config.chainId,
-        positionLiquidationCooldownMechanism,
-        flashbotAccount,
-        useFlashLoan: config.useFlashLoan,
-        flashLoanProvider: config.flashLoanProvider,
-        alwaysRealizeBadDebt: ALWAYS_REALIZE_BAD_DEBT,
-      });
+    initTasks.push(
+      (async () => {
+        try {
+          const moonwellBot = new MoonwellLiquidationBot({
+            logTag: `[${config.chain.name} moonwell]: `,
+            client,
+            moonwellWatchlist: config.moonwellWatchlist!,
+            executorAddress: config.executorAddress,
+            treasuryAddress,
+            liquidityVenues,
+            pricers,
+            wNative: config.wNative,
+            chainId: config.chainId,
+            positionLiquidationCooldownMechanism,
+            flashbotAccount,
+            useFlashLoan: config.useFlashLoan,
+            flashLoanProvider: config.flashLoanProvider,
+            flashLoanFallbackProviders: config.flashLoanFallbackProviders,
+            alwaysRealizeBadDebt: ALWAYS_REALIZE_BAD_DEBT,
+            scanRpcUrls: config.scanRpcUrls,
+          });
 
-      await moonwellBot.initialize();
-      moonwellBot.startPolling();
-      console.log(`${logTag}✅ Moonwell liquidation bot started`);
+          await moonwellBot.initialize();
+          moonwellBot.startPolling();
+          console.log(`${logTag}✅ Moonwell liquidation bot started`);
 
-      // Register Moonwell bot with health server
-      const healthServerMoonwell = getHealthServer();
-      healthServerMoonwell.registerBot("moonwell", () => moonwellBot.getHealthStatus());
-    } catch (e) {
-      console.error(`${logTag}Failed to start Moonwell bot:`, e);
-    }
+          const healthServer = getHealthServer();
+          healthServer.registerBot("moonwell", () => moonwellBot.getHealthStatus());
+        } catch (e) {
+          console.error(`${logTag}Failed to start Moonwell bot:`, e);
+        }
+      })(),
+    );
   }
-
-  // ─── Aave V3 Bot (parallel to Morpho + Comet + Moonwell) ───
 
   if (config.aaveWatchlist?.enabled) {
-    try {
-      const aaveBot = new AaveLiquidationBot({
-        logTag: `[${config.chain.name} aave]: `,
-        client,
-        aaveWatchlist: config.aaveWatchlist,
-        executorAddress: config.executorAddress,
-        treasuryAddress,
-        liquidityVenues,
-        pricers,
-        wNative: config.wNative,
-        chainId: config.chainId,
-        positionLiquidationCooldownMechanism,
-        flashbotAccount,
-        useFlashLoan: config.useFlashLoan,
-        flashLoanProvider: config.flashLoanProvider,
-        alwaysRealizeBadDebt: ALWAYS_REALIZE_BAD_DEBT,
-      });
+    initTasks.push(
+      (async () => {
+        try {
+          const aaveBot = new AaveLiquidationBot({
+            logTag: `[${config.chain.name} aave]: `,
+            client,
+            aaveWatchlist: config.aaveWatchlist!,
+            executorAddress: config.executorAddress,
+            treasuryAddress,
+            liquidityVenues,
+            pricers,
+            wNative: config.wNative,
+            chainId: config.chainId,
+            positionLiquidationCooldownMechanism,
+            flashbotAccount,
+            useFlashLoan: config.useFlashLoan,
+            flashLoanProvider: config.flashLoanProvider,
+            flashLoanFallbackProviders: config.flashLoanFallbackProviders,
+            alwaysRealizeBadDebt: ALWAYS_REALIZE_BAD_DEBT,
+            scanRpcUrls: config.scanRpcUrls,
+          });
 
-      await aaveBot.initialize();
-      aaveBot.startPolling();
-      console.log(`${logTag}✅ Aave V3 liquidation bot started`);
+          await aaveBot.initialize();
+          aaveBot.startPolling();
+          console.log(`${logTag}✅ Aave V3 liquidation bot started`);
 
-      // Register Aave bot with health server
-      const healthServer = getHealthServer();
-      healthServer.registerBot("aave", () => aaveBot.getHealthStatus());
-    } catch (e) {
-      console.error(`${logTag}Failed to start Aave bot:`, e);
-    }
+          const healthServer = getHealthServer();
+          healthServer.registerBot("aave", () => aaveBot.getHealthStatus());
+        } catch (e) {
+          console.error(`${logTag}Failed to start Aave bot:`, e);
+        }
+      })(),
+    );
   }
+
+  // Initialize all bots in parallel
+  await Promise.allSettled(initTasks);
 
   return bot;
 };
