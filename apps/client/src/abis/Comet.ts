@@ -30,6 +30,34 @@ export const COMET_DEPLOY_BLOCKS: Record<Address, number> = {
   "0x784efeB622244d2348d4F2522f8860B96fbEcE89": 11956808, // AERO
 };
 
+// ─── 每個 Comet 的 Collateral Assets（hardcode fallback）───
+// 當 numCollateralAssets() revert 時使用
+export const COMET_COLLATERAL_ASSETS: Record<Address, Address[]> = {
+  // USDC Comet: WETH, cbETH, wstETH, cbBTC, AERO
+  "0xb125E6687d4313864e53df431d5425969c15Eb2F": [
+    "0x4200000000000000000000000000000000000006", // WETH
+    "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22", // cbETH
+    "0xc1CBa3fCea344f92D9239c08C0f2487b61DE718D", // wstETH
+    "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf", // cbBTC
+    "0x940181a94A35A4569E4529A3CDfB74e38FD98631", // AERO
+  ],
+  // WETH Comet: cbBTC, wstETH
+  "0x46e6b214b524310239732D51387075E0e70970bf": [
+    "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf", // cbBTC
+    "0xc1CBa3fCea344f92D9239c08C0f2487b61DE718D", // wstETH
+  ],
+  // USDbC Comet: WETH, cbETH, wstETH
+  "0x9c4ec768c28520B50860ea7a15bd7213a9fF58bf": [
+    "0x4200000000000000000000000000000000000006", // WETH
+    "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22", // cbETH
+    "0xc1CBa3fCea344f92D9239c08C0f2487b61DE718D", // wstETH
+  ],
+  // AERO Comet: WETH
+  "0x784efeB622244d2348d4F2522f8860B96fbEcE89": [
+    "0x4200000000000000000000000000000000000006", // WETH
+  ],
+};
+
 // ─── Comet 共用合約地址 ───
 
 export const COMET_SHARED = {
