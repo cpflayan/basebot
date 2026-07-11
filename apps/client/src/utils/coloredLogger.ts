@@ -51,7 +51,9 @@ const protocolColors: Record<string, string> = {
 function getTimestamp(): string {
   const now = new Date();
   const date = now.toISOString().split("T")[0];
-  const time = now.toTimeString().split(" ")[0].substring(0, 5);
+  // BUGFIX: toTimeString() 格式固定是 "HH:MM:SS GMT+...", 直接 slice(0,5) 拿 "HH:MM"
+  // 比原本的 split(" ")[0].substring(0,5) 更直接，也避免 TS 認為 split 結果可能是 undefined。
+  const time = now.toTimeString().slice(0, 5);
   return `${colors.white}[${date}][${time}]${colors.reset}`;
 }
 

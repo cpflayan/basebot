@@ -7,13 +7,18 @@
  *
  * Pattern: mirrors CometAccountRegistry, adapted for Aave V3 event signatures.
  */
-import { decodeEventLog, toEventSelector, type Address } from "viem";
+import { decodeEventLog, type AbiEvent, type Address } from "viem";
 import { getLogs } from "viem/actions";
 
 import { aaveEventAbi } from "./abis/AaveV3.js";
 import { BaseAccountRegistry, type ScanClient } from "./utils/baseAccountRegistry.js";
 
-const USER_ACTION_TOPICS = aaveEventAbi.map((e) => toEventSelector(e));
+// BUGFIX: 之前算出來後沒被使用，導致 getLogs 沒有任何事件篩選,等於每次都撈 Aave Pool
+// 合約「所有」事件類型(包含高頻的 ReserveDataUpdated、Transfer 等),對這種高流量合約
+// 負擔很重、更容易撞到 rate limit。現在真正拿去用(見下方 events 參數)。
+// viem 的 getLogs 只接受 event/events,不支援原始 topics 參數;用 AbiEvent[] 型別放寬,
+// 避免 aaveEventAbi 裡不同事件 indexed 參數數量不一致時 TS 型別推斷出錯。
+const AAVE_ACTION_EVENTS = aaveEventAbi as readonly AbiEvent[];
 const AAVE_SCAN_BATCH_SIZE = Number(process.env.AAVE_SCAN_BATCH_SIZE ?? 100);
 const AAVE_SCAN_DELAY_MS = Number(process.env.AAVE_SCAN_DELAY_MS ?? 300);
 
@@ -64,7 +69,14 @@ export class AaveAccountRegistry extends BaseAccountRegistry {
     toBlock: number,
     logTag: string,
   ): Promise<number> {
-    return this.scanRangeWithSize(client, poolAddress, fromBlock, toBlock, logTag, toBlock - fromBlock + 1);
+    return this.scanRangeWithSize(
+      client,
+      poolAddress,
+      fromBlock,
+      toBlock,
+      logTag,
+      toBlock - fromBlock + 1,
+    );
   }
 
   private async scanRangeWithSize(
@@ -78,8 +90,13 @@ export class AaveAccountRegistry extends BaseAccountRegistry {
     let newAccounts = 0;
 
     try {
+      // BUGFIX: USER_ACTION_TOPICS 之前算出來後沒被使用，導致這裡沒有 topic 篩選,
+      // 等於每次都撈 Aave Pool 合約「所有」事件類型(包含高頻的 ReserveDataUpdated、
+      // Transfer 等),對這種高流量合約來說負擔很重、更容易撞到 rate limit。
+      // 現在改成只篩選我們真正關心的 5 種事件(Supply/Borrow/Repay/Withdraw/LiquidationCall)。
       const logs = await getLogs(client, {
         address: poolAddress,
+        events: AAVE_ACTION_EVENTS,
         fromBlock: BigInt(fromBlock),
         toBlock: BigInt(toBlock),
       });
@@ -119,8 +136,22 @@ export class AaveAccountRegistry extends BaseAccountRegistry {
         console.warn(
           `${logTag}Response too large for blocks ${fromBlock}-${toBlock}, splitting in half`,
         );
-        const a = await this.scanRangeWithSize(client, poolAddress, fromBlock, mid, logTag, mid - fromBlock + 1);
-        const b = await this.scanRangeWithSize(client, poolAddress, mid + 1, toBlock, logTag, toBlock - mid);
+        const a = await this.scanRangeWithSize(
+          client,
+          poolAddress,
+          fromBlock,
+          mid,
+          logTag,
+          mid - fromBlock + 1,
+        );
+        const b = await this.scanRangeWithSize(
+          client,
+          poolAddress,
+          mid + 1,
+          toBlock,
+          logTag,
+          toBlock - mid,
+        );
         return a + b;
       }
 

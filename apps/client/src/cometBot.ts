@@ -30,8 +30,8 @@ import { cometViewAbi, COMET_COLLATERAL_ASSETS } from "./abis/Comet.js";
 import { CometAccountRegistry } from "./cometAccountRegistry.js";
 import { PositionLiquidationCooldownMechanism } from "./utils/cooldownMechanisms.js";
 import { findDeployBlock } from "./utils/findDeployBlock.js";
-import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
 import { logLiquidationDebug } from "./utils/liquidationDebug.js";
+import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
 import { liquidationTracker } from "./utils/liquidationState.js";
 import { createScanClient, ReadClientPool } from "./utils/rpcFallback.js";
 import {
@@ -451,16 +451,47 @@ export class CometLiquidationBot {
       allowFailure: true,
     });
 
+    // BUGFIX: 之前每一種 collateral 都把 flashLoanAmount(全部閃電貸金額)當作各自的
+    // spend cap 傳給 buyCollateral。Compound III 的 buyCollateral 會真的把 baseAmount
+    // 全部從呼叫者扣走(不會自動按比例縮減),所以只要帳戶有 2 種以上 collateral 且第一種
+    // 的協議儲備量夠大,第一筆呼叫就會花光所有 flash-borrowed 的 base asset,
+    // 第二筆呼叫的 transferFrom 會失敗 → 整筆交易 revert。
+    // 現在改成:先用 USD 價值估算每種 collateral 儲備值多少 base asset,按比例分配
+    // flashLoanAmount 的預算,並確保所有 buyCollateral 呼叫加總不超過 flashLoanAmount。
+    const flashLoanValueUsd = await priceAsset(this.sharedDeps, comet.baseAsset, flashLoanAmount);
+    let remainingBudget = flashLoanAmount;
+
     for (let i = 0; i < reserveResults.length; i++) {
+      if (remainingBudget <= 0n) break;
       const result = reserveResults[i]!;
       if (result.status !== "success" || result.result <= 0n) continue;
       const collateral = filteredCollaterals[i]!;
+      const reserveAmount = result.result;
+
+      let baseAmountForThisCollateral = remainingBudget;
+      if (flashLoanValueUsd && flashLoanValueUsd > 0) {
+        const reserveValueUsd = await priceAsset(this.sharedDeps, collateral, reserveAmount);
+        if (reserveValueUsd !== undefined && reserveValueUsd > 0) {
+          // 用美元價值比例換算成 base asset 數量,並保留 5% 安全邊際避免價格微幅誤差仍超支
+          const ratio = reserveValueUsd / flashLoanValueUsd;
+          const proportional = (flashLoanAmount * BigInt(Math.floor(ratio * 9500))) / 10000n;
+          if (proportional > 0n && proportional < remainingBudget) {
+            baseAmountForThisCollateral = proportional;
+          }
+        }
+      }
+      if (baseAmountForThisCollateral <= 0n) continue;
+      if (baseAmountForThisCollateral > remainingBudget) {
+        baseAmountForThisCollateral = remainingBudget;
+      }
+
       callbackEncoder.cometBuyCollateral(
         comet.address,
         collateral,
         0n, // minAmount = 0 (we rely on simulation for safety)
-        flashLoanAmount, // max base asset to spend
+        baseAmountForThisCollateral,
       );
+      remainingBudget -= baseAmountForThisCollateral;
     }
 
     // Step 4: DEX swap any non-base collateral → base asset

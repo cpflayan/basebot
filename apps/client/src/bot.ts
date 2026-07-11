@@ -37,8 +37,8 @@ import {
   PositionLiquidationCooldownMechanism,
 } from "./utils/cooldownMechanisms.js";
 import { fetchWhitelistedVaults } from "./utils/fetch-whitelisted-vaults.js";
-import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
 import { logLiquidationDebug } from "./utils/liquidationDebug.js";
+import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
 import { liquidationTracker } from "./utils/liquidationState.js";
 import { DEFAULT_LIQUIDATION_BUFFER_BPS, WAD, wMulDown } from "./utils/maths.js";
 import {
@@ -565,7 +565,8 @@ export class LiquidationBot {
       logLiquidationDebug({
         protocol: this.logTag,
         account: position.user,
-        healthFactor: position.healthFactor !== undefined ? Number(position.healthFactor) / 1e18 : undefined,
+        healthFactor:
+          position.healthFactor !== undefined ? Number(position.healthFactor) / 1e18 : undefined,
         collateral: {
           token: marketParams.collateralToken,
           amount: position.collateral,
@@ -579,7 +580,9 @@ export class LiquidationBot {
         details: {
           marketId: MarketUtils.getMarketId(marketParams),
           loanTokenBlacklisted: TOKEN_BLACKLIST.has(marketParams.loanToken.toLowerCase()),
-          collateralTokenBlacklisted: TOKEN_BLACKLIST.has(marketParams.collateralToken.toLowerCase()),
+          collateralTokenBlacklisted: TOKEN_BLACKLIST.has(
+            marketParams.collateralToken.toLowerCase(),
+          ),
         },
       });
       return;
@@ -588,34 +591,22 @@ export class LiquidationBot {
     const seizableCollateral = position.seizableCollateral ?? 0n;
     const badDebtPosition = seizableCollateral === position.collateral;
 
-    logLiquidationDebug({
-      protocol: this.logTag,
-      account: position.user,
-      healthFactor: position.healthFactor !== undefined ? Number(position.healthFactor) / 1e18 : undefined,
-      collateral: {
-        token: marketParams.collateralToken,
-        amount: position.collateral,
-      },
-      debt: {
-        token: marketParams.loanToken,
-        amount: position.borrowShares,
-      },
-      seizableCollateral,
-      isBadDebt: badDebtPosition,
-      decision: "liquidate",
-      reason: "Position evaluation in progress",
-      details: {
-        marketId: MarketUtils.getMarketId(marketParams),
-        seizableEqualsCollateral: badDebtPosition,
-        note: "Checking cooldown and bad debt filters...",
-      },
-    });
-
     if (!this.checkCooldown(MarketUtils.getMarketId(marketParams), position.user)) {
       logLiquidationDebug({
         protocol: this.logTag,
         account: position.user,
-        healthFactor: position.healthFactor !== undefined ? Number(position.healthFactor) / 1e18 : undefined,
+        healthFactor:
+          position.healthFactor !== undefined ? Number(position.healthFactor) / 1e18 : undefined,
+        collateral: {
+          token: marketParams.collateralToken,
+          amount: position.collateral,
+        },
+        debt: {
+          token: marketParams.loanToken,
+          amount: position.borrowShares,
+        },
+        seizableCollateral,
+        isBadDebt: badDebtPosition,
         decision: "skip",
         reason: "Position is in cooldown period",
         details: {
@@ -632,7 +623,8 @@ export class LiquidationBot {
       logLiquidationDebug({
         protocol: this.logTag,
         account: position.user,
-        healthFactor: position.healthFactor !== undefined ? Number(position.healthFactor) / 1e18 : undefined,
+        healthFactor:
+          position.healthFactor !== undefined ? Number(position.healthFactor) / 1e18 : undefined,
         collateral: {
           token: marketParams.collateralToken,
           amount: position.collateral,
@@ -653,6 +645,31 @@ export class LiquidationBot {
       });
       return;
     }
+
+    // All checks passed, proceed with liquidation
+    logLiquidationDebug({
+      protocol: this.logTag,
+      account: position.user,
+      healthFactor:
+        position.healthFactor !== undefined ? Number(position.healthFactor) / 1e18 : undefined,
+      collateral: {
+        token: marketParams.collateralToken,
+        amount: position.collateral,
+      },
+      debt: {
+        token: marketParams.loanToken,
+        amount: position.borrowShares,
+      },
+      seizableCollateral,
+      isBadDebt: badDebtPosition,
+      decision: "liquidate",
+      reason: "All checks passed, proceeding with liquidation",
+      details: {
+        marketId: MarketUtils.getMarketId(marketParams),
+        useFlashLoan: this.useFlashLoan,
+        alwaysRealizeBadDebt: this.alwaysRealizeBadDebt,
+      },
+    });
 
     this._liquidationsAttempted++;
     const hf = position.healthFactor;

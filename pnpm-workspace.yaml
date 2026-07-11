@@ -2,10 +2,19 @@ packages:
   - "packages/*"
   - "apps/*"
 
+# BUGFIX: 統一整個 monorepo 的 viem 版本，避免不同 workspace package 解析到不同的
+# viem 版本（例如 2.54.6 vs 2.55.0），導致跨 package 的型別（Client/Account 等）
+# 在 TypeScript 眼中被視為不相容，出現一堆看似詭異的 typecheck 錯誤。
+# 選 2.54.6 而非最新的 2.55.0 是因為後者剛發布沒幾天，會被下面的 minimumReleaseAge
+# 供應鏈安全設定擋下來。
+overrides:
+  viem: 2.54.6
+
 allowBuilds:
   esbuild: true
   keccak: true
   rescript: true
+  unrs-resolver: true
 
 # 3 days (4320 minutes) — delay newly published packages to reduce supply-chain risk.
 minimumReleaseAge: 4320
