@@ -11,7 +11,7 @@
     "test:client": "pnpm build && vitest --dir apps/client",
     "test:fork-suite": "pnpm build && vitest run apps/client/test/vitest/allBots.fork.test.ts",
     "test:hyperindex": "pnpm --filter @morpho-blue-liquidation-bot/hyperindex test",
-    "build": "pnpm build:config && pnpm --parallel --filter @morpho-blue-liquidation-bot/data-providers --filter @morpho-blue-liquidation-bot/liquidity-venues --filter @morpho-blue-liquidation-bot/pricers build",
+    "build": "pnpm build:config && pnpm --parallel --filter @morpho-blue-liquidation-bot/data-providers --filter @morpho-blue-liquidation-bot/liquidity-venues build && pnpm build:pricers",
     "build:config": "pnpm --filter @morpho-blue-liquidation-bot/config build",
     "build:data-providers": "pnpm --filter @morpho-blue-liquidation-bot/data-providers build",
     "build:liquidity-venues": "pnpm --filter @morpho-blue-liquidation-bot/liquidity-venues build",
