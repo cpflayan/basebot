@@ -20,8 +20,13 @@ import { uniswapV3FactoryAbi, uniswapV3PoolAbi } from "../abis/uniswapV3";
 import type { LiquidityVenue } from "../liquidityVenue";
 import type { ToConvert } from "../types";
 
+const Q96 = 2n ** 96n;
+const BPS_DENOMINATOR = 10_000n;
+
 export class UniswapV3Venue implements LiquidityVenue {
   private pools: Record<Address, Record<Address, Address[]>> = {};
+  // SECURITY (C2): set as a byproduct of convert(), consumed by estimatePriceImpactBps()
+  private lastImpactBps: bigint | undefined;
 
   async supportsRoute(encoder: ExecutorEncoder, src: Address, dst: Address) {
     if (src === dst) return false;
@@ -37,6 +42,7 @@ export class UniswapV3Venue implements LiquidityVenue {
     const pools = this.getCachedPools(src, dst);
 
     if (pools === undefined) {
+      this.lastImpactBps = undefined;
       return toConvert;
     }
 
@@ -64,7 +70,34 @@ export class UniswapV3Venue implements LiquidityVenue {
         throw new Error("(UniswapV3) No Uniswap pool found");
       }
 
+      // SECURITY (C2): swap() below passes MIN/MAX_SQRT_RATIO — no protocol-level
+      // minAmountOut. Approximate price impact from the pool's current liquidity (L)
+      // and sqrtPriceX96, using the standard single-tick virtual-reserve formula:
+      //   virtualReserve0 = L * Q96 / sqrtPriceX96
+      //   virtualReserve1 = L * sqrtPriceX96 / Q96
+      // This ignores tick-crossing for large trades, so it under-estimates impact
+      // for trades that eat through the active tick's liquidity — treat it as a
+      // floor, not an exact figure.
+      const liquidity = liquidities.find((l) => l.pool === biggestPool)?.amount ?? 0n;
+      const [sqrtPriceX96] = await readContract(encoder.client, {
+        address: biggestPool,
+        abi: uniswapV3PoolAbi,
+        functionName: "slot0",
+      });
+
       const zeroForOne = fromHex(src, "bigint") < fromHex(dst, "bigint");
+
+      if (liquidity > 0n && sqrtPriceX96 > 0n) {
+        const virtualReserveSrc = zeroForOne
+          ? (liquidity * Q96) / sqrtPriceX96 // reserve0
+          : (liquidity * sqrtPriceX96) / Q96; // reserve1
+        this.lastImpactBps =
+          virtualReserveSrc > 0n
+            ? (srcAmount * BPS_DENOMINATOR) / (virtualReserveSrc + srcAmount)
+            : undefined;
+      } else {
+        this.lastImpactBps = undefined;
+      }
 
       const encodedContext =
         `0x${0n.toString(16).padStart(24, "0") + zeroAddress.substring(2)}` as const;
@@ -116,6 +149,10 @@ export class UniswapV3Venue implements LiquidityVenue {
         `(UniswapV3) Error swapping: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
+  }
+
+  estimatePriceImpactBps(): bigint | undefined {
+    return this.lastImpactBps;
   }
 
   private getCachedPools(src: Address, dst: Address) {

@@ -12,8 +12,12 @@ interface PoolInfo {
   stable: boolean;
 }
 
+const BPS_DENOMINATOR = 10_000n;
+
 export class AerodromeVenue implements LiquidityVenue {
   private pools: Record<Address, Record<Address, PoolInfo | null>> = {};
+  // SECURITY (C2): set as a byproduct of convert(), consumed by estimatePriceImpactBps()
+  private lastImpactBps: bigint | undefined;
 
   async supportsRoute(encoder: ExecutorEncoder, src: Address, dst: Address) {
     if (src === dst) return false;
@@ -29,11 +33,33 @@ export class AerodromeVenue implements LiquidityVenue {
     const poolInfo = this.getCachedPool(src, dst);
 
     if (poolInfo === undefined || poolInfo === null) {
+      this.lastImpactBps = undefined;
       return toConvert;
     }
 
     try {
       const pool = poolInfo.address;
+
+      // SECURITY (C2): pool.swap() below passes amount0Out=0, amount1Out=0 — no
+      // protocol-level minAmountOut. Fetch reserves as a proxy for price impact so
+      // the caller can size a dynamic slippage margin instead of a flat guess.
+      // NOTE: this is a constant-product (x*y=k) approximation. Aerodrome "stable"
+      // pools use a different curve (x^3*y + y^3*x = k), which has lower slippage
+      // near the peg — so for stable pools this over-estimates impact. That's the
+      // safe direction to be wrong in (bigger margin, not a false sense of safety).
+      const [reserve0, reserve1] = await readContract(encoder.client, {
+        address: pool,
+        abi: aerodromePoolAbi,
+        functionName: "getReserves",
+      });
+      const token0 = await readContract(encoder.client, {
+        address: pool,
+        abi: aerodromePoolAbi,
+        functionName: "token0",
+      });
+      const srcReserve = src.toLowerCase() === token0.toLowerCase() ? reserve0 : reserve1;
+      this.lastImpactBps =
+        srcReserve > 0n ? (srcAmount * BPS_DENOMINATOR) / (srcReserve + srcAmount) : undefined;
 
       // Step 1: Transfer collateral to the pool
       encoder.pushCall(
@@ -71,6 +97,10 @@ export class AerodromeVenue implements LiquidityVenue {
         `(Aerodrome) Error swapping: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
+  }
+
+  estimatePriceImpactBps(): bigint | undefined {
+    return this.lastImpactBps;
   }
 
   private getCachedPool(src: Address, dst: Address): PoolInfo | null | undefined {

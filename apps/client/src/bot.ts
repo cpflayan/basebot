@@ -691,16 +691,14 @@ export class LiquidationBot {
 
     const encoder = new LiquidationEncoder(executorAddress, client);
 
-    if (
-      !(await sharedConvertCollateralToLoan(
-        this.sharedDeps,
-        getAddress(marketParams.collateralToken),
-        getAddress(marketParams.loanToken),
-        this.decreaseSeizableCollateral(seizableCollateral, badDebtPosition),
-        encoder,
-      ))
-    )
-      return;
+    const { success: directSwapSuccess } = await sharedConvertCollateralToLoan(
+      this.sharedDeps,
+      getAddress(marketParams.collateralToken),
+      getAddress(marketParams.loanToken),
+      this.decreaseSeizableCollateral(seizableCollateral, badDebtPosition),
+      encoder,
+    );
+    if (!directSwapSuccess) return;
 
     // Only approve if allowance is insufficient (saves ~5k-21k gas per tx)
     const morphoAddress = this.chainAddresses.morpho;
@@ -841,7 +839,7 @@ export class LiquidationBot {
     // Step 1: Build DEX swap calls (collateral → loan token)
     // These are built on a temporary encoder to capture the raw calls
     const tempEncoder = new LiquidationEncoder(executorAddress, client);
-    const swapSuccess = await sharedConvertCollateralToLoan(
+    const { success: swapSuccess, impactBps: venueImpactBps } = await sharedConvertCollateralToLoan(
       this.sharedDeps,
       getAddress(marketParams.collateralToken),
       getAddress(marketParams.loanToken),
@@ -917,6 +915,8 @@ export class LiquidationBot {
         badDebtPosition,
         flashLoanAmount,
         getAddress(marketParams.collateralToken),
+        undefined, // cachedGasPrice
+        venueImpactBps,
       );
 
       if (success) {
@@ -979,16 +979,14 @@ export class LiquidationBot {
 
     const encoder = new LiquidationEncoder(executorAddress, client);
 
-    if (
-      !(await sharedConvertCollateralToLoan(
-        this.sharedDeps,
-        getAddress(marketParams.collateralToken),
-        getAddress(marketParams.loanToken),
-        seizableCollateral,
-        encoder,
-      ))
-    )
-      return;
+    const { success: preLiqSwapSuccess } = await sharedConvertCollateralToLoan(
+      this.sharedDeps,
+      getAddress(marketParams.collateralToken),
+      getAddress(marketParams.loanToken),
+      seizableCollateral,
+      encoder,
+    );
+    if (!preLiqSwapSuccess) return;
 
     // Only approve if allowance is insufficient (saves ~5k-21k gas per tx)
     const currentAllowance = await readContract(this.client, {

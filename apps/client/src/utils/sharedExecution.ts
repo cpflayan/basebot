@@ -38,11 +38,26 @@ import { liquidationTracker } from "./liquidationState.js";
 const BPS_DENOMINATOR = 10_000n;
 
 /**
- * Slippage tolerance for DEX swaps within flash loan path.
- * Increased from 1% to 3% to provide sandwich-attack safety margin
- * (Base has public mempool with useFlashbots: false).
+ * SECURITY (C2): Dynamic slippage margin for DEX swaps within the flash loan path.
+ * Previously a flat 300 bps (3%) regardless of route. Now sized per the actual
+ * venue used:
+ * - Route went through an aggregator whose own router enforces minReturn on-chain
+ *   (1inch/0x) → the flat 3% was overkill; use a small floor instead.
+ * - Route went through a "naked" AMM (UniswapV3/Aerodrome/UniswapV4, no
+ *   protocol-level minAmountOut) → scale with the route's own estimated price
+ *   impact (never below the old 3% floor), since a thin long-tail pool can move
+ *   more than 3% between simulation and inclusion while a deep WETH/USDC pool
+ *   barely moves at all.
  */
-const FLASH_LOAN_SLIPPAGE_BPS = 300n; // 3% (was 100n = 1%)
+const PROTECTED_ROUTE_FLOOR_BPS = 100n; // 1% — route already has on-chain minReturn protection
+const NAKED_ROUTE_FLOOR_BPS = 300n; // 3% — matches the old flat value, used as a lower bound
+const IMPACT_SAFETY_MULTIPLIER_PCT = 150n; // scale the raw impact estimate by +50%
+
+function computeDynamicSlippageBps(venueImpactBps: bigint | undefined): bigint {
+  if (venueImpactBps === undefined) return PROTECTED_ROUTE_FLOOR_BPS;
+  const scaledImpact = (venueImpactBps * IMPACT_SAFETY_MULTIPLIER_PCT) / 100n;
+  return scaledImpact > NAKED_ROUTE_FLOOR_BPS ? scaledImpact : NAKED_ROUTE_FLOOR_BPS;
+}
 
 // ─── Token Blacklist ───
 
@@ -326,18 +341,28 @@ export async function priceAsset(
 
 // ─── Collateral → Loan token swap ───
 
+export interface ConvertCollateralToLoanResult {
+  success: boolean;
+  // SECURITY (C2): max price impact (bps) across any "naked" (no protocol-level
+  // minAmountOut) venue used in the route. `undefined` means either no naked venue
+  // was used (fully protocol-protected route, e.g. 1inch/0x) or impact couldn't be
+  // estimated — callers should treat `undefined` as "apply the protected floor".
+  impactBps: bigint | undefined;
+}
+
 export async function convertCollateralToLoan(
   deps: SharedExecutionDeps,
   collateralToken: Address,
   loanToken: Address,
   seizableCollateral: bigint,
   encoder: LiquidationEncoder,
-): Promise<boolean> {
+): Promise<ConvertCollateralToLoanResult> {
   let toConvert = {
     src: collateralToken,
     dst: loanToken,
     srcAmount: seizableCollateral,
   };
+  let maxImpactBps: bigint | undefined;
 
   console.log(
     `${deps.logTag}[Route Debug] Trying to convert ${collateralToken.slice(0, 10)}... -> ${loanToken.slice(0, 10)}..., amount=${seizableCollateral}, venues=${deps.liquidityVenues.length}`,
@@ -353,11 +378,23 @@ export async function convertCollateralToLoan(
         const convertSnapshot = { ...toConvert };
         toConvert = await venue.convert(encoder, toConvert);
         if (toConvert.src === convertSnapshot.src && toConvert.dst === convertSnapshot.dst) {
-          console.log(`${deps.logTag}[Route Debug] ${venueName}: route supported but convert returned same tokens, skipping`);
+          console.log(
+            `${deps.logTag}[Route Debug] ${venueName}: route supported but convert returned same tokens, skipping`,
+          );
           encoder.restoreCalls(snapshot);
           continue;
         }
         console.log(`${deps.logTag}[Route Debug] ${venueName}: conversion successful`);
+
+        // SECURITY (C2): accumulate this hop's price impact (if the venue is "naked")
+        const hopImpactBps = venue.estimatePriceImpactBps?.();
+        if (hopImpactBps !== undefined) {
+          maxImpactBps =
+            maxImpactBps === undefined || hopImpactBps > maxImpactBps ? hopImpactBps : maxImpactBps;
+          console.log(
+            `${deps.logTag}[Route Debug] ${venueName}: estimated price impact ${hopImpactBps} bps`,
+          );
+        }
       } else {
         console.log(`${deps.logTag}[Route Debug] ${venueName}: route not supported`);
         encoder.restoreCalls(snapshot);
@@ -372,12 +409,14 @@ export async function convertCollateralToLoan(
 
     if (toConvert.src === toConvert.dst) {
       console.log(`${deps.logTag}[Route Debug] Conversion complete via ${venueName}`);
-      return true;
+      return { success: true, impactBps: maxImpactBps };
     }
   }
 
-  console.log(`${deps.logTag}[Route Debug] No venue found for ${collateralToken.slice(0, 10)}... -> ${loanToken.slice(0, 10)}...`);
-  return false;
+  console.log(
+    `${deps.logTag}[Route Debug] No venue found for ${collateralToken.slice(0, 10)}... -> ${loanToken.slice(0, 10)}...`,
+  );
+  return { success: false, impactBps: undefined };
 }
 
 // ─── Simulation + Execution (flash loan path) ───
@@ -391,6 +430,7 @@ export async function simulateAndExecFlashLoan(
   flashLoanAmount: bigint,
   cachedGasPrice?: bigint,
   collateralToken?: Address,
+  venueImpactBps?: bigint,
 ): Promise<boolean> {
   const functionData = {
     abi: executorAbi,
@@ -453,9 +493,14 @@ export async function simulateAndExecFlashLoan(
   }
 
   // Slippage safety margin
-  const slippageMargin = (flashLoanAmount * FLASH_LOAN_SLIPPAGE_BPS) / BPS_DENOMINATOR;
+  const dynamicSlippageBps = computeDynamicSlippageBps(venueImpactBps);
+  const slippageMargin = (flashLoanAmount * dynamicSlippageBps) / BPS_DENOMINATOR;
   const estimatedGasCost = results[1].gasUsed * gasPrice;
   const minProfitThreshold = slippageMargin > estimatedGasCost ? slippageMargin : estimatedGasCost;
+
+  console.log(
+    `${deps.logTag}[Sim Debug] dynamicSlippageBps=${dynamicSlippageBps} (venueImpactBps=${venueImpactBps ?? "n/a — protected route"})`,
+  );
 
   if (simulatedProfit < minProfitThreshold) {
     console.warn(
@@ -483,7 +528,10 @@ export async function simulateAndExecFlashLoan(
       );
       console.log(`${deps.logTag}[Exec Debug] Flashbots bundle sent`);
     } else {
-      const txHash = await writeContract(deps.client, { address: encoder.address, ...functionData });
+      const txHash = await writeContract(deps.client, {
+        address: encoder.address,
+        ...functionData,
+      });
       console.log(`${deps.logTag}[Exec Debug] Transaction sent: ${txHash}`);
     }
   } catch (e) {
@@ -557,6 +605,7 @@ export async function simulateAndExecFlashLoanWithFallback(
   flashLoanAmount: bigint,
   collateralToken?: Address,
   cachedGasPrice?: bigint,
+  venueImpactBps?: bigint,
 ): Promise<boolean> {
   const providers = [deps.flashLoanProvider, ...deps.flashLoanFallbackProviders];
   console.log(
@@ -586,6 +635,7 @@ export async function simulateAndExecFlashLoanWithFallback(
         flashLoanAmount,
         cachedGasPrice,
         collateralToken,
+        venueImpactBps,
       );
 
       if (success) {
@@ -690,7 +740,10 @@ export async function simulateAndExec(
       );
       console.log(`${deps.logTag}[Exec Debug] Flashbots bundle sent`);
     } else {
-      const txHash = await writeContract(deps.client, { address: encoder.address, ...functionData });
+      const txHash = await writeContract(deps.client, {
+        address: encoder.address,
+        ...functionData,
+      });
       console.log(`${deps.logTag}[Exec Debug] Transaction sent: ${txHash}`);
     }
   } catch (e) {
