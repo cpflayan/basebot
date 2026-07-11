@@ -3,6 +3,8 @@
     // Type checking
     "strict": true,
     "noUncheckedIndexedAccess": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
 
     // Interop constraints
     "verbatimModuleSyntax": false,

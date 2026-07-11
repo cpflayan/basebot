@@ -1,4 +1,11 @@
-import { createPublicClient, http, type Chain, type Client, type Transport } from "viem";
+import {
+  createPublicClient,
+  http,
+  type Chain,
+  type Client,
+  type PublicClient,
+  type Transport,
+} from "viem";
 
 /**
  * RPC fallback manager — tries primary RPC first, falls back to alternatives.
@@ -52,4 +59,111 @@ export function createScanClient(chain: Chain, rpcUrls: string[]): Client<Transp
     chain,
     transport: http(primaryUrl),
   });
+}
+
+// ─── Read client pool (round-robin + health tracking) ───
+
+interface PoolEntry {
+  label: string;
+  client: PublicClient;
+  failures: number;
+  unhealthyUntil: number;
+}
+
+export interface ReadClientPoolConfig {
+  entries: { label: string; url: string }[];
+  chain: Chain;
+  maxFailures?: number;
+  cooldownMs?: number;
+  retryCount?: number;
+}
+
+export class ReadClientPool {
+  private entries: PoolEntry[];
+  private cursor = 0;
+  private readonly maxFailures: number;
+  private readonly cooldownMs: number;
+  private readonly retryCount: number;
+
+  constructor(config: ReadClientPoolConfig) {
+    this.maxFailures = config.maxFailures ?? 3;
+    this.cooldownMs = config.cooldownMs ?? 30_000;
+    this.retryCount = config.retryCount ?? 3;
+    this.entries = config.entries.map((e) => ({
+      label: e.label,
+      client: createPublicClient({
+        chain: config.chain,
+        transport: http(e.url, { retryCount: this.retryCount }),
+      }),
+      failures: 0,
+      unhealthyUntil: 0,
+    }));
+  }
+
+  get size(): number {
+    return this.entries.length;
+  }
+
+  next(): PublicClient {
+    const now = Date.now();
+    const total = this.entries.length;
+
+    for (let i = 0; i < total; i++) {
+      const idx = (this.cursor + i) % total;
+      const entry = this.entries[idx]!;
+
+      if (entry.unhealthyUntil > now) continue;
+
+      this.cursor = (idx + 1) % total;
+      return entry.client;
+    }
+
+    const entry = this.entries[this.cursor % total]!;
+    console.warn(`[ReadClientPool] all endpoints unhealthy, forcing ${entry.label}`);
+    entry.unhealthyUntil = 0;
+    entry.failures = 0;
+    this.cursor = (this.cursor + 1) % total;
+    return entry.client;
+  }
+
+  nextWithLabel(): { client: PublicClient; label: string } {
+    const now = Date.now();
+    const total = this.entries.length;
+
+    for (let i = 0; i < total; i++) {
+      const idx = (this.cursor + i) % total;
+      const entry = this.entries[idx]!;
+
+      if (entry.unhealthyUntil > now) continue;
+
+      this.cursor = (idx + 1) % total;
+      return { client: entry.client, label: entry.label };
+    }
+
+    const entry = this.entries[this.cursor % total]!;
+    console.warn(`[ReadClientPool] all endpoints unhealthy, forcing ${entry.label}`);
+    entry.unhealthyUntil = 0;
+    entry.failures = 0;
+    this.cursor = (this.cursor + 1) % total;
+    return { client: entry.client, label: entry.label };
+  }
+
+  recordSuccess(label: string): void {
+    const entry = this.entries.find((e) => e.label === label);
+    if (entry) {
+      entry.failures = 0;
+    }
+  }
+
+  recordFailure(label: string): void {
+    const entry = this.entries.find((e) => e.label === label);
+    if (!entry) return;
+    entry.failures++;
+    if (entry.failures >= this.maxFailures) {
+      entry.unhealthyUntil = Date.now() + this.cooldownMs;
+      console.warn(
+        `[ReadClientPool] ${label} marked unhealthy for ${this.cooldownMs / 1000}s (${entry.failures} failures)`,
+      );
+    }
+  }
 }

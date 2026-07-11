@@ -19,6 +19,7 @@
 import type { AaveWatchlistConfig, FlashLoanProvider } from "@morpho-blue-liquidation-bot/config";
 import type { LiquidityVenue } from "@morpho-blue-liquidation-bot/liquidity-venues";
 import type { Pricer } from "@morpho-blue-liquidation-bot/pricers";
+import { getChainAddresses } from "@morpho-org/blue-sdk";
 import {
   type Address,
   type Transport,
@@ -47,12 +48,12 @@ import { PositionLiquidationCooldownMechanism } from "./utils/cooldownMechanisms
 import { findDeployBlock } from "./utils/findDeployBlock.js";
 import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
 import { liquidationTracker } from "./utils/liquidationState.js";
-import { createScanClient } from "./utils/rpcFallback.js";
+import { createScanClient, ReadClientPool } from "./utils/rpcFallback.js";
 import {
   type SharedExecutionDeps,
   TOKEN_BLACKLIST as DEFAULT_TOKEN_BLACKLIST,
   convertCollateralToLoan,
-  createBlockPolling,
+  SharedBlockBus,
   priceAsset,
   simulateAndExecFlashLoanWithFallback,
   simulateAndExec,
@@ -61,6 +62,7 @@ import {
 export interface AaveLiquidationBotInputs {
   logTag: string;
   client: WalletClient<Transport, Chain, Account>;
+  paidReadPool: ReadClientPool;
   aaveWatchlist: AaveWatchlistConfig;
   executorAddress: Address;
   treasuryAddress: Address;
@@ -81,6 +83,7 @@ export interface AaveLiquidationBotInputs {
 export class AaveLiquidationBot {
   private logTag: string;
   private client: WalletClient<Transport, Chain, Account>;
+  private paidReadPool: ReadClientPool;
   private poolAddress: Address;
   private poolDeployBlock: number;
   private configuredReserves: Address[];
@@ -106,8 +109,6 @@ export class AaveLiquidationBot {
   private cachedReserves: Address[] = [];
   /** Merged token blacklist (default + config) */
   private tokenBlacklist: Set<string>;
-  /** Slippage tolerance for DEX swaps in bps */
-  private slippageBps: number;
   /** Cached reserve configs (liquidationBonus, decimals) — avoids repeated RPC calls */
   private cachedReserveConfigs = new Map<string, ReserveConfig>();
 
@@ -124,6 +125,7 @@ export class AaveLiquidationBot {
   constructor(inputs: AaveLiquidationBotInputs) {
     this.logTag = inputs.logTag;
     this.client = inputs.client;
+    this.paidReadPool = inputs.paidReadPool;
     this.poolAddress = inputs.aaveWatchlist.poolAddress;
     this.poolDeployBlock = inputs.aaveWatchlist.poolDeployBlock;
     this.configuredReserves = inputs.aaveWatchlist.reserves;
@@ -141,7 +143,6 @@ export class AaveLiquidationBot {
     this.alwaysRealizeBadDebt = inputs.alwaysRealizeBadDebt ?? false;
     this.pollIntervalBlocks = inputs.aaveWatchlist.pollIntervalBlocks ?? 5;
     this.minHealthFactorBuffer = inputs.aaveWatchlist.minHealthFactorBuffer ?? 0n;
-    this.slippageBps = inputs.aaveWatchlist.slippageBps ?? 100;
 
     // Merge default + config token blacklists
     this.tokenBlacklist = new Set(DEFAULT_TOKEN_BLACKLIST);
@@ -167,6 +168,7 @@ export class AaveLiquidationBot {
       alwaysRealizeBadDebt: this.alwaysRealizeBadDebt,
       flashLoanProvider: this.flashLoanProvider,
       flashLoanFallbackProviders: this.flashLoanFallbackProviders,
+      morphoAddress: getChainAddresses(this.chainId).morpho,
     };
 
     // Read-only client on Base public RPC for historical scanning
@@ -241,7 +243,9 @@ export class AaveLiquidationBot {
           `${this.logTag}⚠️ On-chain getReservesList failed, using configured reserves (${this.configuredReserves.length} assets)`,
         );
       } else {
-        console.error(`${this.logTag}Failed to cache reserves:`, e);
+        console.error(
+          `${this.logTag}Failed to cache reserves: ${e instanceof Error ? e.message : e}`,
+        );
         this.cachedReserves = [];
       }
     }
@@ -255,7 +259,7 @@ export class AaveLiquidationBot {
     if (this.cachedReserves.length === 0) return;
 
     try {
-      const results = await multicall(this.client, {
+      const results = await multicall(this.paidReadPool.next(), {
         contracts: this.cachedReserves.map((asset) => ({
           address: this.poolAddress,
           abi: aaveReserveConfigurationAbi,
@@ -296,8 +300,7 @@ export class AaveLiquidationBot {
       );
     } catch (e) {
       console.warn(
-        `${this.logTag}⚠️ Failed to cache reserve configs via multicall, will fetch on-demand:`,
-        e,
+        `${this.logTag}⚠️ Failed to cache reserve configs via multicall, will fetch on-demand: ${e instanceof Error ? e.message : e}`,
       );
     }
   }
@@ -308,13 +311,8 @@ export class AaveLiquidationBot {
    * Start polling: check getUserAccountData on every N blocks.
    * Returns an unwatch function.
    */
-  startPolling(): () => void {
-    return createBlockPolling({
-      logTag: this.logTag,
-      client: this.client,
-      pollIntervalBlocks: this.pollIntervalBlocks,
-      onTick: () => this.checkAave(),
-    });
+  startPolling(bus: SharedBlockBus): void {
+    bus.register(this.pollIntervalBlocks, () => this.checkAave(), this.logTag);
   }
 
   // ─── Health status ───
@@ -372,7 +370,9 @@ export class AaveLiquidationBot {
     } catch (e) {
       this._rpcErrors++;
       this._lastError = String(e);
-      console.error(`${this.logTag}Error checking Aave Pool:`, e);
+      console.error(
+        `${this.logTag}Error checking Aave Pool: ${e instanceof Error ? e.message : e}`,
+      );
     }
   }
 
@@ -393,7 +393,7 @@ export class AaveLiquidationBot {
       const batch = accounts.slice(i, i + BATCH_SIZE);
 
       try {
-        const results = await multicall(this.client, {
+        const results = await multicall(this.paidReadPool.next(), {
           contracts: batch.map((account) => ({
             address: this.poolAddress,
             abi: aavePoolViewAbi,
@@ -419,7 +419,9 @@ export class AaveLiquidationBot {
       } catch (e) {
         this._rpcErrors += batch.length;
         this._rpcTotal += batch.length;
-        console.warn(`${this.logTag}⚠️ batchCheckHealthFactor batch ${i / BATCH_SIZE} failed:`, e);
+        console.warn(
+          `${this.logTag}⚠️ batchCheckHealthFactor batch ${i / BATCH_SIZE} failed: ${e instanceof Error ? e.message : e}`,
+        );
       }
     }
 
@@ -554,7 +556,9 @@ export class AaveLiquidationBot {
     } catch (error) {
       this._liquidationsFailed++;
       this._lastError = String(error);
-      console.error(`${this.logTag}Failed to liquidate ${account} on Aave Pool (direct)`, error);
+      console.error(
+        `${this.logTag}Failed to liquidate ${account} on Aave Pool (direct): ${error instanceof Error ? error.message : error}`,
+      );
     }
   }
 
@@ -639,7 +643,9 @@ export class AaveLiquidationBot {
     } catch (error) {
       this._liquidationsFailed++;
       this._lastError = String(error);
-      console.error(`${this.logTag}[FlashLoan] Failed to liquidate ${account} on Aave Pool`, error);
+      console.error(
+        `${this.logTag}[FlashLoan] Failed to liquidate ${account} on Aave Pool: ${error instanceof Error ? error.message : error}`,
+      );
     }
   }
 }

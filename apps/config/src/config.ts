@@ -34,7 +34,9 @@ export function loadApprovedMarketIds(chainId: number): `0x${string}`[] {
       })
       .map((m: { marketId: string }) => m.marketId as `0x${string}`);
   } catch (e) {
-    console.warn(`[config] 讀取 discovered-markets.${chainId}.json 失敗:`, e);
+    console.warn(
+      `[config] 讀取 discovered-markets.${chainId}.json 失敗: ${e instanceof Error ? e.message : e}`,
+    );
     return [];
   }
 }
@@ -272,7 +274,7 @@ export const chainConfigs: Record<number, Config> = {
         ],
         pollIntervalBlocks: 5,
       },
-      scanRpcUrls: ["https://mainnet.base.org", process.env.ALCHEMY_BASE_RPC ?? ""].filter(Boolean),
+      scanRpcUrls: [process.env.PUBLIC_RPC_URL_BASE ?? "https://mainnet.base.org"].filter(Boolean),
     },
   },
   [unichain.id]: {

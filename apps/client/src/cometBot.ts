@@ -11,6 +11,7 @@
 import type { CometWatchlistConfig, FlashLoanProvider } from "@morpho-blue-liquidation-bot/config";
 import type { LiquidityVenue } from "@morpho-blue-liquidation-bot/liquidity-venues";
 import type { Pricer } from "@morpho-blue-liquidation-bot/pricers";
+import { getChainAddresses } from "@morpho-org/blue-sdk";
 import {
   type Address,
   type Transport,
@@ -31,12 +32,12 @@ import { PositionLiquidationCooldownMechanism } from "./utils/cooldownMechanisms
 import { findDeployBlock } from "./utils/findDeployBlock.js";
 import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
 import { liquidationTracker } from "./utils/liquidationState.js";
-import { createScanClient } from "./utils/rpcFallback.js";
+import { createScanClient, ReadClientPool } from "./utils/rpcFallback.js";
 import {
   type SharedExecutionDeps,
   TOKEN_BLACKLIST,
   convertCollateralToLoan,
-  createBlockPolling,
+  SharedBlockBus,
   priceAsset,
   simulateAndExecFlashLoanWithFallback,
   simulateAndExec,
@@ -45,6 +46,7 @@ import {
 export interface CometLiquidationBotInputs {
   logTag: string;
   client: WalletClient<Transport, Chain, Account>;
+  paidReadPool: ReadClientPool;
   cometWatchlist: CometWatchlistConfig;
   executorAddress: Address;
   treasuryAddress: Address;
@@ -73,6 +75,7 @@ interface CometInfo {
 export class CometLiquidationBot {
   private logTag: string;
   private client: WalletClient<Transport, Chain, Account>;
+  private paidReadPool: ReadClientPool;
   private cometList: CometInfo[];
   private executorAddress: Address;
   private treasuryAddress: Address;
@@ -105,6 +108,7 @@ export class CometLiquidationBot {
   constructor(inputs: CometLiquidationBotInputs) {
     this.logTag = inputs.logTag;
     this.client = inputs.client;
+    this.paidReadPool = inputs.paidReadPool;
     this.executorAddress = inputs.executorAddress;
     this.treasuryAddress = inputs.treasuryAddress;
     this.liquidityVenues = inputs.liquidityVenues;
@@ -143,6 +147,7 @@ export class CometLiquidationBot {
       alwaysRealizeBadDebt: this.alwaysRealizeBadDebt,
       flashLoanProvider: this.flashLoanProvider,
       flashLoanFallbackProviders: this.flashLoanFallbackProviders,
+      morphoAddress: getChainAddresses(this.chainId).morpho,
     };
 
     // Read-only client on Base public RPC for historical scanning
@@ -233,8 +238,7 @@ export class CometLiquidationBot {
         );
       } else {
         console.error(
-          `${this.logTag}Failed to cache collateral assets for ${comet.address.slice(0, 10)}...:`,
-          e,
+          `${this.logTag}Failed to cache collateral assets for ${comet.address.slice(0, 10)}...: ${e instanceof Error ? e.message : e}`,
         );
         comet.collateralAssets = [];
       }
@@ -247,13 +251,8 @@ export class CometLiquidationBot {
    * Start polling: check isLiquidatable on every N blocks.
    * Returns an unwatch function.
    */
-  startPolling(): () => void {
-    return createBlockPolling({
-      logTag: this.logTag,
-      client: this.client,
-      pollIntervalBlocks: this.pollIntervalBlocks,
-      onTick: () => this.checkAllComets(),
-    });
+  startPolling(bus: SharedBlockBus): void {
+    bus.register(this.pollIntervalBlocks, () => this.checkAllComets(), this.logTag);
   }
 
   /**
@@ -284,7 +283,9 @@ export class CometLiquidationBot {
           await this.liquidateComet(comet, account);
         }
       } catch (e) {
-        console.error(`${this.logTag}Error checking Comet ${comet.address.slice(0, 10)}...:`, e);
+        console.error(
+          `${this.logTag}Error checking Comet ${comet.address.slice(0, 10)}...: ${e instanceof Error ? e.message : e}`,
+        );
       }
     }
   }
@@ -301,7 +302,7 @@ export class CometLiquidationBot {
       const batch = accounts.slice(i, i + BATCH_SIZE);
 
       try {
-        const results = await multicall(this.client, {
+        const results = await multicall(this.paidReadPool.next(), {
           contracts: batch.map((account) => ({
             address: comet,
             abi: cometViewAbi,
@@ -328,7 +329,9 @@ export class CometLiquidationBot {
         this._rpcErrors += batch.length;
         this._rpcTotal += batch.length;
         this._lastError = String(e);
-        console.warn(`${this.logTag}⚠️ batchCheckLiquidatable batch ${i / BATCH_SIZE} failed:`, e);
+        console.warn(
+          `${this.logTag}⚠️ batchCheckLiquidatable batch ${i / BATCH_SIZE} failed: ${e instanceof Error ? e.message : e}`,
+        );
       }
     }
 
@@ -405,7 +408,7 @@ export class CometLiquidationBot {
     const filteredCollaterals = collateralAssets.filter(
       (c) => !TOKEN_BLACKLIST.has(c.toLowerCase()),
     );
-    const reserveResults = await multicall(this.client, {
+    const reserveResults = await multicall(this.paidReadPool.next(), {
       contracts: filteredCollaterals.map((collateral) => ({
         address: comet.address,
         abi: cometViewAbi,
@@ -488,8 +491,7 @@ export class CometLiquidationBot {
       this._liquidationsFailed++;
       this._lastError = String(error);
       console.error(
-        `${this.logTag}[FlashLoan] Failed to liquidate ${account} on Comet ${comet.address.slice(0, 10)}...`,
-        error,
+        `${this.logTag}[FlashLoan] Failed to liquidate ${account} on Comet ${comet.address.slice(0, 10)}...: ${error instanceof Error ? error.message : error}`,
       );
     }
   }
@@ -519,7 +521,7 @@ export class CometLiquidationBot {
     const filteredCollaterals = collateralAssets.filter(
       (c) => !TOKEN_BLACKLIST.has(c.toLowerCase()),
     );
-    const reserveResults = await multicall(this.client, {
+    const reserveResults = await multicall(this.paidReadPool.next(), {
       contracts: filteredCollaterals.map((collateral) => ({
         address: comet.address,
         abi: cometViewAbi,
@@ -592,8 +594,7 @@ export class CometLiquidationBot {
       this._liquidationsFailed++;
       this._lastError = String(error);
       console.error(
-        `${this.logTag}Failed to liquidate ${account} on Comet ${comet.address.slice(0, 10)}...`,
-        error,
+        `${this.logTag}Failed to liquidate ${account} on Comet ${comet.address.slice(0, 10)}...: ${error instanceof Error ? error.message : error}`,
       );
     }
   }
@@ -635,8 +636,7 @@ export class CometLiquidationBot {
       this._rpcErrors++;
       this._lastError = String(e);
       console.warn(
-        `${this.logTag}Failed to estimate debt for ${account} on ${comet.slice(0, 10)}...:`,
-        e,
+        `${this.logTag}Failed to estimate debt for ${account} on ${comet.slice(0, 10)}...: ${e instanceof Error ? e.message : e}`,
       );
       return 0n;
     }

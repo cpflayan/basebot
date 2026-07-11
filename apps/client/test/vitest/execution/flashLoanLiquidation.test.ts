@@ -1,4 +1,4 @@
-import { type AccrualPosition, MarketUtils } from "@morpho-org/blue-sdk";
+import { MarketUtils } from "@morpho-org/blue-sdk";
 import type { AnvilTestClient } from "@morpho-org/test";
 import { testAccount } from "@morpho-org/test";
 import { createViemTest } from "@morpho-org/test/vitest";
@@ -189,6 +189,7 @@ describe("Base chain flash loan liquidation - full path test", () => {
       console.log("[Base] Setting up position...");
 
       const marketId = await setupPositionOnBase(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         client as any,
         marketParams,
         collateralAmount,
@@ -208,19 +209,6 @@ describe("Base chain flash loan liquidation - full path test", () => {
       console.log("  Supply shares:", position[0].toString());
       console.log("  Borrow shares:", position[1].toString());
       console.log("  Collateral:", position[2].toString());
-
-      // Create a mock position object for the bot
-      const _mockPosition: AccrualPosition = {
-        user: borrower.address,
-        marketId,
-        supplyShares: position[0],
-        borrowShares: position[1],
-        collateral: position[2],
-        healthFactor: 500000000000000000n, // Mock HF < 1 (0.5 in WAD)
-        collateralValue: parseUnits("15000", 6), // Mock value > debt
-        borrowAssets: borrowAmount,
-        seizableCollateral: position[2],
-      } as unknown as AccrualPosition;
 
       // Mock the data provider response
       nock("https://api.morpho.org")

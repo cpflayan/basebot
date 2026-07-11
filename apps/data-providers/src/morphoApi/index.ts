@@ -18,7 +18,8 @@ export class MorphoApiDataProvider implements DataProvider {
 
       return [...new Set(vaultMarkets.flat())];
     } catch (error) {
-      console.error(`[Chain ${client.chain.id}] Error fetching markets for vaults:`, error);
+      const msg = error instanceof Error ? error.message : error;
+      console.error(`[Chain ${client.chain.id}] Error fetching markets for vaults: ${msg}`);
       return [];
     }
   }
@@ -67,15 +68,16 @@ export class MorphoApiDataProvider implements DataProvider {
       if (positions.length === 0)
         return { liquidatablePositions: [], preLiquidatablePositions: [] };
 
+      const marketsNeeded = new Set(positions.map((p) => p.market.uniqueKey).filter(Boolean));
+
       const marketResults = await Promise.allSettled(
-        [...marketIds].map(async (marketId) => {
-          const market = await fetchMarket(marketId as MarketId, client, {
+        [...marketsNeeded].map(async (marketId) => {
+          const market = await fetchMarket(marketId, client, {
             chainId: client.chain.id,
-            // Disable `deployless` so that viem multicall aggregates fetches
             deployless: false,
           });
 
-          const now = BigInt(Time.timestamp());
+          const now = Time.timestamp();
           const timestamp = now > market.lastUpdate ? now : market.lastUpdate;
           return [marketId, market.accrueInterest(timestamp)] as const;
         }),
@@ -84,14 +86,16 @@ export class MorphoApiDataProvider implements DataProvider {
       const marketsMap = new Map(
         marketResults
           .filter(
-            (r): r is PromiseFulfilledResult<readonly [Hex, Market]> => r.status === "fulfilled",
+            (r): r is PromiseFulfilledResult<readonly [MarketId, Market]> =>
+              r.status === "fulfilled",
           )
           .map((r) => r.value),
       );
 
       for (const r of marketResults) {
         if (r.status === "rejected") {
-          console.error(`[Chain ${client.chain.id}] Error fetching market:`, r.reason);
+          const msg = r.reason instanceof Error ? r.reason.message : r.reason;
+          console.error(`[Chain ${client.chain.id}] Error fetching market: ${msg}`);
         }
       }
 
@@ -122,7 +126,8 @@ export class MorphoApiDataProvider implements DataProvider {
         preLiquidatablePositions: [],
       };
     } catch (error) {
-      console.error(`[Chain ${client.chain.id}] Error fetching liquidatable positions:`, error);
+      const msg = error instanceof Error ? error.message : error;
+      console.error(`[Chain ${client.chain.id}] Error fetching liquidatable positions: ${msg}`);
       return { liquidatablePositions: [], preLiquidatablePositions: [] };
     }
   }
@@ -152,9 +157,9 @@ export class MorphoApiDataProvider implements DataProvider {
         }),
       );
     } catch (error) {
+      const msg = error instanceof Error ? error.message : error;
       console.error(
-        `[Chain ${client.chain.id}] Error fetching vault markets for ${vaultAddress}:`,
-        error,
+        `[Chain ${client.chain.id}] Error fetching vault markets for ${vaultAddress}: ${msg}`,
       );
       return [];
     }

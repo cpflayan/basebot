@@ -15,6 +15,7 @@ import {
   type Chain,
   type Hex,
   type LocalAccount,
+  type PublicClient,
   type Transport,
   type WalletClient,
 } from "viem";
@@ -51,7 +52,7 @@ const FLASH_LOAN_SLIPPAGE_BPS = 300n; // 3% (was 100n = 1%)
  * Merges hardcoded defaults + TOKEN_BLACKLIST env var.
  */
 const DEFAULT_BLACKLIST = [
-  "0x35e5db674d8e93a03d814fa0ada70731efe8a4b9", // USR (Resolv USD) on Base — depegged
+  "0x4ed4e862860bed51a9570b96d89af5e1b0efefed", // USR (Resolv USD) on Base — depegged
 ];
 
 const ENV_BLACKLIST = process.env.TOKEN_BLACKLIST
@@ -60,52 +61,58 @@ const ENV_BLACKLIST = process.env.TOKEN_BLACKLIST
 
 export const TOKEN_BLACKLIST = new Set<string>([...DEFAULT_BLACKLIST, ...ENV_BLACKLIST]);
 
-// ─── Block polling template ───
+// ─── Shared block bus (single watchBlocks for all bots) ───
 
-export interface BlockPollingOptions {
-  logTag: string;
-  client: WalletClient<Transport, Chain, Account>;
-  pollIntervalBlocks: number;
-  onTick: () => Promise<void>;
-  onError?: (error: Error) => void;
-}
+export class SharedBlockBus {
+  private listeners: {
+    interval: number;
+    callback: () => Promise<void>;
+    count: number;
+    running: boolean;
+    logTag: string;
+  }[] = [];
+  private unwatch: (() => void) | null = null;
 
-/**
- * Create a block-based polling loop with overlap protection.
- * Returns an unwatch function.
- */
-export function createBlockPolling(opts: BlockPollingOptions): () => void {
-  let blockCount = 0;
-  let running = false;
+  register(interval: number, callback: () => Promise<void>, logTag: string): void {
+    this.listeners.push({ interval, callback, count: 0, running: false, logTag });
+    console.log(`${logTag}📡 Registered on shared block bus (every ${interval} blocks)`);
+  }
 
-  const unwatch = watchBlocks(opts.client, {
-    onBlock: () => {
-      blockCount++;
-      if (blockCount % opts.pollIntervalBlocks !== 0) return;
-      if (running) return;
-      running = true;
+  start(client: PublicClient, retryDelayMs = 5_000): () => void {
+    const doWatch = () => {
+      this.unwatch = watchBlocks(client, {
+        onBlock: () => {
+          for (const l of this.listeners) {
+            l.count++;
+            if (l.count % l.interval !== 0) continue;
+            if (l.running) continue;
+            l.running = true;
+            l.callback()
+              .catch((e: unknown) => {
+                console.error(
+                  `${l.logTag}Error in poll tick: ${e instanceof Error ? e.message : e}`,
+                );
+              })
+              .finally(() => {
+                l.running = false;
+              });
+          }
+        },
+        onError: (error: Error) => {
+          console.error(
+            `[SharedBlockBus] watchBlocks error, restarting in ${retryDelayMs}ms: ${error.message}`,
+          );
+          this.unwatch?.();
+          setTimeout(doWatch, retryDelayMs);
+        },
+      });
+    };
 
-      opts
-        .onTick()
-        .catch((e: unknown) => {
-          console.error(`${opts.logTag}Error in polling tick:`, e);
-        })
-        .finally(() => {
-          running = false;
-        });
-    },
-    onError: (error: Error) => {
-      if (opts.onError) {
-        opts.onError(error);
-      } else {
-        console.error(`${opts.logTag}watchBlocks error:`, error);
-      }
-    },
-  });
-
-  console.log(`${opts.logTag}📡 Polling started (every ${opts.pollIntervalBlocks} blocks)`);
-
-  return unwatch;
+    doWatch();
+    return () => {
+      this.unwatch?.();
+    };
+  }
 }
 
 // ─── Types ───
@@ -353,7 +360,9 @@ export async function convertCollateralToLoan(
         }
       }
     } catch (error) {
-      console.error(`${deps.logTag}Error converting ${toConvert.src} to ${toConvert.dst}`, error);
+      console.error(
+        `${deps.logTag}Error converting ${toConvert.src} to ${toConvert.dst}: ${error instanceof Error ? error.message : error}`,
+      );
       encoder.flush();
       for (const call of savedCalls) {
         encoder.pushCall(encoder.address, 0n, call);
@@ -562,7 +571,9 @@ export async function simulateAndExecFlashLoanWithFallback(
         return true;
       }
     } catch (error) {
-      console.warn(`${deps.logTag}[FlashLoanFallback] Provider ${provider} failed:`, error);
+      console.warn(
+        `${deps.logTag}[FlashLoanFallback] Provider ${provider} failed: ${error instanceof Error ? error.message : error}`,
+      );
     }
   }
 

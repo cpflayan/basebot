@@ -173,9 +173,22 @@ export class LiquidationBot {
       this.coveredMarkets,
     );
 
-    // Cache market state for each covered market
+    // Cache market state for each covered market — skip fresh cached markets
+    const MARKET_CACHE_TTL_MS = Number(process.env.MARKET_CACHE_TTL_MS ?? "60000"); // 1 min default
+    const staleMarkets = this.coveredMarkets.filter(
+      (marketId) =>
+        !this.positionCache.getMarket(marketId) ||
+        this.positionCache.isMarketStale(marketId, MARKET_CACHE_TTL_MS),
+    );
+
+    if (staleMarkets.length > 0) {
+      console.log(
+        `${this.logTag}🔄 Refreshing ${staleMarkets.length}/${this.coveredMarkets.length} stale markets`,
+      );
+    }
+
     const marketResults = await Promise.allSettled(
-      this.coveredMarkets.map(async (marketId) => {
+      staleMarkets.map(async (marketId) => {
         const market = await fetchMarket(marketId as MarketId, this.client, {
           chainId: this.chainId,
           deployless: false,
@@ -249,7 +262,9 @@ export class LiquidationBot {
           console.log(`${this.logTag}🔄 Periodic cache refresh...`);
           await this.initializeCache();
         } catch (e) {
-          console.error(`${this.logTag}Cache refresh failed:`, e);
+          console.error(
+            `${this.logTag}Cache refresh failed: ${e instanceof Error ? e.message : e}`,
+          );
         }
       })();
     }, this.cacheRefreshInterval);
@@ -408,7 +423,7 @@ export class LiquidationBot {
             `${this.logTag}  Market ${marketId.slice(0, 10)}... — ${atRisk.length} at-risk position(s)!`,
           );
 
-          for (const { position: cachedPos, hf } of atRisk) {
+          for (const { position: cachedPos } of atRisk) {
             const accrualPos = this.positionCache.buildAccrualPosition(
               marketId,
               cachedPos.user,
@@ -416,17 +431,14 @@ export class LiquidationBot {
             );
             if (!accrualPos) continue;
 
-            console.log(
-              `${this.logTag}  🎯 ${cachedPos.user} HF=${hf.toFixed(4)} — attempting liquidation`,
-            );
-
             await this.liquidate(accrualPos);
-            this._liquidationsAttempted++;
           }
         } catch (e) {
           this._rpcErrors++;
-          this._lastError = String(e);
-          console.error(`${this.logTag}Error processing market ${marketId.slice(0, 10)}...:`, e);
+          this._lastError = e instanceof Error ? e.message : String(e);
+          console.error(
+            `${this.logTag}Error processing market ${marketId.slice(0, 10)}...: ${this._lastError}`,
+          );
         }
       }),
     );
@@ -497,7 +509,9 @@ export class LiquidationBot {
         fetchedAt: Date.now(),
       });
     } catch (e) {
-      console.error(`${this.logTag}Failed to refresh market ${marketId.slice(0, 10)}...:`, e);
+      console.error(
+        `${this.logTag}Failed to refresh market ${marketId.slice(0, 10)}...: ${e instanceof Error ? e.message : e}`,
+      );
     }
   }
 
@@ -558,8 +572,6 @@ export class LiquidationBot {
 
     if (!this.checkCooldown(MarketUtils.getMarketId(marketParams), position.user)) return;
 
-    this._liquidationsAttempted++;
-
     // Bad debt pre-filter: skip early if collateral value < debt and we don't realize bad debt.
     // Avoids wasting gas on simulation for positions that can't be profitable.
     if (!this.alwaysRealizeBadDebt && badDebtPosition) {
@@ -568,6 +580,12 @@ export class LiquidationBot {
       );
       return;
     }
+
+    this._liquidationsAttempted++;
+    const hf = position.healthFactor;
+    console.log(
+      `${this.logTag}  🎯 ${position.user} HF=${hf !== undefined ? Number(hf).toFixed(4) : "?"} — attempting liquidation`,
+    );
 
     if (this.useFlashLoan) {
       await this.liquidateWithFlashLoan(position, badDebtPosition);
@@ -985,7 +1003,7 @@ export class LiquidationBot {
     } catch (e) {
       this._rpcErrors++;
       this._lastError = String(e);
-      console.error(`${this.logTag}Failed to fetch markets:`, e);
+      console.error(`${this.logTag}Failed to fetch markets: ${e instanceof Error ? e.message : e}`);
     }
   }
 

@@ -8,9 +8,8 @@ import {
 import type { DataProvider } from "@morpho-blue-liquidation-bot/data-providers";
 import { createLiquidityVenue } from "@morpho-blue-liquidation-bot/liquidity-venues";
 import { createPricer } from "@morpho-blue-liquidation-bot/pricers";
-import { createWalletClient, Hex, http } from "viem";
+import { createPublicClient, createWalletClient, fallback, Hex, http } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { watchBlocks } from "viem/actions";
 
 import { AaveLiquidationBot } from "./aaveBot";
 import { LiquidationBot, type LiquidationBotInputs } from "./bot";
@@ -21,6 +20,8 @@ import {
   MarketsFetchingCooldownMechanism,
   PositionLiquidationCooldownMechanism,
 } from "./utils/cooldownMechanisms";
+import { ReadClientPool } from "./utils/rpcFallback.js";
+import { SharedBlockBus } from "./utils/sharedExecution.js";
 import type { WebhookServer } from "./webhook";
 
 export const launchBot = async (
@@ -31,10 +32,46 @@ export const launchBot = async (
   const logTag = `[${config.chain.name} client]: `;
   console.log(`${logTag}Starting up`);
 
+  // Write client: Alchemy primary, failover to paid RPCs
+  const fallbackRpcUrl = process.env.FALLBACK_RPC_URL;
+  const paidRpcUrls = [
+    process.env.PAID_RPC_COINBASE,
+    process.env.PAID_RPC_CHAINSTACK,
+    process.env.PAID_RPC_ZAN,
+    process.env.PAID_RPC_GETBLOCK,
+  ].filter(Boolean);
+  const rpcRetryOpts = { retryCount: 3, retryDelay: 1000 };
+  const writeTransports = [
+    http(config.rpcUrl, rpcRetryOpts),
+    ...paidRpcUrls.map((url) => http(url, rpcRetryOpts)),
+    ...(fallbackRpcUrl ? [http(fallbackRpcUrl, rpcRetryOpts)] : []),
+  ];
+  const mainTransport = fallback(writeTransports, { rank: false });
+
   const client = createWalletClient({
     chain: config.chain,
-    transport: http(config.rpcUrl),
+    transport: mainTransport,
     account: privateKeyToAccount(config.liquidationPrivateKey),
+  });
+
+  // Paid read pool: round-robin across paid RPCs for multicall reads
+  const paidReadPool = new ReadClientPool({
+    chain: config.chain,
+    entries: [
+      { label: "chainstack", url: process.env.PAID_RPC_CHAINSTACK ?? config.rpcUrl },
+      { label: "coinbase", url: process.env.PAID_RPC_COINBASE ?? config.rpcUrl },
+      { label: "zan", url: process.env.PAID_RPC_ZAN ?? config.rpcUrl },
+      { label: "getblock", url: process.env.PAID_RPC_GETBLOCK ?? config.rpcUrl },
+      { label: "nodereal", url: process.env.PAID_RPC_NODEREAL ?? config.rpcUrl },
+    ].filter((e) => e.url !== config.rpcUrl || process.env.PAID_RPC_CHAINSTACK === undefined),
+  });
+  console.log(`${logTag}💰 Paid read pool: ${paidReadPool.size} endpoints (round-robin)`);
+
+  // Separate public client for watchBlocks — uses free RPC to avoid rate-limiting Alchemy
+  const watchRpcUrl = process.env.WATCH_RPC_URL ?? process.env.PUBLIC_RPC_URL_BASE ?? config.rpcUrl;
+  const watchClient = createPublicClient({
+    chain: config.chain,
+    transport: http(watchRpcUrl, rpcRetryOpts),
   });
 
   // LIQUIDITY VENUES
@@ -107,7 +144,9 @@ export const launchBot = async (
     await bot.initializeCache();
     bot.startPeriodicRefresh();
   } catch (e) {
-    console.error(`${logTag}Cache initialization failed, continuing with lazy-load:`, e);
+    console.error(
+      `${logTag}Cache initialization failed, continuing with lazy-load: ${e instanceof Error ? e.message : e}`,
+    );
   }
 
   // Register bot with webhook server for event-driven triggering
@@ -117,28 +156,10 @@ export const launchBot = async (
 
   const blockInterval = config.blockInterval ?? 1;
 
-  const startWatching = () => {
-    // SECURITY (NM4): 重啟時重置 count，避免重啟後立即觸發 bot.run()
-    let count = 0;
-
-    watchBlocks(client, {
-      onBlock: () => {
-        if (count % blockInterval === 0) {
-          bot.run().catch((e: unknown) => {
-            console.error(`${logTag} uncaught error in bot.run():`, e);
-          });
-        }
-        count++;
-      },
-      onError: (error) => {
-        const retryDelay = config.watchBlocksRetryDelayMs ?? 5_000;
-        console.error(`${logTag} watchBlocks error, restarting watcher in ${retryDelay}ms:`, error);
-        setTimeout(startWatching, retryDelay);
-      },
-    });
-  };
-
-  startWatching();
+  // Shared block bus — single watchBlocks subscription for all bots
+  const blockBus = new SharedBlockBus();
+  blockBus.register(blockInterval, () => bot.run(), logTag);
+  blockBus.start(watchClient, config.watchBlocksRetryDelayMs ?? 5_000);
 
   // Register Morpho bot with health server
   const healthServerMorpho = getHealthServer();
@@ -155,6 +176,7 @@ export const launchBot = async (
           const cometBot = new CometLiquidationBot({
             logTag: `[${config.chain.name} comet]: `,
             client,
+            paidReadPool,
             cometWatchlist: config.cometWatchlist!,
             executorAddress: config.executorAddress,
             treasuryAddress,
@@ -172,13 +194,15 @@ export const launchBot = async (
           });
 
           await cometBot.initialize();
-          cometBot.startPolling();
+          cometBot.startPolling(blockBus);
           console.log(`${logTag}✅ Comet liquidation bot started`);
 
           const healthServer = getHealthServer();
           healthServer.registerBot("comet", () => cometBot.getHealthStatus());
         } catch (e) {
-          console.error(`${logTag}Failed to start Comet bot:`, e);
+          console.error(
+            `${logTag}Failed to start Comet bot: ${e instanceof Error ? e.message : e}`,
+          );
         }
       })(),
     );
@@ -191,6 +215,7 @@ export const launchBot = async (
           const moonwellBot = new MoonwellLiquidationBot({
             logTag: `[${config.chain.name} moonwell]: `,
             client,
+            paidReadPool,
             moonwellWatchlist: config.moonwellWatchlist!,
             executorAddress: config.executorAddress,
             treasuryAddress,
@@ -208,13 +233,15 @@ export const launchBot = async (
           });
 
           await moonwellBot.initialize();
-          moonwellBot.startPolling();
+          moonwellBot.startPolling(blockBus);
           console.log(`${logTag}✅ Moonwell liquidation bot started`);
 
           const healthServer = getHealthServer();
           healthServer.registerBot("moonwell", () => moonwellBot.getHealthStatus());
         } catch (e) {
-          console.error(`${logTag}Failed to start Moonwell bot:`, e);
+          console.error(
+            `${logTag}Failed to start Moonwell bot: ${e instanceof Error ? e.message : e}`,
+          );
         }
       })(),
     );
@@ -227,6 +254,7 @@ export const launchBot = async (
           const aaveBot = new AaveLiquidationBot({
             logTag: `[${config.chain.name} aave]: `,
             client,
+            paidReadPool,
             aaveWatchlist: config.aaveWatchlist!,
             executorAddress: config.executorAddress,
             treasuryAddress,
@@ -244,13 +272,13 @@ export const launchBot = async (
           });
 
           await aaveBot.initialize();
-          aaveBot.startPolling();
+          aaveBot.startPolling(blockBus);
           console.log(`${logTag}✅ Aave V3 liquidation bot started`);
 
           const healthServer = getHealthServer();
           healthServer.registerBot("aave", () => aaveBot.getHealthStatus());
         } catch (e) {
-          console.error(`${logTag}Failed to start Aave bot:`, e);
+          console.error(`${logTag}Failed to start Aave bot: ${e instanceof Error ? e.message : e}`);
         }
       })(),
     );

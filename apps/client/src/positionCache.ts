@@ -272,7 +272,13 @@ export class PositionCache {
       })),
       markets: [...this.markets.entries()].map(([marketId, m]) => ({
         marketId,
-        params: m.params,
+        params: {
+          loanToken: m.params.loanToken,
+          collateralToken: m.params.collateralToken,
+          oracle: m.params.oracle,
+          irm: m.params.irm,
+          lltv: m.params.lltv.toString(),
+        },
         totalSupplyAssets: m.totalSupplyAssets.toString(),
         totalSupplyShares: m.totalSupplyShares.toString(),
         totalBorrowAssets: m.totalBorrowAssets.toString(),
@@ -305,7 +311,13 @@ export class PositionCache {
     for (const m of data.markets) {
       this.setMarket({
         marketId: m.marketId,
-        params: m.params,
+        params: {
+          loanToken: m.params.loanToken,
+          collateralToken: m.params.collateralToken,
+          oracle: m.params.oracle,
+          irm: m.params.irm,
+          lltv: BigInt(m.params.lltv),
+        },
         totalSupplyAssets: BigInt(m.totalSupplyAssets),
         totalSupplyShares: BigInt(m.totalSupplyShares),
         totalBorrowAssets: BigInt(m.totalBorrowAssets),

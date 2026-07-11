@@ -20,6 +20,7 @@ import type {
 } from "@morpho-blue-liquidation-bot/config";
 import type { LiquidityVenue } from "@morpho-blue-liquidation-bot/liquidity-venues";
 import type { Pricer } from "@morpho-blue-liquidation-bot/pricers";
+import { getChainAddresses } from "@morpho-org/blue-sdk";
 import {
   type Address,
   type Transport,
@@ -39,12 +40,12 @@ import { MoonwellAccountRegistry } from "./moonwellAccountRegistry.js";
 import { PositionLiquidationCooldownMechanism } from "./utils/cooldownMechanisms.js";
 import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
 import { liquidationTracker } from "./utils/liquidationState.js";
-import { createScanClient } from "./utils/rpcFallback.js";
+import { createScanClient, ReadClientPool } from "./utils/rpcFallback.js";
 import {
   type SharedExecutionDeps,
   TOKEN_BLACKLIST,
   convertCollateralToLoan,
-  createBlockPolling,
+  SharedBlockBus,
   priceAsset,
   simulateAndExecFlashLoanWithFallback,
   simulateAndExec,
@@ -60,6 +61,7 @@ const SIMULATION_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
 export interface MoonwellLiquidationBotInputs {
   logTag: string;
   client: WalletClient<Transport, Chain, Account>;
+  paidReadPool: ReadClientPool;
   moonwellWatchlist: MoonwellWatchlistConfig;
   executorAddress: Address;
   treasuryAddress: Address;
@@ -86,6 +88,7 @@ interface MTokenInfo {
 export class MoonwellLiquidationBot {
   private logTag: string;
   private client: WalletClient<Transport, Chain, Account>;
+  private paidReadPool: ReadClientPool;
   private comptroller: Address;
   private mTokenList: MTokenInfo[];
   private executorAddress: Address;
@@ -108,7 +111,6 @@ export class MoonwellLiquidationBot {
 
   /** Cached Comptroller params */
   private closeFactor = 0n;
-  private liquidationIncentive = 0n;
 
   /** Cached mToken → reserveFactor (for pre-filtering unprofitable markets) */
   private reserveFactors = new Map<Address, bigint>();
@@ -141,6 +143,7 @@ export class MoonwellLiquidationBot {
   constructor(inputs: MoonwellLiquidationBotInputs) {
     this.logTag = inputs.logTag;
     this.client = inputs.client;
+    this.paidReadPool = inputs.paidReadPool;
     this.comptroller = inputs.moonwellWatchlist.comptroller;
     this.executorAddress = inputs.executorAddress;
     this.treasuryAddress = inputs.treasuryAddress;
@@ -179,6 +182,7 @@ export class MoonwellLiquidationBot {
       alwaysRealizeBadDebt: this.alwaysRealizeBadDebt,
       flashLoanProvider: this.flashLoanProvider,
       flashLoanFallbackProviders: this.flashLoanFallbackProviders,
+      morphoAddress: getChainAddresses(this.chainId).morpho,
     };
 
     // Read-only client on Base public RPC for historical scanning
@@ -279,7 +283,7 @@ export class MoonwellLiquidationBot {
   private async cacheComptrollerParams(): Promise<void> {
     try {
       this._rpcTotal += 2;
-      const [cf, li] = await Promise.all([
+      const [cf] = await Promise.all([
         readContract(this.client, {
           address: this.comptroller,
           abi: comptrollerAbi,
@@ -292,19 +296,14 @@ export class MoonwellLiquidationBot {
         }),
       ]);
       this.closeFactor = cf;
-      this.liquidationIncentive = li;
-      console.log(
-        `${this.logTag}📋 Comptroller params: closeFactor=${Number(cf) / 1e18}, liquidationIncentive=${Number(li) / 1e18}`,
-      );
+      console.log(`${this.logTag}📋 Comptroller params: closeFactor=${Number(cf) / 1e18}`);
     } catch (e) {
       this._rpcErrors += 2;
       this._lastError = String(e);
       // Fallback to standard Compound V2 defaults
       this.closeFactor = 5n * 10n ** 17n; // 0.5e18 = 50%
-      this.liquidationIncentive = 11n * 10n ** 17n; // 1.1e18 = 10% bonus
       console.warn(
-        `${this.logTag}⚠️ Failed to read Comptroller params, using defaults: closeFactor=50%, incentive=10%`,
-        e,
+        `${this.logTag}⚠️ Failed to read Comptroller params, using defaults: closeFactor=50%, incentive=10%: ${e instanceof Error ? e.message : e}`,
       );
     }
   }
@@ -357,13 +356,8 @@ export class MoonwellLiquidationBot {
    * Start polling: check getAccountLiquidity on every N blocks.
    * Returns an unwatch function.
    */
-  startPolling(): () => void {
-    return createBlockPolling({
-      logTag: this.logTag,
-      client: this.client,
-      pollIntervalBlocks: this.pollIntervalBlocks,
-      onTick: () => this.checkAllMarkets(),
-    });
+  startPolling(bus: SharedBlockBus): void {
+    bus.register(this.pollIntervalBlocks, () => this.checkAllMarkets(), this.logTag);
   }
 
   /**
@@ -377,7 +371,9 @@ export class MoonwellLiquidationBot {
       try {
         await this.registry.scanNewEvents(this.client, mToken.address, this.logTag);
       } catch (e) {
-        console.error(`${this.logTag}Error scanning mToken ${mToken.address.slice(0, 10)}...:`, e);
+        console.error(
+          `${this.logTag}Error scanning mToken ${mToken.address.slice(0, 10)}...: ${e instanceof Error ? e.message : e}`,
+        );
       }
     }
 
@@ -431,7 +427,7 @@ export class MoonwellLiquidationBot {
       const batch = accounts.slice(i, i + BATCH_SIZE);
       try {
         this._rpcTotal += batch.length;
-        const results = await multicall(this.client, {
+        const results = await multicall(this.paidReadPool.next(), {
           contracts: batch.map((account) => ({
             address: this.comptroller,
             abi: comptrollerAbi,
@@ -455,7 +451,9 @@ export class MoonwellLiquidationBot {
       } catch (e) {
         this._rpcErrors += batch.length;
         this._lastError = String(e);
-        console.warn(`${this.logTag}⚠️ batchCheckShortfall batch ${i / BATCH_SIZE} failed:`, e);
+        console.warn(
+          `${this.logTag}⚠️ batchCheckShortfall batch ${i / BATCH_SIZE} failed: ${e instanceof Error ? e.message : e}`,
+        );
       }
     }
 
@@ -551,8 +549,7 @@ export class MoonwellLiquidationBot {
         return;
       } catch (error) {
         console.warn(
-          `${this.logTag}  ⚠️ Liquidation via ${borrowMToken.slice(0, 10)}... failed, trying next borrow...`,
-          error,
+          `${this.logTag}  ⚠️ Liquidation via ${borrowMToken.slice(0, 10)}... failed, trying next borrow...: ${error instanceof Error ? error.message : error}`,
         );
       }
     }
@@ -655,7 +652,9 @@ export class MoonwellLiquidationBot {
         console.log(`${this.logTag}[FlashLoan] Skipped ${account} (not profitable)`);
       }
     } catch (error) {
-      console.error(`${this.logTag}[FlashLoan] Failed to liquidate ${account}:`, error);
+      console.error(
+        `${this.logTag}[FlashLoan] Failed to liquidate ${account}: ${error instanceof Error ? error.message : error}`,
+      );
     }
   }
 
@@ -734,7 +733,9 @@ export class MoonwellLiquidationBot {
         console.log(`${this.logTag}Skipped ${account} (not profitable)`);
       }
     } catch (error) {
-      console.error(`${this.logTag}Failed to liquidate ${account}:`, error);
+      console.error(
+        `${this.logTag}Failed to liquidate ${account}: ${error instanceof Error ? error.message : error}`,
+      );
     }
   }
 
@@ -749,7 +750,7 @@ export class MoonwellLiquidationBot {
   ): Promise<{ borrowMToken: Address; borrowBalance: bigint }[]> {
     try {
       this._rpcTotal += this.mTokenList.length;
-      const results = await multicall(this.client, {
+      const results = await multicall(this.paidReadPool.next(), {
         contracts: this.mTokenList.map((mToken) => ({
           address: mToken.address,
           abi: mTokenAbi,
@@ -777,7 +778,9 @@ export class MoonwellLiquidationBot {
     } catch (e) {
       this._rpcErrors += this.mTokenList.length;
       this._lastError = String(e);
-      console.warn(`${this.logTag}⚠️ findAllBorrowPositions multicall failed:`, e);
+      console.warn(
+        `${this.logTag}⚠️ findAllBorrowPositions multicall failed: ${e instanceof Error ? e.message : e}`,
+      );
       return [];
     }
   }
@@ -791,7 +794,7 @@ export class MoonwellLiquidationBot {
 
     try {
       this._rpcTotal += this.mTokenList.length;
-      const results = await multicall(this.client, {
+      const results = await multicall(this.paidReadPool.next(), {
         contracts: this.mTokenList.map((mToken) => ({
           address: mToken.address,
           abi: mTokenAbi,
@@ -815,7 +818,9 @@ export class MoonwellLiquidationBot {
     } catch (e) {
       this._rpcErrors += this.mTokenList.length;
       this._lastError = String(e);
-      console.warn(`${this.logTag}⚠️ findBestCollateral multicall failed:`, e);
+      console.warn(
+        `${this.logTag}⚠️ findBestCollateral multicall failed: ${e instanceof Error ? e.message : e}`,
+      );
     }
 
     return bestMToken;
@@ -841,7 +846,7 @@ export class MoonwellLiquidationBot {
    */
   private async initOracleTimestamps(): Promise<void> {
     try {
-      const results = await multicall(this.client, {
+      const results = await multicall(this.paidReadPool.next(), {
         contracts: this.mTokenList.map((mToken) => ({
           address: mToken.address,
           abi: mTokenAbi,
@@ -863,7 +868,9 @@ export class MoonwellLiquidationBot {
     } catch (e) {
       this._rpcErrors++;
       this._lastError = String(e);
-      console.warn(`${this.logTag}⚠️ initOracleTimestamps multicall failed:`, e);
+      console.warn(
+        `${this.logTag}⚠️ initOracleTimestamps multicall failed: ${e instanceof Error ? e.message : e}`,
+      );
     }
   }
 
@@ -878,7 +885,7 @@ export class MoonwellLiquidationBot {
 
     try {
       this._rpcTotal += this.mTokenList.length;
-      const results = await multicall(this.client, {
+      const results = await multicall(this.paidReadPool.next(), {
         contracts: this.mTokenList.map((mToken) => ({
           address: mToken.address,
           abi: mTokenAbi,
@@ -905,7 +912,9 @@ export class MoonwellLiquidationBot {
     } catch (e) {
       this._rpcErrors += this.mTokenList.length;
       this._lastError = String(e);
-      console.warn(`${this.logTag}⚠️ detectOracleUpdates multicall failed:`, e);
+      console.warn(
+        `${this.logTag}⚠️ detectOracleUpdates multicall failed: ${e instanceof Error ? e.message : e}`,
+      );
     }
 
     if (this.hotMarkets.size > 0) {

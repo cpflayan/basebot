@@ -101,7 +101,7 @@ export async function selectBestLiquidationPair(
   healthFactor: bigint,
   reserves: Address[],
   pricers?: Pricer[],
-  wNative?: Address,
+  _wNative?: Address,
   cachedReserveConfigs?: Map<string, ReserveConfig>,
 ): Promise<LiquidationPair | null> {
   // Step 1: Enumerate user's collateral and debt assets via multicall
@@ -225,7 +225,7 @@ export async function selectBestLiquidationPair(
 
 async function evaluatePair(
   client: WalletClient<Transport, Chain, Account>,
-  poolAddress: Address,
+  _poolAddress: Address,
   collateral: { asset: Address; balance: bigint },
   debt: { asset: Address; balance: bigint },
   closeFactorBps: bigint,

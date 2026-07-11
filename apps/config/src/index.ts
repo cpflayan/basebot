@@ -42,10 +42,19 @@ export function chainConfig(chainId: number): ChainConfig {
   };
 }
 
+const CHAIN_NAME_ALIASES: Record<number, string> = {
+  1: "MAINNET",
+  8453: "BASE",
+};
+
 export function getSecrets(chainId: number, chain?: Chain) {
   const defaultRpcUrl = chain?.rpcUrls.default.http[0];
+  const alias = CHAIN_NAME_ALIASES[chainId];
 
-  const rpcUrl = process.env[`RPC_URL_${chainId}`] ?? defaultRpcUrl;
+  const rpcUrl =
+    process.env[`RPC_URL_${chainId}`] ??
+    (alias ? process.env[`RPC_URL_${alias}`] : undefined) ??
+    defaultRpcUrl;
   const executorAddress = process.env[`EXECUTOR_ADDRESS_${chainId}`];
   const liquidationPrivateKey = process.env[`LIQUIDATION_PRIVATE_KEY_${chainId}`];
 
