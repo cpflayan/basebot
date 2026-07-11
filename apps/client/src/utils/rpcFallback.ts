@@ -1,5 +1,6 @@
 import {
   createPublicClient,
+  fallback,
   http,
   type Chain,
   type Client,
@@ -51,13 +52,17 @@ export class RPCFallbackManager {
 
 /**
  * Create a scan client with fallback RPC support.
- * Uses the first available RPC from the list.
+ * BUGFIX: previously only ever used rpcUrls[0] and silently discarded the rest,
+ * despite the name/docstring implying fallback across the whole list. Now uses
+ * viem's `fallback()` transport so if the primary RPC errors (e.g. rate limit),
+ * later calls automatically move on to the next URL in the list.
  */
 export function createScanClient(chain: Chain, rpcUrls: string[]): Client<Transport, Chain> {
-  const primaryUrl = rpcUrls[0] ?? "https://mainnet.base.org";
+  const urls = rpcUrls.length > 0 ? rpcUrls : ["https://mainnet.base.org"];
+  const transports = urls.map((url) => http(url, { retryCount: 2, retryDelay: 500 }));
   return createPublicClient({
     chain,
-    transport: http(primaryUrl),
+    transport: transports.length > 1 ? fallback(transports, { rank: false }) : transports[0]!,
   });
 }
 

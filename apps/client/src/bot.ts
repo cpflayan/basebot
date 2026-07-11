@@ -38,6 +38,7 @@ import {
 } from "./utils/cooldownMechanisms.js";
 import { fetchWhitelistedVaults } from "./utils/fetch-whitelisted-vaults.js";
 import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
+import { logLiquidationDebug } from "./utils/liquidationDebug.js";
 import { liquidationTracker } from "./utils/liquidationState.js";
 import { DEFAULT_LIQUIDATION_BUFFER_BPS, WAD, wMulDown } from "./utils/maths.js";
 import {
@@ -561,23 +562,95 @@ export class LiquidationBot {
       TOKEN_BLACKLIST.has(marketParams.loanToken.toLowerCase()) ||
       TOKEN_BLACKLIST.has(marketParams.collateralToken.toLowerCase())
     ) {
-      console.log(
-        `${this.logTag}⛔ Skip ${position.user}: blacklisted token in market ${MarketUtils.getMarketId(marketParams).slice(0, 10)}...`,
-      );
+      logLiquidationDebug({
+        protocol: this.logTag,
+        account: position.user,
+        healthFactor: position.healthFactor !== undefined ? Number(position.healthFactor) / 1e18 : undefined,
+        collateral: {
+          token: marketParams.collateralToken,
+          amount: position.collateral,
+        },
+        debt: {
+          token: marketParams.loanToken,
+          amount: position.borrowShares,
+        },
+        decision: "skip",
+        reason: "Blacklisted token in market",
+        details: {
+          marketId: MarketUtils.getMarketId(marketParams),
+          loanTokenBlacklisted: TOKEN_BLACKLIST.has(marketParams.loanToken.toLowerCase()),
+          collateralTokenBlacklisted: TOKEN_BLACKLIST.has(marketParams.collateralToken.toLowerCase()),
+        },
+      });
       return;
     }
 
     const seizableCollateral = position.seizableCollateral ?? 0n;
     const badDebtPosition = seizableCollateral === position.collateral;
 
-    if (!this.checkCooldown(MarketUtils.getMarketId(marketParams), position.user)) return;
+    logLiquidationDebug({
+      protocol: this.logTag,
+      account: position.user,
+      healthFactor: position.healthFactor !== undefined ? Number(position.healthFactor) / 1e18 : undefined,
+      collateral: {
+        token: marketParams.collateralToken,
+        amount: position.collateral,
+      },
+      debt: {
+        token: marketParams.loanToken,
+        amount: position.borrowShares,
+      },
+      seizableCollateral,
+      isBadDebt: badDebtPosition,
+      decision: "liquidate",
+      reason: "Position evaluation in progress",
+      details: {
+        marketId: MarketUtils.getMarketId(marketParams),
+        seizableEqualsCollateral: badDebtPosition,
+        note: "Checking cooldown and bad debt filters...",
+      },
+    });
+
+    if (!this.checkCooldown(MarketUtils.getMarketId(marketParams), position.user)) {
+      logLiquidationDebug({
+        protocol: this.logTag,
+        account: position.user,
+        healthFactor: position.healthFactor !== undefined ? Number(position.healthFactor) / 1e18 : undefined,
+        decision: "skip",
+        reason: "Position is in cooldown period",
+        details: {
+          marketId: MarketUtils.getMarketId(marketParams),
+          note: "Recently attempted liquidation, waiting before retry",
+        },
+      });
+      return;
+    }
 
     // Bad debt pre-filter: skip early if collateral value < debt and we don't realize bad debt.
     // Avoids wasting gas on simulation for positions that can't be profitable.
     if (!this.alwaysRealizeBadDebt && badDebtPosition) {
-      console.log(
-        `${this.logTag}⏭️ Skip ${position.user}: bad debt (collateral fully seizable, no bonus)`,
-      );
+      logLiquidationDebug({
+        protocol: this.logTag,
+        account: position.user,
+        healthFactor: position.healthFactor !== undefined ? Number(position.healthFactor) / 1e18 : undefined,
+        collateral: {
+          token: marketParams.collateralToken,
+          amount: position.collateral,
+        },
+        debt: {
+          token: marketParams.loanToken,
+          amount: position.borrowShares,
+        },
+        seizableCollateral,
+        isBadDebt: badDebtPosition,
+        decision: "skip",
+        reason: "Bad debt position (collateral fully seizable, no liquidation bonus)",
+        details: {
+          marketId: MarketUtils.getMarketId(marketParams),
+          alwaysRealizeBadDebt: this.alwaysRealizeBadDebt,
+          note: "Position is underwater and bot is configured to skip bad debt",
+        },
+      });
       return;
     }
 
@@ -592,7 +665,12 @@ export class LiquidationBot {
       return;
     }
 
+    // Direct liquidation path (no flash loan)
     const { client, executorAddress } = this;
+
+    console.log(
+      `${this.logTag}[Direct Debug] ${position.user}: seizableCollateral=${seizableCollateral}, badDebt=${badDebtPosition}`,
+    );
 
     const encoder = new LiquidationEncoder(executorAddress, client);
 
@@ -702,6 +780,11 @@ export class LiquidationBot {
     const flashLoanAmount = position.borrowAssets ?? 0n;
     if (flashLoanAmount === 0n) return;
 
+    // DEBUG: Log liquidation parameters
+    console.log(
+      `${this.logTag}[FlashLoan Debug] ${position.user}: flashLoanAmount=${flashLoanAmount}, seizableCollateral=${seizableCollateral}, collateral=${position.collateral}, collateralValue=${position.collateralValue ?? "undefined"}, badDebt=${badDebtPosition}`,
+    );
+
     // ── Profitability pre-filter ──
     // Position is already confirmed liquidatable (HF < 1) by the data provider.
     // HF = (collateralValue × LLTV) / borrowAssets, so HF < 1 means:
@@ -757,6 +840,9 @@ export class LiquidationBot {
     }
 
     const dexSwapCalls = tempEncoder.flush();
+    console.log(
+      `${this.logTag}[FlashLoan Debug] DEX route found: ${dexSwapCalls.length} swap call(s) for ${marketParams.collateralToken.slice(0, 10)}... -> ${marketParams.loanToken.slice(0, 10)}...`,
+    );
 
     // Step 2: Build flash loan callback calls on a temp encoder.
     // These execute INSIDE the Balancer callback, BEFORE the auto-appended repayment transfers.

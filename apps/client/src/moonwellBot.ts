@@ -39,6 +39,7 @@ import { comptrollerAbi, mTokenAbi, MOONWELL_UNDERLYING_MAP } from "./abis/Moonw
 import { MoonwellAccountRegistry } from "./moonwellAccountRegistry.js";
 import { PositionLiquidationCooldownMechanism } from "./utils/cooldownMechanisms.js";
 import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
+import { logLiquidationDebug } from "./utils/liquidationDebug.js";
 import { liquidationTracker } from "./utils/liquidationState.js";
 import { createScanClient, ReadClientPool } from "./utils/rpcFallback.js";
 import {
@@ -369,7 +370,7 @@ export class MoonwellLiquidationBot {
     // Incremental scan for new accounts across all mTokens
     for (const mToken of this.mTokenList) {
       try {
-        await this.registry.scanNewEvents(this.client, mToken.address, this.logTag);
+        await this.registry.scanNewEvents(this.scanClient, mToken.address, this.logTag);
       } catch (e) {
         console.error(
           `${this.logTag}Error scanning mToken ${mToken.address.slice(0, 10)}...: ${e instanceof Error ? e.message : e}`,
@@ -465,6 +466,16 @@ export class MoonwellLiquidationBot {
   private async liquidateAccount(account: Address): Promise<void> {
     // Cooldown check (use comptroller address as "market" key)
     if (this.cooldown && !this.cooldown.isPositionReady(this.comptroller, account)) {
+      logLiquidationDebug({
+        protocol: this.logTag,
+        account,
+        decision: "skip",
+        reason: "Position is in cooldown period",
+        details: {
+          comptroller: this.comptroller,
+          note: "Recently attempted liquidation, waiting before retry",
+        },
+      });
       return;
     }
 
@@ -472,13 +483,35 @@ export class MoonwellLiquidationBot {
     const accountKey = account.toLowerCase();
     const cooldownExpiry = this.simulationCooldowns.get(accountKey);
     if (cooldownExpiry && Date.now() < cooldownExpiry) {
+      logLiquidationDebug({
+        protocol: this.logTag,
+        account,
+        decision: "skip",
+        reason: "Simulation failure cooldown",
+        details: {
+          comptroller: this.comptroller,
+          note: "Previous simulation failed, waiting before retry",
+        },
+      });
       return; // Still in cooldown, skip silently
     }
     // Cooldown expired, clear it
     if (cooldownExpiry) {
       this.simulationCooldowns.delete(accountKey);
-      this.simulationFailures.set(accountKey, 0);
+      this.simulationFailures.delete(accountKey);
     }
+
+    logLiquidationDebug({
+      protocol: this.logTag,
+      account,
+      decision: "liquidate",
+      reason: "Moonwell liquidation check passed, attempting liquidation",
+      details: {
+        comptroller: this.comptroller,
+        useFlashLoan: this.useFlashLoan,
+        note: "Proceeding to find borrow positions and collateral",
+      },
+    });
 
     console.log(`${this.logTag}  🎯 ${account} — attempting Moonwell liquidation`);
 
@@ -488,21 +521,51 @@ export class MoonwellLiquidationBot {
     const borrowPositions = await this.findAllBorrowPositions(account);
 
     if (borrowPositions.length === 0) {
-      console.log(`${this.logTag}  ${account} — no borrow positions found, skipping`);
+      logLiquidationDebug({
+        protocol: this.logTag,
+        account,
+        decision: "skip",
+        reason: "No borrow positions found",
+        details: {
+          comptroller: this.comptroller,
+          note: "Account has no active borrows",
+        },
+      });
       return;
     }
 
     // Find best collateral (largest mToken balance)
     const collateralMToken = await this.findBestCollateral(account);
     if (!collateralMToken) {
-      console.log(`${this.logTag}  ${account} — no collateral found, skipping`);
+      logLiquidationDebug({
+        protocol: this.logTag,
+        account,
+        decision: "skip",
+        reason: "No collateral found",
+        details: {
+          comptroller: this.comptroller,
+          borrowPositionsCount: borrowPositions.length,
+          note: "Account has borrows but no collateral to seize",
+        },
+      });
       return;
     }
     const collateralUnderlying = this.getUnderlying(collateralMToken);
 
     // SECURITY: Skip if collateral is blacklisted
     if (TOKEN_BLACKLIST.has(collateralUnderlying.toLowerCase())) {
-      console.log(`${this.logTag}  ⛔ Skip ${account}: blacklisted collateral`);
+      logLiquidationDebug({
+        protocol: this.logTag,
+        account,
+        decision: "skip",
+        reason: "Blacklisted collateral",
+        details: {
+          comptroller: this.comptroller,
+          collateralMToken,
+          collateralUnderlying,
+          note: "Collateral token is in TOKEN_BLACKLIST",
+        },
+      });
       return;
     }
 

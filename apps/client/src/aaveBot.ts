@@ -47,6 +47,7 @@ import {
 import { PositionLiquidationCooldownMechanism } from "./utils/cooldownMechanisms.js";
 import { findDeployBlock } from "./utils/findDeployBlock.js";
 import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
+import { logLiquidationDebug } from "./utils/liquidationDebug.js";
 import { liquidationTracker } from "./utils/liquidationState.js";
 import { createScanClient, ReadClientPool } from "./utils/rpcFallback.js";
 import {
@@ -171,8 +172,10 @@ export class AaveLiquidationBot {
       morphoAddress: getChainAddresses(this.chainId).morpho,
     };
 
-    // Read-only client on Base public RPC for historical scanning
-    this.scanClient = createScanClient(base, inputs.scanRpcUrls ?? ["https://mainnet.base.org"]);
+    // Read-only client for historical scanning — uses paid Alchemy RPC for better rate limits
+    const paidRpcUrl = process.env.RPC_URL_BASE;
+    const scanRpcUrls = paidRpcUrl ? [paidRpcUrl, "https://mainnet.base.org"] : ["https://mainnet.base.org"];
+    this.scanClient = createScanClient(base, scanRpcUrls);
   }
 
   // ─── Initialization ───
@@ -346,7 +349,7 @@ export class AaveLiquidationBot {
   async checkAave(): Promise<void> {
     try {
       // Incremental scan for new accounts
-      await this.registry.scanNewEvents(this.client, this.poolAddress, this.logTag);
+      await this.registry.scanNewEvents(this.scanClient, this.poolAddress, this.logTag);
 
       // Get all known accounts — prioritize recently active ones
       // (accounts added later from event scanning have more recent activity)
@@ -446,7 +449,16 @@ export class AaveLiquidationBot {
     this._liquidationsAttempted++;
 
     if (!pair) {
-      console.log(`${this.logTag}  ${account} — no profitable liquidation pair found, skipping`);
+      logLiquidationDebug({
+        protocol: this.logTag,
+        account,
+        healthFactor: Number(healthFactor) / 1e18,
+        decision: "skip",
+        reason: "No profitable liquidation pair found",
+        details: {
+          note: "Could not find collateral/debt pair with positive expected profit",
+        },
+      });
       this._liquidationsAttempted--; // Don't count skipped pairs as attempts
       return;
     }
@@ -456,26 +468,71 @@ export class AaveLiquidationBot {
       this.tokenBlacklist.has(pair.collateralAsset.toLowerCase()) ||
       this.tokenBlacklist.has(pair.debtAsset.toLowerCase())
     ) {
-      console.log(`${this.logTag}⛔ Skip ${account}: blacklisted token in pair`);
+      logLiquidationDebug({
+        protocol: this.logTag,
+        account,
+        healthFactor: Number(healthFactor) / 1e18,
+        collateral: {
+          token: pair.collateralAsset,
+          amount: pair.seizableCollateral,
+        },
+        debt: {
+          token: pair.debtAsset,
+          amount: pair.debtToCover,
+        },
+        decision: "skip",
+        reason: "Blacklisted token in liquidation pair",
+        details: {
+          collateralBlacklisted: this.tokenBlacklist.has(pair.collateralAsset.toLowerCase()),
+          debtBlacklisted: this.tokenBlacklist.has(pair.debtAsset.toLowerCase()),
+        },
+      });
       return;
     }
 
     // Cooldown check
     if (this.cooldown && !this.cooldown.isPositionReady(this.poolAddress, account)) {
+      logLiquidationDebug({
+        protocol: this.logTag,
+        account,
+        healthFactor: Number(healthFactor) / 1e18,
+        decision: "skip",
+        reason: "Position is in cooldown period",
+        details: {
+          note: "Recently attempted liquidation, waiting before retry",
+        },
+      });
       return;
     }
 
-    console.log(
-      `${this.logTag}  🎯 ${account} HF=${(Number(healthFactor) / 1e18).toFixed(4)} — ` +
-        `best pair: collateral=${pair.collateralAsset.slice(0, 10)}... debt=${pair.debtAsset.slice(0, 10)}... ` +
-        `debtToCover=${pair.debtToCover}`,
-    );
-
     const badDebtPosition = pair.isBadDebt;
+
+    logLiquidationDebug({
+      protocol: this.logTag,
+      account,
+      healthFactor: Number(healthFactor) / 1e18,
+      collateral: {
+        token: pair.collateralAsset,
+        amount: pair.seizableCollateral,
+      },
+      debt: {
+        token: pair.debtAsset,
+        amount: pair.debtToCover,
+      },
+      seizableCollateral: pair.seizableCollateral,
+      isBadDebt: badDebtPosition,
+      decision: badDebtPosition && !this.alwaysRealizeBadDebt ? "skip" : "liquidate",
+      reason: badDebtPosition && !this.alwaysRealizeBadDebt
+        ? "Bad debt position (underwater) and alwaysRealizeBadDebt is disabled"
+        : `Best pair selected: debtToCover=${pair.debtToCover}, expected profit calculation in progress`,
+      details: {
+        useFlashLoan: this.useFlashLoan,
+        alwaysRealizeBadDebt: this.alwaysRealizeBadDebt,
+      },
+    });
 
     // Bad debt pre-filter: skip early if position is underwater and we don't realize bad debt
     if (!this.alwaysRealizeBadDebt && badDebtPosition) {
-      console.log(`${this.logTag}⏭️ Skip ${account}: bad debt (underwater position)`);
       return;
     }
 

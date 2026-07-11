@@ -14,7 +14,7 @@ import { decodeEventLog, type Address } from "viem";
 import { getLogs } from "viem/actions";
 
 import { mTokenEventAbi } from "./abis/Moonwell.js";
-import { BaseAccountRegistry, type ScanClient } from "./utils/baseAccountRegistry.js";
+import { BaseAccountRegistry, isRateLimitError, sleep, type ScanClient } from "./utils/baseAccountRegistry.js";
 
 export class MoonwellAccountRegistry extends BaseAccountRegistry {
   protected readonly logPrefix = "[MoonwellRegistry]";
@@ -28,8 +28,8 @@ export class MoonwellAccountRegistry extends BaseAccountRegistry {
   ): Promise<number> {
     let newAccounts = 0;
 
-    try {
-      const logs = await getLogs(client, {
+    const narrowFilter = () =>
+      getLogs(client, {
         address: mTokenAddress,
         event: {
           inputs: [
@@ -46,6 +46,31 @@ export class MoonwellAccountRegistry extends BaseAccountRegistry {
         strict: false,
       });
 
+    let logs: Awaited<ReturnType<typeof narrowFilter>> | undefined;
+    let lastError: unknown;
+
+    // 先試窄篩選;如果是 rate limit,延遲後重試同一個窄篩選最多 3 次,
+    // 而不是立刻換成更重的 broad filter(那只會被限速得更兇)。
+    for (let attempt = 0; attempt <= 3; attempt++) {
+      try {
+        logs = await narrowFilter();
+        lastError = undefined;
+        break;
+      } catch (e) {
+        lastError = e;
+        if (isRateLimitError(e) && attempt < 3) {
+          const delayMs = 1000 * 2 ** attempt; // 1s, 2s, 4s
+          console.warn(
+            `${logTag}Rate limited scanning ${mTokenAddress.slice(0, 10)}... blocks ${fromBlock}-${toBlock}, retrying in ${delayMs}ms (attempt ${attempt + 1}/3)`,
+          );
+          await sleep(delayMs);
+          continue;
+        }
+        break;
+      }
+    }
+
+    if (logs) {
       for (const log of logs) {
         try {
           const decoded = decodeEventLog({
@@ -66,42 +91,44 @@ export class MoonwellAccountRegistry extends BaseAccountRegistry {
           // Skip undecodable logs
         }
       }
-    } catch {
-      console.warn(
-        `${logTag}Event filter failed for ${mTokenAddress.slice(0, 10)}... blocks ${fromBlock}-${toBlock}, trying broad filter`,
-      );
-      try {
-        const logs = await getLogs(client, {
-          address: mTokenAddress,
-          fromBlock: BigInt(fromBlock),
-          toBlock: BigInt(toBlock),
-        });
+      return newAccounts;
+    }
 
-        for (const log of logs) {
-          try {
-            const decoded = decodeEventLog({
-              abi: mTokenEventAbi,
-              topics: log.topics,
-              data: log.data,
-            });
-            const args = decoded.args as Record<string, unknown>;
-            const borrower = args.borrower as Address | undefined;
-            const minter = args.minter as Address | undefined;
-            const payer = args.payer as Address | undefined;
+    // 窄篩選重試後仍失敗,且不是 rate limit(例如節點不支援該篩選格式)才降級成 broad filter。
+    console.warn(
+      `${logTag}Event filter failed for ${mTokenAddress.slice(0, 10)}... blocks ${fromBlock}-${toBlock}, trying broad filter (${lastError instanceof Error ? lastError.message : lastError})`,
+    );
+    try {
+      const broadLogs = await getLogs(client, {
+        address: mTokenAddress,
+        fromBlock: BigInt(fromBlock),
+        toBlock: BigInt(toBlock),
+      });
 
-            if (borrower) newAccounts += this.addAccount(mTokenAddress, borrower);
-            if (minter) newAccounts += this.addAccount(mTokenAddress, minter);
-            if (payer) newAccounts += this.addAccount(mTokenAddress, payer);
-          } catch {
-            // Skip undecodable logs
-          }
+      for (const log of broadLogs) {
+        try {
+          const decoded = decodeEventLog({
+            abi: mTokenEventAbi,
+            topics: log.topics,
+            data: log.data,
+          });
+          const args = decoded.args as Record<string, unknown>;
+          const borrower = args.borrower as Address | undefined;
+          const minter = args.minter as Address | undefined;
+          const payer = args.payer as Address | undefined;
+
+          if (borrower) newAccounts += this.addAccount(mTokenAddress, borrower);
+          if (minter) newAccounts += this.addAccount(mTokenAddress, minter);
+          if (payer) newAccounts += this.addAccount(mTokenAddress, payer);
+        } catch {
+          // Skip undecodable logs
         }
-      } catch (e2) {
-        console.error(
-          `${logTag}Broad log scan failed for ${mTokenAddress.slice(0, 10)}... blocks ${fromBlock}-${toBlock}:`,
-          e2,
-        );
       }
+    } catch (e2) {
+      console.error(
+        `${logTag}Broad log scan failed for ${mTokenAddress.slice(0, 10)}... blocks ${fromBlock}-${toBlock}:`,
+        e2,
+      );
     }
 
     return newAccounts;

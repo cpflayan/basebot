@@ -58,12 +58,13 @@ export const launchBot = async (
   const paidReadPool = new ReadClientPool({
     chain: config.chain,
     entries: [
-      { label: "chainstack", url: process.env.PAID_RPC_CHAINSTACK ?? config.rpcUrl },
-      { label: "coinbase", url: process.env.PAID_RPC_COINBASE ?? config.rpcUrl },
-      { label: "zan", url: process.env.PAID_RPC_ZAN ?? config.rpcUrl },
-      { label: "getblock", url: process.env.PAID_RPC_GETBLOCK ?? config.rpcUrl },
-      { label: "nodereal", url: process.env.PAID_RPC_NODEREAL ?? config.rpcUrl },
-    ].filter((e) => e.url !== config.rpcUrl || process.env.PAID_RPC_CHAINSTACK === undefined),
+      { label: "chainstack", url: process.env.PAID_RPC_CHAINSTACK },
+      { label: "coinbase", url: process.env.PAID_RPC_COINBASE },
+      { label: "zan", url: process.env.PAID_RPC_ZAN },
+      { label: "getblock", url: process.env.PAID_RPC_GETBLOCK },
+      { label: "nodereal", url: process.env.PAID_RPC_NODEREAL },
+      { label: "simplystaking", url: process.env.PAID_RPC_SIMPLYSTAKING },
+    ].filter((e): e is { label: string; url: string } => Boolean(e.url)),
   });
   console.log(`${logTag}💰 Paid read pool: ${paidReadPool.size} endpoints (round-robin)`);
 
@@ -200,9 +201,23 @@ export const launchBot = async (
           const healthServer = getHealthServer();
           healthServer.registerBot("comet", () => cometBot.getHealthStatus());
         } catch (e) {
-          console.error(
-            `${logTag}Failed to start Comet bot: ${e instanceof Error ? e.message : e}`,
-          );
+          const errorMsg = e instanceof Error ? e.message : String(e);
+          console.error(`${logTag}Failed to start Comet bot: ${errorMsg}`);
+          const healthServer = getHealthServer();
+          healthServer.registerBot("comet", () => ({
+            protocol: "comet",
+            isHealthy: false,
+            lastError: `Initialization failed: ${errorMsg}`,
+            lastCheckTimestamp: Date.now(),
+            lastCheckBlock: 0,
+            registryAccountCount: 0,
+            liquidationsAttempted: 0,
+            liquidationsSucceeded: 0,
+            liquidationsFailed: 0,
+            rpcErrors: 0,
+            rpcTotal: 0,
+            rpcErrorRate: 0,
+          }));
         }
       })(),
     );
@@ -239,9 +254,23 @@ export const launchBot = async (
           const healthServer = getHealthServer();
           healthServer.registerBot("moonwell", () => moonwellBot.getHealthStatus());
         } catch (e) {
-          console.error(
-            `${logTag}Failed to start Moonwell bot: ${e instanceof Error ? e.message : e}`,
-          );
+          const errorMsg = e instanceof Error ? e.message : String(e);
+          console.error(`${logTag}Failed to start Moonwell bot: ${errorMsg}`);
+          const healthServer = getHealthServer();
+          healthServer.registerBot("moonwell", () => ({
+            protocol: "moonwell",
+            isHealthy: false,
+            lastError: `Initialization failed: ${errorMsg}`,
+            lastCheckTimestamp: Date.now(),
+            lastCheckBlock: 0,
+            registryAccountCount: 0,
+            liquidationsAttempted: 0,
+            liquidationsSucceeded: 0,
+            liquidationsFailed: 0,
+            rpcErrors: 0,
+            rpcTotal: 0,
+            rpcErrorRate: 0,
+          }));
         }
       })(),
     );
@@ -278,7 +307,23 @@ export const launchBot = async (
           const healthServer = getHealthServer();
           healthServer.registerBot("aave", () => aaveBot.getHealthStatus());
         } catch (e) {
-          console.error(`${logTag}Failed to start Aave bot: ${e instanceof Error ? e.message : e}`);
+          const errorMsg = e instanceof Error ? e.message : String(e);
+          console.error(`${logTag}Failed to start Aave bot: ${errorMsg}`);
+          const healthServer = getHealthServer();
+          healthServer.registerBot("aave", () => ({
+            protocol: "aave",
+            isHealthy: false,
+            lastError: `Initialization failed: ${errorMsg}`,
+            lastCheckTimestamp: Date.now(),
+            lastCheckBlock: 0,
+            registryAccountCount: 0,
+            liquidationsAttempted: 0,
+            liquidationsSucceeded: 0,
+            liquidationsFailed: 0,
+            rpcErrors: 0,
+            rpcTotal: 0,
+            rpcErrorRate: 0,
+          }));
         }
       })(),
     );

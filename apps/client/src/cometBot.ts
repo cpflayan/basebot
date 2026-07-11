@@ -31,6 +31,7 @@ import { CometAccountRegistry } from "./cometAccountRegistry.js";
 import { PositionLiquidationCooldownMechanism } from "./utils/cooldownMechanisms.js";
 import { findDeployBlock } from "./utils/findDeployBlock.js";
 import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
+import { logLiquidationDebug } from "./utils/liquidationDebug.js";
 import { liquidationTracker } from "./utils/liquidationState.js";
 import { createScanClient, ReadClientPool } from "./utils/rpcFallback.js";
 import {
@@ -264,7 +265,7 @@ export class CometLiquidationBot {
     for (const comet of this.cometList) {
       try {
         // Incremental scan for new accounts
-        await this.registry.scanNewEvents(this.client, comet.address, this.logTag);
+        await this.registry.scanNewEvents(this.scanClient, comet.address, this.logTag);
 
         // Get all known accounts
         const accounts = this.registry.getAccounts(comet.address);
@@ -312,12 +313,11 @@ export class CometLiquidationBot {
           allowFailure: true,
         });
 
-        this._rpcTotal += batch.length;
+        this._rpcTotal += 1;
 
         for (let j = 0; j < results.length; j++) {
           const result = results[j]!;
           if (result.status !== "success") {
-            this._rpcErrors++;
             continue;
           }
           const [isLiq] = result.result;
@@ -326,8 +326,8 @@ export class CometLiquidationBot {
           }
         }
       } catch (e) {
-        this._rpcErrors += batch.length;
-        this._rpcTotal += batch.length;
+        this._rpcErrors += 1;
+        this._rpcTotal += 1;
         this._lastError = String(e);
         console.warn(
           `${this.logTag}⚠️ batchCheckLiquidatable batch ${i / BATCH_SIZE} failed: ${e instanceof Error ? e.message : e}`,
@@ -343,14 +343,47 @@ export class CometLiquidationBot {
   private async liquidateComet(comet: CometInfo, account: Address): Promise<void> {
     // SECURITY: Skip blacklisted tokens
     if (TOKEN_BLACKLIST.has(comet.baseAsset.toLowerCase())) {
-      console.log(`${this.logTag}⛔ Skip ${account}: blacklisted base asset`);
+      logLiquidationDebug({
+        protocol: this.logTag,
+        account,
+        decision: "skip",
+        reason: "Blacklisted base asset",
+        details: {
+          cometAddress: comet.address,
+          baseAsset: comet.baseAsset,
+          note: "Base asset is in TOKEN_BLACKLIST",
+        },
+      });
       return;
     }
 
     // Cooldown check
     if (this.cooldown && !this.cooldown.isPositionReady(comet.address, account)) {
+      logLiquidationDebug({
+        protocol: this.logTag,
+        account,
+        decision: "skip",
+        reason: "Position is in cooldown period",
+        details: {
+          cometAddress: comet.address,
+          note: "Recently attempted liquidation, waiting before retry",
+        },
+      });
       return;
     }
+
+    logLiquidationDebug({
+      protocol: this.logTag,
+      account,
+      decision: "liquidate",
+      reason: "Comet liquidation check passed, attempting liquidation",
+      details: {
+        cometAddress: comet.address,
+        baseAsset: comet.baseAsset,
+        useFlashLoan: this.useFlashLoan,
+        note: "Proceeding to estimate debt and execute liquidation",
+      },
+    });
 
     console.log(`${this.logTag}  🎯 ${account} — attempting Comet liquidation`);
 

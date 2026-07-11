@@ -252,7 +252,7 @@ export const chainConfigs: Record<number, Config> = {
         pollIntervalBlocks: 5,
       },
       aaveWatchlist: {
-        enabled: false, // feature flag — set to true to enable Aave V3 liquidation bot
+        enabled: true, // feature flag — set to true to enable Aave V3 liquidation bot
         poolAddress: "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5",
         poolDeployBlock: 2357134, // verified via binary search (eth_getCode)
         reserves: [
@@ -274,7 +274,16 @@ export const chainConfigs: Record<number, Config> = {
         ],
         pollIntervalBlocks: 5,
       },
-      scanRpcUrls: [process.env.PUBLIC_RPC_URL_BASE ?? "https://mainnet.base.org"].filter(Boolean),
+      // BUGFIX: 原本只用免費的 mainnet.base.org 做歷史事件掃描(可能要掃幾千萬個區塊),
+      // 極容易被 rate limit。現在優先用已設定的付費 RPC,免費節點降級為最後備援。
+      scanRpcUrls: [
+        process.env.PAID_RPC_CHAINSTACK,
+        process.env.PAID_RPC_COINBASE,
+        process.env.PAID_RPC_ZAN,
+        process.env.PAID_RPC_SIMPLYSTAKING,
+        process.env.PUBLIC_RPC_URL_BASE,
+        "https://mainnet.base.org",
+      ].filter((u): u is string => Boolean(u)),
     },
   },
   [unichain.id]: {

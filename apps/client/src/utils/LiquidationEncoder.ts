@@ -10,6 +10,26 @@ import { preLiquidationAbi } from "../abis/PreLiquidation";
 export class LiquidationEncoder<
   client extends Client<Transport, Chain, Account> = Client<Transport, Chain, Account>,
 > extends ExecutorEncoder<client> {
+  /**
+   * Snapshot the current call stack for safe rollback.
+   * Use before attempting operations that may fail (e.g., venue routing).
+   */
+  public snapshotCalls(): { calls: Hex[]; totalValue: bigint } {
+    return {
+      calls: [...this.calls],
+      totalValue: this.totalValue,
+    };
+  }
+
+  /**
+   * Restore the call stack to a previous snapshot.
+   * Use when an operation fails to rollback without side effects.
+   */
+  public restoreCalls(snapshot: { calls: Hex[]; totalValue: bigint }): void {
+    this.calls = snapshot.calls;
+    this.totalValue = snapshot.totalValue;
+  }
+
   public preLiquidate(
     preLiquidation: Address,
     borrower: Address,

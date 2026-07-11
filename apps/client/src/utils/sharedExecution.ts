@@ -339,40 +339,44 @@ export async function convertCollateralToLoan(
     srcAmount: seizableCollateral,
   };
 
+  console.log(
+    `${deps.logTag}[Route Debug] Trying to convert ${collateralToken.slice(0, 10)}... -> ${loanToken.slice(0, 10)}..., amount=${seizableCollateral}, venues=${deps.liquidityVenues.length}`,
+  );
+
   for (const venue of deps.liquidityVenues) {
-    const savedCalls = encoder.flush();
-    for (const call of savedCalls) {
-      encoder.pushCall(encoder.address, 0n, call);
-    }
+    const snapshot = encoder.snapshotCalls();
+    const venueName = venue.constructor.name;
 
     try {
       const routeSupported = await venue.supportsRoute(encoder, toConvert.src, toConvert.dst);
       if (routeSupported) {
-        const snapshot = { ...toConvert };
+        const convertSnapshot = { ...toConvert };
         toConvert = await venue.convert(encoder, toConvert);
-        if (toConvert.src === snapshot.src && toConvert.dst === snapshot.dst) {
+        if (toConvert.src === convertSnapshot.src && toConvert.dst === convertSnapshot.dst) {
+          console.log(`${deps.logTag}[Route Debug] ${venueName}: route supported but convert returned same tokens, skipping`);
+          encoder.restoreCalls(snapshot);
           continue;
         }
+        console.log(`${deps.logTag}[Route Debug] ${venueName}: conversion successful`);
       } else {
-        encoder.flush();
-        for (const call of savedCalls) {
-          encoder.pushCall(encoder.address, 0n, call);
-        }
+        console.log(`${deps.logTag}[Route Debug] ${venueName}: route not supported`);
+        encoder.restoreCalls(snapshot);
       }
     } catch (error) {
       console.error(
-        `${deps.logTag}Error converting ${toConvert.src} to ${toConvert.dst}: ${error instanceof Error ? error.message : error}`,
+        `${deps.logTag}[Route Debug] ${venueName}: error — ${error instanceof Error ? error.message : error}`,
       );
-      encoder.flush();
-      for (const call of savedCalls) {
-        encoder.pushCall(encoder.address, 0n, call);
-      }
+      encoder.restoreCalls(snapshot);
       continue;
     }
 
-    if (toConvert.src === toConvert.dst) return true;
+    if (toConvert.src === toConvert.dst) {
+      console.log(`${deps.logTag}[Route Debug] Conversion complete via ${venueName}`);
+      return true;
+    }
   }
 
+  console.log(`${deps.logTag}[Route Debug] No venue found for ${collateralToken.slice(0, 10)}... -> ${loanToken.slice(0, 10)}...`);
   return false;
 }
 
@@ -421,6 +425,12 @@ export async function simulateAndExecFlashLoan(
     return false;
   }
 
+  // DEBUG: Log simulation results
+  const simulatedProfit = (results[2].result ?? 0n) - (results[0].result ?? 0n);
+  console.log(
+    `${deps.logTag}[Sim Debug] balanceBefore=${results[0].result}, balanceAfter=${results[2].result}, simulatedProfit=${simulatedProfit}, gasUsed=${results[1].gasUsed}, gasPrice=${gasPrice}`,
+  );
+
   if (
     !(await checkProfit(
       deps,
@@ -437,11 +447,12 @@ export async function simulateAndExecFlashLoan(
       flashLoanAmount,
       collateralToken,
     ))
-  )
+  ) {
+    console.log(`${deps.logTag}[Sim Debug] Profit check failed — skipping execution`);
     return false;
+  }
 
   // Slippage safety margin
-  const simulatedProfit = (results[2].result ?? 0n) - (results[0].result ?? 0n);
   const slippageMargin = (flashLoanAmount * FLASH_LOAN_SLIPPAGE_BPS) / BPS_DENOMINATOR;
   const estimatedGasCost = results[1].gasUsed * gasPrice;
   const minProfitThreshold = slippageMargin > estimatedGasCost ? slippageMargin : estimatedGasCost;
@@ -454,20 +465,32 @@ export async function simulateAndExecFlashLoan(
   }
 
   // Execute
-  if (deps.flashbotAccount) {
-    const signedBundle = await Flashbots.signBundle([
-      {
-        transaction: { to: encoder.address, ...functionData },
-        client: deps.client,
-      },
-    ]);
-    await Flashbots.sendRawBundle(
-      signedBundle,
-      (await getBlockNumber(deps.client)) + 1n,
-      deps.flashbotAccount,
+  console.log(
+    `${deps.logTag}[Exec Debug] Passing profit check — executing via ${deps.flashbotAccount ? "Flashbots" : "direct writeContract"}`,
+  );
+  try {
+    if (deps.flashbotAccount) {
+      const signedBundle = await Flashbots.signBundle([
+        {
+          transaction: { to: encoder.address, ...functionData },
+          client: deps.client,
+        },
+      ]);
+      await Flashbots.sendRawBundle(
+        signedBundle,
+        (await getBlockNumber(deps.client)) + 1n,
+        deps.flashbotAccount,
+      );
+      console.log(`${deps.logTag}[Exec Debug] Flashbots bundle sent`);
+    } else {
+      const txHash = await writeContract(deps.client, { address: encoder.address, ...functionData });
+      console.log(`${deps.logTag}[Exec Debug] Transaction sent: ${txHash}`);
+    }
+  } catch (e) {
+    console.error(
+      `${deps.logTag}[Exec Debug] Execution failed: ${e instanceof Error ? e.message : e}`,
     );
-  } else {
-    await writeContract(deps.client, { address: encoder.address, ...functionData });
+    throw e;
   }
 
   return true;
@@ -536,6 +559,9 @@ export async function simulateAndExecFlashLoanWithFallback(
   cachedGasPrice?: bigint,
 ): Promise<boolean> {
   const providers = [deps.flashLoanProvider, ...deps.flashLoanFallbackProviders];
+  console.log(
+    `${deps.logTag}[FlashLoan Debug] Trying ${providers.length} provider(s): ${providers.join(", ")}, flashLoanAmount=${flashLoanAmount}`,
+  );
 
   for (let i = 0; i < providers.length; i++) {
     const provider = providers[i]!;
@@ -646,20 +672,32 @@ export async function simulateAndExec(
     return false;
 
   // Execute
-  if (deps.flashbotAccount) {
-    const signedBundle = await Flashbots.signBundle([
-      {
-        transaction: { to: encoder.address, ...functionData },
-        client: deps.client,
-      },
-    ]);
-    await Flashbots.sendRawBundle(
-      signedBundle,
-      (await getBlockNumber(deps.client)) + 1n,
-      deps.flashbotAccount,
+  console.log(
+    `${deps.logTag}[Exec Debug] Passing profit check — executing via ${deps.flashbotAccount ? "Flashbots" : "direct writeContract"}`,
+  );
+  try {
+    if (deps.flashbotAccount) {
+      const signedBundle = await Flashbots.signBundle([
+        {
+          transaction: { to: encoder.address, ...functionData },
+          client: deps.client,
+        },
+      ]);
+      await Flashbots.sendRawBundle(
+        signedBundle,
+        (await getBlockNumber(deps.client)) + 1n,
+        deps.flashbotAccount,
+      );
+      console.log(`${deps.logTag}[Exec Debug] Flashbots bundle sent`);
+    } else {
+      const txHash = await writeContract(deps.client, { address: encoder.address, ...functionData });
+      console.log(`${deps.logTag}[Exec Debug] Transaction sent: ${txHash}`);
+    }
+  } catch (e) {
+    console.error(
+      `${deps.logTag}[Exec Debug] Execution failed: ${e instanceof Error ? e.message : e}`,
     );
-  } else {
-    await writeContract(deps.client, { address: encoder.address, ...functionData });
+    throw e;
   }
 
   return true;

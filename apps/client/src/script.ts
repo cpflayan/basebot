@@ -1,5 +1,11 @@
 import "dotenv/config";
 
+// Initialize colored console with timestamps (must be first)
+import { coloredConsole } from "./utils/coloredLogger.js";
+globalThis.console.log = coloredConsole.log.bind(coloredConsole);
+globalThis.console.error = coloredConsole.error.bind(coloredConsole);
+globalThis.console.warn = coloredConsole.warn.bind(coloredConsole);
+
 import {
   chainConfigs,
   chainConfig,

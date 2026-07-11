@@ -25,6 +25,22 @@ import { getBlockNumber } from "viem/actions";
 /** Max blocks per eth_getLogs call — Base 公開 RPC 上限 10,000 */
 const SCAN_BATCH_SIZE = 10_000;
 
+/**
+ * 判斷錯誤是否為 RPC rate limit（例如免費公開節點回傳 -32016 "over rate limit"）。
+ * BUGFIX: 以前不管什麼錯誤都直接 fallback 成「無 topic 篩選的 broad filter」，
+ * 對 rate limit 來說完全是反效果——broad filter 撈的資料量更大，只會被限速得更兇
+ * （在實際 log 中可以看到 "Broad log scan failed ... over rate limit"）。
+ * 現在 rate limit 錯誤改成延遲後重試原本的窄篩選，而不是立刻擴大掃描範圍。
+ */
+export function isRateLimitError(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : String(e);
+  return /rate limit|429|too many requests|-32016/i.test(msg);
+}
+
+export function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /** Generic client type for read-only scanning */
 export type ScanClient = Client<Transport, Chain> | WalletClient<Transport, Chain, Account>;
 
