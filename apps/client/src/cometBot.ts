@@ -460,6 +460,9 @@ export class CometLiquidationBot {
     // flashLoanAmount 的預算,並確保所有 buyCollateral 呼叫加總不超過 flashLoanAmount。
     const flashLoanValueUsd = await priceAsset(this.sharedDeps, comet.baseAsset, flashLoanAmount);
     let remainingBudget = flashLoanAmount;
+    // Tracks how much of each collateral buyCollateral is expected to hand back, so the
+    // Step 4 swap below can be given a real amount instead of a literal 0.
+    const expectedCollateralOut = new Map<Address, bigint>();
 
     for (let i = 0; i < reserveResults.length; i++) {
       if (remainingBudget <= 0n) break;
@@ -485,6 +488,23 @@ export class CometLiquidationBot {
         baseAmountForThisCollateral = remainingBudget;
       }
 
+      let quotedOut = 0n;
+      try {
+        quotedOut = await readContract(this.paidReadPool.next(), {
+          address: comet.address,
+          abi: cometViewAbi,
+          functionName: "quoteCollateral",
+          args: [collateral, baseAmountForThisCollateral],
+        });
+      } catch (error) {
+        console.warn(
+          `${this.logTag}⚠️ quoteCollateral failed for ${collateral.slice(0, 10)}...: ${error instanceof Error ? error.message : error}`,
+        );
+      }
+      // buyCollateral can never return more than what's actually in reserve
+      if (quotedOut > reserveAmount) quotedOut = reserveAmount;
+      expectedCollateralOut.set(collateral, quotedOut);
+
       callbackEncoder.cometBuyCollateral(
         comet.address,
         collateral,
@@ -499,11 +519,14 @@ export class CometLiquidationBot {
       if (TOKEN_BLACKLIST.has(collateral.toLowerCase())) continue;
       if (collateral.toLowerCase() === comet.baseAsset.toLowerCase()) continue;
 
+      const expectedAmount = expectedCollateralOut.get(collateral) ?? 0n;
+      if (expectedAmount === 0n) continue; // nothing was bought for this collateral
+
       await convertCollateralToLoan(
         this.sharedDeps,
         collateral,
         comet.baseAsset,
-        0n, // amount will be determined at runtime by executor balance
+        expectedAmount,
         callbackEncoder,
       );
     }
@@ -595,10 +618,16 @@ export class CometLiquidationBot {
       allowFailure: true,
     });
 
+    // buyCollateral is called with an unbounded base budget below, so it pulls in the
+    // entire available reserve for each collateral — that reserve amount is exactly what
+    // Step "DEX swap" will need to convert.
+    const expectedCollateralOut = new Map<Address, bigint>();
+
     for (let i = 0; i < reserveResults.length; i++) {
       const result = reserveResults[i]!;
       if (result.status !== "success" || result.result <= 0n) continue;
       const collateral = filteredCollaterals[i]!;
+      expectedCollateralOut.set(collateral, result.result);
       encoder.cometBuyCollateral(comet.address, collateral, 0n, maxUint256);
     }
 
@@ -607,7 +636,16 @@ export class CometLiquidationBot {
       if (TOKEN_BLACKLIST.has(collateral.toLowerCase())) continue;
       if (collateral.toLowerCase() === comet.baseAsset.toLowerCase()) continue;
 
-      await convertCollateralToLoan(this.sharedDeps, collateral, comet.baseAsset, 0n, encoder);
+      const expectedAmount = expectedCollateralOut.get(collateral) ?? 0n;
+      if (expectedAmount === 0n) continue;
+
+      await convertCollateralToLoan(
+        this.sharedDeps,
+        collateral,
+        comet.baseAsset,
+        expectedAmount,
+        encoder,
+      );
     }
 
     // Skim profit

@@ -129,6 +129,20 @@ export const comptrollerAbi = [
     stateMutability: "view",
     type: "function",
   },
+  {
+    inputs: [
+      { name: "mTokenBorrowed", type: "address" },
+      { name: "mTokenCollateral", type: "address" },
+      { name: "actualRepayAmount", type: "uint256" },
+    ],
+    name: "liquidateCalculateSeizeTokens",
+    outputs: [
+      { name: "error", type: "uint256" },
+      { name: "seizeTokens", type: "uint256" },
+    ],
+    stateMutability: "view",
+    type: "function",
+  },
 ] as const;
 
 // ─── MToken (CErc20) ABI ───

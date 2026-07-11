@@ -46,8 +46,8 @@ import {
 } from "./utils/aaveAssetPairSelector.js";
 import { PositionLiquidationCooldownMechanism } from "./utils/cooldownMechanisms.js";
 import { findDeployBlock } from "./utils/findDeployBlock.js";
-import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
 import { logLiquidationDebug } from "./utils/liquidationDebug.js";
+import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
 import { liquidationTracker } from "./utils/liquidationState.js";
 import { createScanClient, ReadClientPool } from "./utils/rpcFallback.js";
 import {
@@ -174,7 +174,9 @@ export class AaveLiquidationBot {
 
     // Read-only client for historical scanning — uses paid Alchemy RPC for better rate limits
     const paidRpcUrl = process.env.RPC_URL_BASE;
-    const scanRpcUrls = paidRpcUrl ? [paidRpcUrl, "https://mainnet.base.org"] : ["https://mainnet.base.org"];
+    const scanRpcUrls = paidRpcUrl
+      ? [paidRpcUrl, "https://mainnet.base.org"]
+      : ["https://mainnet.base.org"];
     this.scanClient = createScanClient(base, scanRpcUrls);
   }
 
@@ -522,9 +524,10 @@ export class AaveLiquidationBot {
       seizableCollateral: pair.seizableCollateral,
       isBadDebt: badDebtPosition,
       decision: badDebtPosition && !this.alwaysRealizeBadDebt ? "skip" : "liquidate",
-      reason: badDebtPosition && !this.alwaysRealizeBadDebt
-        ? "Bad debt position (underwater) and alwaysRealizeBadDebt is disabled"
-        : `Best pair selected: debtToCover=${pair.debtToCover}, expected profit calculation in progress`,
+      reason:
+        badDebtPosition && !this.alwaysRealizeBadDebt
+          ? "Bad debt position (underwater) and alwaysRealizeBadDebt is disabled"
+          : `Best pair selected: debtToCover=${pair.debtToCover}, expected profit calculation in progress`,
       details: {
         useFlashLoan: this.useFlashLoan,
         alwaysRealizeBadDebt: this.alwaysRealizeBadDebt,
@@ -660,7 +663,10 @@ export class AaveLiquidationBot {
         this.sharedDeps,
         pair.collateralAsset,
         pair.debtAsset,
-        0n, // amount determined at runtime by executor balance
+        // Aave's seized amount is known off-chain (same value used by liquidationCall
+        // above and by the non-flash-loan path), so reuse it instead of a literal 0 —
+        // passing 0 here made every venue attempt a zero-amount swap and revert.
+        pair.seizableCollateral,
         callbackEncoder,
       );
     }

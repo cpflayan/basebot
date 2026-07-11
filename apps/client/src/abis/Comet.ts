@@ -109,6 +109,16 @@ export const cometViewAbi = [
     type: "function",
   },
   {
+    inputs: [
+      { name: "asset", type: "address" },
+      { name: "baseAmount", type: "uint256" },
+    ],
+    name: "quoteCollateral",
+    outputs: [{ name: "", type: "uint256" }],
+    stateMutability: "view",
+    type: "function",
+  },
+  {
     inputs: [{ name: "asset", type: "address" }],
     name: "getPrice",
     outputs: [{ name: "", type: "uint256" }],

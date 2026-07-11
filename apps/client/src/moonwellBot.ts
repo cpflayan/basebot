@@ -38,8 +38,8 @@ import { base } from "viem/chains";
 import { comptrollerAbi, mTokenAbi, MOONWELL_UNDERLYING_MAP } from "./abis/Moonwell.js";
 import { MoonwellAccountRegistry } from "./moonwellAccountRegistry.js";
 import { PositionLiquidationCooldownMechanism } from "./utils/cooldownMechanisms.js";
-import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
 import { logLiquidationDebug } from "./utils/liquidationDebug.js";
+import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
 import { liquidationTracker } from "./utils/liquidationState.js";
 import { createScanClient, ReadClientPool } from "./utils/rpcFallback.js";
 import {
@@ -112,6 +112,9 @@ export class MoonwellLiquidationBot {
 
   /** Cached Comptroller params */
   private closeFactor = 0n;
+  /** Cached liquidation incentive (1e18-scaled), e.g. 1.08e18 = 8% bonus. Used as a
+   *  fallback sanity check; the swap amount itself is read via liquidateCalculateSeizeTokens. */
+  private liquidationIncentiveMantissa = 108n * 10n ** 16n; // default 8%, overwritten on cache
 
   /** Cached mToken → reserveFactor (for pre-filtering unprofitable markets) */
   private reserveFactors = new Map<Address, bigint>();
@@ -284,7 +287,7 @@ export class MoonwellLiquidationBot {
   private async cacheComptrollerParams(): Promise<void> {
     try {
       this._rpcTotal += 2;
-      const [cf] = await Promise.all([
+      const [cf, li] = await Promise.all([
         readContract(this.client, {
           address: this.comptroller,
           abi: comptrollerAbi,
@@ -297,7 +300,10 @@ export class MoonwellLiquidationBot {
         }),
       ]);
       this.closeFactor = cf;
-      console.log(`${this.logTag}📋 Comptroller params: closeFactor=${Number(cf) / 1e18}`);
+      this.liquidationIncentiveMantissa = li;
+      console.log(
+        `${this.logTag}📋 Comptroller params: closeFactor=${Number(cf) / 1e18}, liquidationIncentive=${Number(li) / 1e18}`,
+      );
     } catch (e) {
       this._rpcErrors += 2;
       this._lastError = String(e);
@@ -635,6 +641,46 @@ export class MoonwellLiquidationBot {
   }
 
   /**
+   * Estimate the underlying collateral amount that `liquidateBorrow` + `redeem(maxUint256)`
+   * will actually produce, so the DEX swap step can be given a real amount instead of a
+   * literal 0 (which every liquidity venue would otherwise try to swap and revert on).
+   *
+   * Mirrors the on-chain math exactly (liquidateCalculateSeizeTokens is the same view
+   * function the Comptroller uses internally), so this is subject to the same
+   * between-read-and-execution price drift as any other pre-computed liquidation amount
+   * (e.g. Aave's `seizableCollateral`) — simulation still guards against a stale value.
+   */
+  private async estimateSeizedUnderlying(
+    borrowMToken: Address,
+    collateralMToken: Address,
+    repayAmount: bigint,
+  ): Promise<bigint> {
+    try {
+      const [error, seizeTokens] = await readContract(this.client, {
+        address: this.comptroller,
+        abi: comptrollerAbi,
+        functionName: "liquidateCalculateSeizeTokens",
+        args: [borrowMToken, collateralMToken, repayAmount],
+      });
+      if (error !== 0n) return 0n;
+
+      const exchangeRate = await readContract(this.client, {
+        address: collateralMToken,
+        abi: mTokenAbi,
+        functionName: "exchangeRateStored",
+      });
+
+      // underlying = seizeTokens * exchangeRate / 1e18 (Compound V2 exchange rate scaling)
+      return (seizeTokens * exchangeRate) / 10n ** 18n;
+    } catch (error) {
+      console.warn(
+        `${this.logTag}⚠️ Failed to estimate seized collateral for ${collateralMToken.slice(0, 10)}...: ${error instanceof Error ? error.message : error}`,
+      );
+      return 0n;
+    }
+  }
+
+  /**
    * Flash loan path:
    *   1. Borrow underlying from Balancer
    *   2. Approve borrow mToken + liquidateBorrow → seize collateral mToken
@@ -674,11 +720,20 @@ export class MoonwellLiquidationBot {
 
     // Step 4: DEX swap collateral underlying → borrow underlying (if different tokens)
     if (collateralUnderlying.toLowerCase() !== borrowUnderlying.toLowerCase()) {
+      const expectedCollateral = await this.estimateSeizedUnderlying(
+        borrowMToken,
+        collateralMToken,
+        repayAmount,
+      );
+      if (expectedCollateral === 0n) {
+        console.log(`${this.logTag}  ${account} could not estimate seized collateral, skipping`);
+        return;
+      }
       await convertCollateralToLoan(
         this.sharedDeps,
         collateralUnderlying,
         borrowUnderlying,
-        0n, // amount determined at runtime by executor balance
+        expectedCollateral,
         callbackEncoder,
       );
     }
@@ -753,11 +808,20 @@ export class MoonwellLiquidationBot {
 
     // DEX swap collateral underlying → borrow underlying (if different tokens)
     if (collateralUnderlying.toLowerCase() !== borrowUnderlying.toLowerCase()) {
+      const expectedCollateral = await this.estimateSeizedUnderlying(
+        borrowMToken,
+        collateralMToken,
+        repayAmount,
+      );
+      if (expectedCollateral === 0n) {
+        console.log(`${this.logTag}  ${account} could not estimate seized collateral, skipping`);
+        return;
+      }
       await convertCollateralToLoan(
         this.sharedDeps,
         collateralUnderlying,
         borrowUnderlying,
-        0n,
+        expectedCollateral,
         encoder,
       );
     }
