@@ -373,16 +373,20 @@ export class MoonwellLiquidationBot {
   async checkAllMarkets(): Promise<void> {
     this._lastCheckTimestamp = Math.floor(Date.now() / 1000);
 
-    // Incremental scan for new accounts across all mTokens
-    for (const mToken of this.mTokenList) {
-      try {
-        await this.registry.scanNewEvents(this.scanClient, mToken.address, this.logTag);
-      } catch (e) {
-        console.error(
-          `${this.logTag}Error scanning mToken ${mToken.address.slice(0, 10)}...: ${e instanceof Error ? e.message : e}`,
-        );
-      }
-    }
+    // Incremental scan for new accounts across all mTokens in parallel.
+    // persist=false avoids concurrent JSON write races; one save covers all markets.
+    await Promise.all(
+      this.mTokenList.map(async (mToken) => {
+        try {
+          await this.registry.scanNewEvents(this.scanClient, mToken.address, this.logTag, false);
+        } catch (e) {
+          console.error(
+            `${this.logTag}Error scanning mToken ${mToken.address.slice(0, 10)}...: ${e instanceof Error ? e.message : e}`,
+          );
+        }
+      }),
+    );
+    this.registry.saveToFile();
 
     // Detect oracle price updates — mark affected markets as "hot"
     await this.detectOracleUpdates();
@@ -402,15 +406,18 @@ export class MoonwellLiquidationBot {
 
     if (liquidatable.length === 0) return;
 
+    // Build hot-account set once (O(hot markets × accounts)) instead of per-sort comparison
+    const hotAccountSet = this.buildHotAccountSet();
+
     // Sort: (1) hot market accounts first, (2) by shortfall descending
     liquidatable.sort((a, b) => {
-      const aHot = this.isAccountInHotMarket(a.account) ? 0 : 1;
-      const bHot = this.isAccountInHotMarket(b.account) ? 0 : 1;
+      const aHot = hotAccountSet.has(a.account.toLowerCase()) ? 0 : 1;
+      const bHot = hotAccountSet.has(b.account.toLowerCase()) ? 0 : 1;
       if (aHot !== bHot) return aHot - bHot;
       return b.shortfall > a.shortfall ? 1 : b.shortfall < a.shortfall ? -1 : 0;
     });
 
-    const hotCount = liquidatable.filter((l) => this.isAccountInHotMarket(l.account)).length;
+    const hotCount = liquidatable.filter((l) => hotAccountSet.has(l.account.toLowerCase())).length;
     console.log(
       `${this.logTag}🎯 ${liquidatable.length} liquidatable account(s) found! (${hotCount} in hot markets, sorted by priority)`,
     );
@@ -523,8 +530,8 @@ export class MoonwellLiquidationBot {
 
     this._liquidationsAttempted++;
 
-    // Find all borrow positions, sorted by balance descending
-    const borrowPositions = await this.findAllBorrowPositions(account);
+    // Single multicall: borrow balances + collateral balances (was 2 separate multicalls)
+    const { borrowPositions, collateralMToken } = await this.findBorrowAndCollateral(account);
 
     if (borrowPositions.length === 0) {
       logLiquidationDebug({
@@ -540,8 +547,6 @@ export class MoonwellLiquidationBot {
       return;
     }
 
-    // Find best collateral (largest mToken balance)
-    const collateralMToken = await this.findBestCollateral(account);
     if (!collateralMToken) {
       logLiquidationDebug({
         protocol: this.logTag,
@@ -869,102 +874,90 @@ export class MoonwellLiquidationBot {
   // ─── Helpers ───
 
   /**
-   * Find ALL borrow positions for an account, sorted by balance descending.
-   * Returns array of { borrowMToken, borrowBalance } — caller tries each until one succeeds.
+   * Single multicall for borrow + collateral discovery.
+   * Replaces two sequential multicalls (borrowBalanceStored then balanceOf).
    */
-  private async findAllBorrowPositions(
-    account: Address,
-  ): Promise<{ borrowMToken: Address; borrowBalance: bigint }[]> {
+  private async findBorrowAndCollateral(account: Address): Promise<{
+    borrowPositions: { borrowMToken: Address; borrowBalance: bigint }[];
+    collateralMToken: Address | null;
+  }> {
+    const n = this.mTokenList.length;
     try {
-      this._rpcTotal += this.mTokenList.length;
+      this._rpcTotal += n * 2;
       const results = await multicall(this.paidReadPool.next(), {
-        contracts: this.mTokenList.map((mToken) => ({
-          address: mToken.address,
-          abi: mTokenAbi,
-          functionName: "borrowBalanceStored" as const,
-          args: [account] as const,
-        })),
+        contracts: [
+          ...this.mTokenList.map((mToken) => ({
+            address: mToken.address,
+            abi: mTokenAbi,
+            functionName: "borrowBalanceStored" as const,
+            args: [account] as const,
+          })),
+          ...this.mTokenList.map((mToken) => ({
+            address: mToken.address,
+            abi: mTokenAbi,
+            functionName: "balanceOf" as const,
+            args: [account] as const,
+          })),
+        ],
         allowFailure: true,
       });
 
-      return results
-        .map((r, i) => {
-          if (r.status !== "success") {
-            this._rpcErrors++;
-            return null;
-          }
-          const borrowBalance = r.result;
-          return borrowBalance > 0n
-            ? { borrowMToken: this.mTokenList[i]!.address, borrowBalance }
-            : null;
-        })
-        .filter((r): r is { borrowMToken: Address; borrowBalance: bigint } => r !== null)
-        .sort((a, b) =>
-          b.borrowBalance > a.borrowBalance ? 1 : b.borrowBalance < a.borrowBalance ? -1 : 0,
-        );
-    } catch (e) {
-      this._rpcErrors += this.mTokenList.length;
-      this._lastError = String(e);
-      console.warn(
-        `${this.logTag}⚠️ findAllBorrowPositions multicall failed: ${e instanceof Error ? e.message : e}`,
-      );
-      return [];
-    }
-  }
-
-  /**
-   * Find the best collateral mToken (largest balance) for an account.
-   */
-  private async findBestCollateral(account: Address): Promise<Address | null> {
-    let bestMToken: Address | null = null;
-    let maxBalance = 0n;
-
-    try {
-      this._rpcTotal += this.mTokenList.length;
-      const results = await multicall(this.paidReadPool.next(), {
-        contracts: this.mTokenList.map((mToken) => ({
-          address: mToken.address,
-          abi: mTokenAbi,
-          functionName: "balanceOf" as const,
-          args: [account] as const,
-        })),
-        allowFailure: true,
-      });
-
-      for (let i = 0; i < results.length; i++) {
-        const result = results[i]!;
-        if (result.status !== "success") {
+      const borrowPositions: { borrowMToken: Address; borrowBalance: bigint }[] = [];
+      for (let i = 0; i < n; i++) {
+        const r = results[i]!;
+        if (r.status !== "success") {
           this._rpcErrors++;
           continue;
         }
-        if (result.result > maxBalance) {
-          maxBalance = result.result;
-          bestMToken = this.mTokenList[i]!.address;
+        if (r.result > 0n) {
+          borrowPositions.push({
+            borrowMToken: this.mTokenList[i]!.address,
+            borrowBalance: r.result,
+          });
         }
       }
+      borrowPositions.sort((a, b) =>
+        b.borrowBalance > a.borrowBalance ? 1 : b.borrowBalance < a.borrowBalance ? -1 : 0,
+      );
+
+      let collateralMToken: Address | null = null;
+      let maxBalance = 0n;
+      for (let i = 0; i < n; i++) {
+        const r = results[n + i]!;
+        if (r.status !== "success") {
+          this._rpcErrors++;
+          continue;
+        }
+        if (r.result > maxBalance) {
+          maxBalance = r.result;
+          collateralMToken = this.mTokenList[i]!.address;
+        }
+      }
+
+      return { borrowPositions, collateralMToken };
     } catch (e) {
-      this._rpcErrors += this.mTokenList.length;
+      this._rpcErrors += n * 2;
       this._lastError = String(e);
       console.warn(
-        `${this.logTag}⚠️ findBestCollateral multicall failed: ${e instanceof Error ? e.message : e}`,
+        `${this.logTag}⚠️ findBorrowAndCollateral multicall failed: ${e instanceof Error ? e.message : e}`,
       );
+      return { borrowPositions: [], collateralMToken: null };
     }
-
-    return bestMToken;
   }
 
   /**
-   * Check if an account has a position in any hot market.
+   * Build a lowercase Set of accounts that hold positions in any hot market.
+   * Used for O(1) priority checks when sorting liquidatable accounts.
    */
-  private isAccountInHotMarket(account: Address): boolean {
-    if (this.hotMarkets.size === 0) return false;
-    const lowerAccount = account.toLowerCase();
-    // An account is "hot" if it has any position (borrow or collateral) in a hot market
+  private buildHotAccountSet(): Set<string> {
+    const hot = new Set<string>();
+    if (this.hotMarkets.size === 0) return hot;
     for (const hotMToken of this.hotMarkets) {
-      const accounts = this.registry.getAccounts(hotMToken);
-      if (accounts.some((a) => a.toLowerCase() === lowerAccount)) return true;
+      for (const account of this.registry.getAccounts(hotMToken)) {
+        hot.add(account.toLowerCase());
+      }
     }
-    return false;
+    return hot;
   }
 
   /**

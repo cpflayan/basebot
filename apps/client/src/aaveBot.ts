@@ -56,6 +56,7 @@ import {
   convertCollateralToLoan,
   SharedBlockBus,
   priceAsset,
+  primeTokenDecimals,
   simulateAndExecFlashLoanWithFallback,
   simulateAndExec,
 } from "./utils/sharedExecution.js";
@@ -290,14 +291,17 @@ export class AaveLiquidationBot {
           isFrozen,
         ] = result.result;
 
+        const decimalsNum = Number(decimals);
         this.cachedReserveConfigs.set(asset.toLowerCase(), {
           ltv,
           liquidationThreshold,
           liquidationBonus,
-          decimals: Number(decimals),
+          decimals: decimalsNum,
           isActive,
           isFrozen,
         });
+        // Prefill process-lifetime decimals cache for profit/price paths
+        primeTokenDecimals(asset, decimalsNum);
       }
 
       console.log(

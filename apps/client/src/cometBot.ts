@@ -458,22 +458,36 @@ export class CometLiquidationBot {
     // 第二筆呼叫的 transferFrom 會失敗 → 整筆交易 revert。
     // 現在改成:先用 USD 價值估算每種 collateral 儲備值多少 base asset,按比例分配
     // flashLoanAmount 的預算,並確保所有 buyCollateral 呼叫加總不超過 flashLoanAmount。
-    const flashLoanValueUsd = await priceAsset(this.sharedDeps, comet.baseAsset, flashLoanAmount);
+    //
+    // Efficiency: price all collaterals in parallel, then multicall quoteCollateral —
+    // previously each collateral did sequential price + quote RPCs.
+    const candidates: { collateral: Address; reserveAmount: bigint }[] = [];
+    for (let i = 0; i < reserveResults.length; i++) {
+      const result = reserveResults[i]!;
+      if (result.status !== "success" || result.result <= 0n) continue;
+      candidates.push({ collateral: filteredCollaterals[i]!, reserveAmount: result.result });
+    }
+
+    const [flashLoanValueUsd, ...reserveValuesUsd] = await Promise.all([
+      priceAsset(this.sharedDeps, comet.baseAsset, flashLoanAmount),
+      ...candidates.map(({ collateral, reserveAmount }) =>
+        priceAsset(this.sharedDeps, collateral, reserveAmount),
+      ),
+    ]);
+
     let remainingBudget = flashLoanAmount;
     // Tracks how much of each collateral buyCollateral is expected to hand back, so the
     // Step 4 swap below can be given a real amount instead of a literal 0.
     const expectedCollateralOut = new Map<Address, bigint>();
+    const buyPlans: { collateral: Address; reserveAmount: bigint; baseAmount: bigint }[] = [];
 
-    for (let i = 0; i < reserveResults.length; i++) {
+    for (let i = 0; i < candidates.length; i++) {
       if (remainingBudget <= 0n) break;
-      const result = reserveResults[i]!;
-      if (result.status !== "success" || result.result <= 0n) continue;
-      const collateral = filteredCollaterals[i]!;
-      const reserveAmount = result.result;
+      const { collateral, reserveAmount } = candidates[i]!;
+      const reserveValueUsd = reserveValuesUsd[i];
 
       let baseAmountForThisCollateral = remainingBudget;
       if (flashLoanValueUsd && flashLoanValueUsd > 0) {
-        const reserveValueUsd = await priceAsset(this.sharedDeps, collateral, reserveAmount);
         if (reserveValueUsd !== undefined && reserveValueUsd > 0) {
           // 用美元價值比例換算成 base asset 數量,並保留 5% 安全邊際避免價格微幅誤差仍超支
           const ratio = reserveValueUsd / flashLoanValueUsd;
@@ -488,30 +502,48 @@ export class CometLiquidationBot {
         baseAmountForThisCollateral = remainingBudget;
       }
 
-      let quotedOut = 0n;
-      try {
-        quotedOut = await readContract(this.paidReadPool.next(), {
+      buyPlans.push({
+        collateral,
+        reserveAmount,
+        baseAmount: baseAmountForThisCollateral,
+      });
+      remainingBudget -= baseAmountForThisCollateral;
+    }
+
+    // Batch quoteCollateral for all planned buys (1 multicall instead of N RPCs)
+    if (buyPlans.length > 0) {
+      const quoteResults = await multicall(this.paidReadPool.next(), {
+        contracts: buyPlans.map(({ collateral, baseAmount }) => ({
           address: comet.address,
           abi: cometViewAbi,
-          functionName: "quoteCollateral",
-          args: [collateral, baseAmountForThisCollateral],
-        });
-      } catch (error) {
-        console.warn(
-          `${this.logTag}⚠️ quoteCollateral failed for ${collateral.slice(0, 10)}...: ${error instanceof Error ? error.message : error}`,
+          functionName: "quoteCollateral" as const,
+          args: [collateral, baseAmount] as const,
+        })),
+        allowFailure: true,
+      });
+
+      for (let i = 0; i < buyPlans.length; i++) {
+        const plan = buyPlans[i]!;
+        const quoteResult = quoteResults[i]!;
+        let quotedOut = 0n;
+        if (quoteResult.status === "success") {
+          quotedOut = quoteResult.result;
+        } else {
+          console.warn(
+            `${this.logTag}⚠️ quoteCollateral failed for ${plan.collateral.slice(0, 10)}...`,
+          );
+        }
+        // buyCollateral can never return more than what's actually in reserve
+        if (quotedOut > plan.reserveAmount) quotedOut = plan.reserveAmount;
+        expectedCollateralOut.set(plan.collateral, quotedOut);
+
+        callbackEncoder.cometBuyCollateral(
+          comet.address,
+          plan.collateral,
+          0n, // minAmount = 0 (we rely on simulation for safety)
+          plan.baseAmount,
         );
       }
-      // buyCollateral can never return more than what's actually in reserve
-      if (quotedOut > reserveAmount) quotedOut = reserveAmount;
-      expectedCollateralOut.set(collateral, quotedOut);
-
-      callbackEncoder.cometBuyCollateral(
-        comet.address,
-        collateral,
-        0n, // minAmount = 0 (we rely on simulation for safety)
-        baseAmountForThisCollateral,
-      );
-      remainingBudget -= baseAmountForThisCollateral;
     }
 
     // Step 4: DEX swap any non-base collateral → base asset

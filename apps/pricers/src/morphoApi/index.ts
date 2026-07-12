@@ -2,10 +2,18 @@ import type { Account, Address, Chain, Client, Transport } from "viem";
 
 import type { Pricer } from "../pricer";
 
+interface CachedPrice {
+  price: number;
+  fetchTimestamp: number;
+}
+
 export class MorphoApi implements Pricer {
   private readonly API_URL = "https://blue-api.morpho.org/graphql";
   private supportedChains: number[] = [];
   private initialized = false;
+  /** Short TTL cache — same asset is often priced many times per poll tick */
+  private priceCache = new Map<string, CachedPrice>();
+  private readonly cacheTimeoutMs = 15_000; // 15 seconds
 
   async price(client: Client<Transport, Chain, Account>, asset: Address) {
     if (!this.initialized) {
@@ -13,6 +21,12 @@ export class MorphoApi implements Pricer {
     }
 
     if (!this.supportedChains.includes(client.chain.id)) return;
+
+    const cacheKey = `${client.chain.id}:${asset.toLowerCase()}`;
+    const cached = this.priceCache.get(cacheKey);
+    if (cached && Date.now() - cached.fetchTimestamp < this.cacheTimeoutMs) {
+      return cached.price;
+    }
 
     try {
       const response = await fetch(this.API_URL, {
@@ -27,9 +41,16 @@ export class MorphoApi implements Pricer {
 
       const items = data.data.assets.items;
 
-      const priceUsd = items.find((item) => item.address === asset)?.priceUsd ?? null;
+      // Case-insensitive match — API may return checksummed addresses
+      const assetLower = asset.toLowerCase();
+      const priceUsd =
+        items.find((item) => item.address.toLowerCase() === assetLower)?.priceUsd ?? null;
 
-      return priceUsd ?? undefined;
+      if (priceUsd != null) {
+        this.priceCache.set(cacheKey, { price: priceUsd, fetchTimestamp: Date.now() });
+        return priceUsd;
+      }
+      return undefined;
     } catch (error) {
       console.error(error);
       return undefined;

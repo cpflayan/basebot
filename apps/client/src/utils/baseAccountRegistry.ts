@@ -54,6 +54,8 @@ export abstract class BaseAccountRegistry {
   protected accounts = new Map<string, Set<Address>>();
   /** address (lowercase) → last scanned block */
   protected lastScannedBlock = new Map<string, number>();
+  /** address (lowercase) → last block written to disk */
+  private lastPersistedBlock = new Map<string, number>();
   /** Path for JSON persistence */
   protected filePath: string;
   /** Log prefix (e.g. "[CometRegistry]", "[MoonwellRegistry]") */
@@ -74,6 +76,7 @@ export abstract class BaseAccountRegistry {
       }
       for (const [key, block] of Object.entries(raw.lastScannedBlock ?? {})) {
         this.lastScannedBlock.set(key, block);
+        this.lastPersistedBlock.set(key, block);
       }
       const total = [...this.accounts.values()].reduce((s, set) => s + set.size, 0);
       console.log(`${this.logPrefix} Loaded ${total} accounts from ${this.filePath}`);
@@ -99,8 +102,14 @@ export abstract class BaseAccountRegistry {
       state.lastScannedBlock[key] = block;
     }
     const tmpPath = this.filePath + ".tmp";
-    fs.writeFileSync(tmpPath, JSON.stringify(state, null, 2));
+    // Compact JSON — same data, less CPU/disk than pretty-print on every save
+    fs.writeFileSync(tmpPath, JSON.stringify(state));
     fs.renameSync(tmpPath, this.filePath);
+
+    // Keep debounce cursors in sync after any explicit save
+    for (const [key, block] of this.lastScannedBlock) {
+      this.lastPersistedBlock.set(key, block);
+    }
   }
 
   // ─── Scan orchestration ───
@@ -130,7 +139,7 @@ export abstract class BaseAccountRegistry {
     }
 
     this.lastScannedBlock.set(key, currentBlock);
-    this.saveToFile();
+    this.saveToFile(); // always persist after full historical scan
 
     const count = this.accounts.get(key)?.size ?? 0;
     console.log(
@@ -138,10 +147,15 @@ export abstract class BaseAccountRegistry {
     );
   }
 
+  /**
+   * @param persist - When false, updates in-memory state only (caller must save once).
+   *   Use for parallel multi-market scans to avoid concurrent write races.
+   */
   async scanNewEvents(
     client: ScanClient,
     contractAddress: Address,
     logTag: string,
+    persist = true,
   ): Promise<number> {
     const key = contractAddress.toLowerCase();
     const lastScanned = this.lastScannedBlock.get(key);
@@ -164,7 +178,12 @@ export abstract class BaseAccountRegistry {
     }
 
     this.lastScannedBlock.set(key, currentBlock);
-    this.saveToFile();
+
+    // Only hit disk when accounts changed, or periodically so lastScanned advances
+    // are durable without rewriting JSON on every empty poll tick.
+    if (persist && (newAccounts > 0 || this.shouldPersistLastScanned(key, currentBlock))) {
+      this.saveToFile();
+    }
 
     if (newAccounts > 0) {
       console.log(
@@ -173,6 +192,16 @@ export abstract class BaseAccountRegistry {
     }
 
     return newAccounts;
+  }
+
+  /**
+   * Debounce lastScanned-only disk writes: persist at most once per ~200 blocks
+   * of progress without new accounts. In-memory lastScanned is always current;
+   * a crash only causes a short re-scan.
+   */
+  private shouldPersistLastScanned(key: string, currentBlock: number): boolean {
+    const lastPersisted = this.lastPersistedBlock.get(key) ?? 0;
+    return currentBlock - lastPersisted >= 200;
   }
 
   // ─── Abstract: protocol-specific event scanning ───

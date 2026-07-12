@@ -11,14 +11,16 @@
  */
 import type { Pricer } from "@morpho-blue-liquidation-bot/pricers";
 import type { Address, Transport, Chain, Account, WalletClient } from "viem";
-import { erc20Abi, formatUnits } from "viem";
-import { multicall, readContract } from "viem/actions";
+import { formatUnits } from "viem";
+import { multicall } from "viem/actions";
 
 import {
   aavePoolReserveDataAbi,
   aaveReserveConfigurationAbi,
   HEALTH_FACTOR_THRESHOLD,
 } from "../abis/AaveV3.js";
+
+import { getTokenDecimals, primeTokenDecimals } from "./sharedExecution.js";
 
 // ─── Types ───
 
@@ -101,7 +103,7 @@ export async function selectBestLiquidationPair(
   healthFactor: bigint,
   reserves: Address[],
   pricers?: Pricer[],
-  _wNative?: Address,
+  wNative?: Address,
   cachedReserveConfigs?: Map<string, ReserveConfig>,
 ): Promise<LiquidationPair | null> {
   // Step 1: Enumerate user's collateral and debt assets via multicall
@@ -157,12 +159,14 @@ export async function selectBestLiquidationPair(
       if (config) {
         liquidationBonuses.set(asset.toLowerCase(), config.liquidationBonus);
         reserveDecimals.set(asset.toLowerCase(), config.decimals);
+        primeTokenDecimals(asset, config.decimals);
       }
     }
     for (const { asset } of debtAssets) {
       const config = cachedReserveConfigs.get(asset.toLowerCase());
       if (config) {
         reserveDecimals.set(asset.toLowerCase(), config.decimals);
+        primeTokenDecimals(asset, config.decimals);
       }
     }
   }
@@ -185,35 +189,66 @@ export async function selectBestLiquidationPair(
       const entry = bonusResults[i];
       if (entry?.status !== "success" || !entry?.result) continue;
       const asset = missingBonusAssets[i]!.asset;
+      const decimals = Number(entry.result[3]);
       liquidationBonuses.set(asset.toLowerCase(), entry.result[2]); // liquidationBonus
-      reserveDecimals.set(asset.toLowerCase(), Number(entry.result[3])); // decimals
+      reserveDecimals.set(asset.toLowerCase(), decimals);
+      primeTokenDecimals(asset, decimals);
     }
   }
 
-  // Step 4: Evaluate each (collateral, debt) pair
+  // Step 4: Price each unique asset once (not once per pair)
+  const priceByAsset = new Map<string, number>();
+  if (pricers && pricers.length > 0) {
+    const uniqueAssets = new Map<string, Address>();
+    for (const { asset } of collateralAssets) uniqueAssets.set(asset.toLowerCase(), asset);
+    for (const { asset } of debtAssets) uniqueAssets.set(asset.toLowerCase(), asset);
+
+    // Fill any missing decimals (shared process cache) in parallel
+    const assetsNeedingDecimals = [...uniqueAssets.values()].filter(
+      (asset) => !reserveDecimals.has(asset.toLowerCase()),
+    );
+    if (assetsNeedingDecimals.length > 0) {
+      const decimalsResults = await Promise.all(
+        assetsNeedingDecimals.map(async (asset) => {
+          const decimals = await getTokenDecimals(client, asset, wNative);
+          return [asset.toLowerCase(), decimals] as const;
+        }),
+      );
+      for (const [key, decimals] of decimalsResults) {
+        reserveDecimals.set(key, decimals);
+      }
+    }
+
+    const priceResults = await Promise.all(
+      [...uniqueAssets.values()].map(async (asset) => {
+        const price = await priceAssetOnce(client, asset, pricers);
+        return [asset.toLowerCase(), price] as const;
+      }),
+    );
+    for (const [key, price] of priceResults) {
+      if (price !== undefined) priceByAsset.set(key, price);
+    }
+  }
+
+  // Step 5: Evaluate all pairs in pure math (no further RPCs)
   let bestPair: LiquidationPair | null = null;
   let bestProfit = 0n;
 
   for (const collateral of collateralAssets) {
     for (const debt of debtAssets) {
-      try {
-        const pair = await evaluatePair(
-          client,
-          poolAddress,
-          collateral,
-          debt,
-          closeFactorBps,
-          liquidationBonuses,
-          reserveDecimals,
-          pricers,
-        );
+      const pair = evaluatePair(
+        collateral,
+        debt,
+        closeFactorBps,
+        liquidationBonuses,
+        reserveDecimals,
+        pricers,
+        priceByAsset,
+      );
 
-        if (pair && pair.estimatedProfit > bestProfit) {
-          bestProfit = pair.estimatedProfit;
-          bestPair = pair;
-        }
-      } catch {
-        // Skip pairs that fail evaluation
+      if (pair && pair.estimatedProfit > bestProfit) {
+        bestProfit = pair.estimatedProfit;
+        bestPair = pair;
       }
     }
   }
@@ -223,16 +258,15 @@ export async function selectBestLiquidationPair(
 
 // ─── Evaluate a single (collateral, debt) pair ───
 
-async function evaluatePair(
-  client: WalletClient<Transport, Chain, Account>,
-  _poolAddress: Address,
+function evaluatePair(
   collateral: { asset: Address; balance: bigint },
   debt: { asset: Address; balance: bigint },
   closeFactorBps: bigint,
   liquidationBonuses: Map<string, bigint>,
   reserveDecimals: Map<string, number>,
-  pricers?: Pricer[],
-): Promise<LiquidationPair | null> {
+  pricers: Pricer[] | undefined,
+  priceByAsset: Map<string, number>,
+): LiquidationPair | null {
   // debtToCover = closeFactor * debtBalance (close factor caps it)
   const debtToCover = (debt.balance * closeFactorBps) / 10000n;
   if (debtToCover === 0n) return null;
@@ -255,24 +289,14 @@ async function evaluatePair(
     };
   }
 
-  // ── Fetch prices; use cached decimals when available ──
-  const [collateralPrice, debtPrice] = await Promise.all([
-    priceAsset(client, collateral.asset, pricers),
-    priceAsset(client, debt.asset, pricers),
-  ]);
+  const collateralPrice = priceByAsset.get(collateral.asset.toLowerCase());
+  const debtPrice = priceByAsset.get(debt.asset.toLowerCase());
 
   if (collateralPrice === undefined || debtPrice === undefined) return null;
   if (collateralPrice === 0) return null;
 
-  // Use cached decimals from reserve config, fallback to RPC
-  const [collateralDecimals, debtDecimals] = await Promise.all([
-    Promise.resolve(
-      reserveDecimals.get(collateral.asset.toLowerCase()) ?? getDecimals(client, collateral.asset),
-    ),
-    Promise.resolve(
-      reserveDecimals.get(debt.asset.toLowerCase()) ?? getDecimals(client, debt.asset),
-    ),
-  ]);
+  const collateralDecimals = reserveDecimals.get(collateral.asset.toLowerCase()) ?? 18;
+  const debtDecimals = reserveDecimals.get(debt.asset.toLowerCase()) ?? 18;
 
   // ── Correct seizable collateral formula (Aave V3 protocol logic): ──
   // seizableCollateral = debtToCover * (debtPrice / collateralPrice)
@@ -322,7 +346,7 @@ async function evaluatePair(
 
 // ─── Helpers ───
 
-async function priceAsset(
+async function priceAssetOnce(
   client: WalletClient<Transport, Chain, Account>,
   asset: Address,
   pricers: Pricer[],
@@ -332,19 +356,4 @@ async function priceAsset(
     if (price !== undefined) return price;
   }
   return undefined;
-}
-
-async function getDecimals(
-  client: WalletClient<Transport, Chain, Account>,
-  asset: Address,
-): Promise<number> {
-  try {
-    return await readContract(client, {
-      address: asset,
-      abi: erc20Abi,
-      functionName: "decimals",
-    });
-  } catch {
-    return 18; // fallback
-  }
 }

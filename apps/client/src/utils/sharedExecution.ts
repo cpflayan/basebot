@@ -38,6 +38,43 @@ import { liquidationTracker } from "./liquidationState.js";
 const BPS_DENOMINATOR = 10_000n;
 
 /**
+ * Process-lifetime ERC-20 decimals cache.
+ * Decimals are immutable on-chain; caching eliminates repeated `decimals()` RPCs
+ * across profit checks, pair selection, and budget math on every poll tick.
+ */
+const decimalsCache = new Map<string, number>();
+
+/** Resolve ERC-20 decimals with process-lifetime cache. Fallback 18 on failure. */
+export async function getTokenDecimals(
+  client: WalletClient<Transport, Chain, Account> | PublicClient,
+  asset: Address,
+  wNative?: Address,
+): Promise<number> {
+  if (asset.toLowerCase() === wNative?.toLowerCase()) return 18;
+
+  const key = asset.toLowerCase();
+  const cached = decimalsCache.get(key);
+  if (cached !== undefined) return cached;
+
+  try {
+    const decimals = await readContract(client, {
+      address: asset,
+      abi: erc20Abi,
+      functionName: "decimals",
+    });
+    decimalsCache.set(key, decimals);
+    return decimals;
+  } catch {
+    return 18;
+  }
+}
+
+/** Prefill decimals cache (e.g. from Aave reserve config) to skip RPCs entirely. */
+export function primeTokenDecimals(asset: Address, decimals: number): void {
+  decimalsCache.set(asset.toLowerCase(), decimals);
+}
+
+/**
  * SECURITY (C2): Dynamic slippage margin for DEX swaps within the flash loan path.
  * Previously a flat 300 bps (3%) regardless of route. Now sized per the actual
  * venue used:
@@ -211,14 +248,7 @@ export async function checkProfit(
 
   if (loanAssetPriceUsd === undefined || gasPriceUsd === undefined) return false;
 
-  const loanAssetDecimals =
-    loanAsset === deps.wNative
-      ? 18
-      : await readContract(deps.client, {
-          address: loanAsset,
-          abi: erc20Abi,
-          functionName: "decimals",
-        });
+  const loanAssetDecimals = await getTokenDecimals(deps.client, loanAsset, deps.wNative);
 
   const loanAssetProfitUsd =
     parseFloat(formatUnits(loanAssetProfit, loanAssetDecimals)) * loanAssetPriceUsd;
@@ -327,14 +357,7 @@ export async function priceAsset(
   }
   if (price === undefined) return undefined;
 
-  const decimals =
-    asset === deps.wNative
-      ? 18
-      : await readContract(deps.client, {
-          address: asset,
-          abi: erc20Abi,
-          functionName: "decimals",
-        });
+  const decimals = await getTokenDecimals(deps.client, asset, deps.wNative);
 
   return parseFloat(formatUnits(amount, decimals)) * price;
 }

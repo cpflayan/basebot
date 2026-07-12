@@ -221,18 +221,60 @@ export class PositionCache {
   /**
    * Find all positions in a market with HF < threshold.
    * Uses cached oracle prices (may be slightly stale).
+   *
+   * Accrues market interest once per call (shared by all positions), instead of
+   * rebuilding Market + accrueInterest for every user.
    */
   findAtRiskPositions(
     marketId: Hex,
     threshold = 1,
     freshPrice?: bigint,
   ): { position: CachedPosition; hf: number }[] {
+    const mkt = this.markets.get(marketId);
+    if (!mkt) return [];
+
+    const price = freshPrice ?? mkt.price;
+    if (!price) return [];
+
+    const market = new Market({
+      params: mkt.params,
+      totalSupplyAssets: mkt.totalSupplyAssets,
+      totalSupplyShares: mkt.totalSupplyShares,
+      totalBorrowAssets: mkt.totalBorrowAssets,
+      totalBorrowShares: mkt.totalBorrowShares,
+      lastUpdate: mkt.lastUpdate,
+      fee: mkt.fee,
+      rateAtTarget: mkt.rateAtTarget,
+      price,
+    });
+
+    const now = BigInt(Math.floor(Date.now() / 1000));
+    const timestamp = now > market.lastUpdate ? now : market.lastUpdate;
+    const accruedMarket = market.accrueInterest(timestamp);
+
     const positions = this.getPositionsForMarket(marketId);
     const atRisk: { position: CachedPosition; hf: number }[] = [];
 
     for (const pos of positions) {
-      const hf = this.calculateHF(marketId, pos.user, freshPrice);
-      if (hf !== undefined && hf < threshold) {
+      if (pos.borrowShares === 0n) continue;
+
+      const accrualPos = new AccrualPosition(
+        {
+          user: pos.user,
+          supplyShares: pos.supplyShares,
+          borrowShares: pos.borrowShares,
+          collateral: pos.collateral,
+        },
+        accruedMarket,
+      );
+
+      const hfBigInt = accrualPos.healthFactor;
+      if (hfBigInt === undefined) continue;
+      // MaxUint256 means no debt → treat as Infinity (never at risk)
+      if (hfBigInt > 10n ** 30n) continue;
+
+      const hf = Number(hfBigInt) / 1e18;
+      if (hf < threshold) {
         atRisk.push({ position: pos, hf });
       }
     }
