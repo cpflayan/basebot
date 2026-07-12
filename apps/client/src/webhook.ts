@@ -10,13 +10,13 @@ import type { LiquidationBot } from "./bot.js";
  * - WithdrawCollateral: reduces collateral → lowers HF
  * - Withdraw: supply-side withdrawal, may affect market state
  */
-const MORPHO_EVENT_SIGNATURES = [
+export const MORPHO_EVENT_SIGNATURES = [
   "Borrow(bytes32,address,address,address,uint256,uint256)",
   "WithdrawCollateral(bytes32,address,address,address,uint256)",
   "Withdraw(bytes32,address,address,address,uint256,uint256)",
   "SupplyCollateral(bytes32,address,address,uint256)",
   "Repay(bytes32,address,address,address,uint256,uint256)",
-  "Liquidate(bytes32,address,address,address,uint256,uint256,uint256,uint256)",
+  "Liquidate(bytes32,address,address,uint256,uint256,uint256,uint256)",
 ] as const;
 
 /**

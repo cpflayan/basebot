@@ -17,7 +17,16 @@ import {
   loadApprovedMarketIds,
   ALWAYS_REALIZE_BAD_DEBT,
 } from "@morpho-blue-liquidation-bot/config";
-import { type Hex, getAddress, parseAbi, maxUint256, type Address, encodeFunctionData } from "viem";
+import {
+  type Hex,
+  getAddress,
+  parseAbi,
+  maxUint256,
+  type Address,
+  encodeFunctionData,
+  toEventSelector,
+  encodeAbiParameters,
+} from "viem";
 import { readContract } from "viem/actions";
 import { describe, expect, afterAll } from "vitest";
 
@@ -25,7 +34,7 @@ import { getHealthServer } from "../../src/health.js";
 import { calculateCloseFactor } from "../../src/utils/aaveAssetPairSelector.js";
 import { LiquidationEncoder } from "../../src/utils/LiquidationEncoder.js";
 import { liquidationTracker } from "../../src/utils/liquidationState.js";
-import { WebhookServer, decodeMorphoLog } from "../../src/webhook.js";
+import { WebhookServer, decodeMorphoLog, MORPHO_EVENT_SIGNATURES } from "../../src/webhook.js";
 import { aaveBaseForkTest } from "../setup.js";
 
 // ─── Base Chain Addresses ──────────────────────────────────────────────────────
@@ -55,6 +64,17 @@ const MARKET_ID_MORPHO =
   "0x8793cf302b8ffd655ab97bd1c695dbd967807e8367a65cb2f4edaf1380ba1bda" as Hex;
 
 const MARKET_PARAMS_MORPHO = [USDC, WETH, ORACLE_MORPHO, IRM_MORPHO, LLTV_MORPHO] as const;
+
+// Computed from the same signatures webhook.ts uses to build its topic0 filter set,
+// so these can never drift from the real event selectors.
+const [
+  BORROW_TOPIC0,
+  WITHDRAW_COLLATERAL_TOPIC0,
+  ,
+  SUPPLY_COLLATERAL_TOPIC0,
+  REPAY_TOPIC0,
+  LIQUIDATE_TOPIC0,
+] = MORPHO_EVENT_SIGNATURES.map((sig) => toEventSelector(sig));
 
 // ─── Mock Bytecodes ────────────────────────────────────────────────────────────
 
@@ -97,9 +117,11 @@ const morphoAbi = parseAbi([
 ]);
 const cometAbi = parseAbi([
   "function supply(address,uint256)",
-  "function borrow(uint256)",
+  "function withdraw(address,uint256)",
   "function isLiquidatable(address) view returns (bool)",
-  "function balanceOf(address) view returns (int256)",
+  "function balanceOf(address) view returns (uint256)",
+  "function borrowBalanceOf(address) view returns (uint256)",
+  "function collateralBalanceOf(address,address) view returns (uint128)",
   "function getPrice(address) view returns (uint256)",
   "function quote(address,uint256) view returns (uint256)",
 ]);
@@ -175,6 +197,17 @@ async function sendTx(client: any, from: Address, to: Address, data: Hex, value 
   ]);
   await rawRpc(client, "anvil_stopImpersonatingAccount", [from]);
   await rawRpc(client, "evm_mine", []);
+
+  // eth_sendTransaction only throws on pre-flight errors; a transaction that reverts
+  // during execution is still mined and still returns a hash. Check the receipt's
+  // status explicitly, or silent reverts get mistaken for success.
+  const receipt = await rawRpc(client, "eth_getTransactionReceipt", [hash]);
+  if (!receipt || receipt.status === "0x0") {
+    throw new Error(
+      `Transaction reverted (to=${to}, hash=${hash}, gasUsed=${receipt?.gasUsed ?? "?"})`,
+    );
+  }
+
   return hash;
 }
 
@@ -187,7 +220,8 @@ async function sendTxSilent(
 ): Promise<string | null> {
   try {
     return await sendTx(client, from, to, data, value);
-  } catch {
+  } catch (e: any) {
+    console.log(`[sendTxSilent] tx from=${from} to=${to} failed: ${e?.message ?? e}`);
     return null;
   }
 }
@@ -295,16 +329,40 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
         args: [WETH, 5n * 10n ** 18n],
       }),
     );
+    try {
+      const balAfterSupply = await readContract(client, {
+        address: COMET,
+        abi: cometAbi,
+        functionName: "balanceOf",
+        args: [SAFE_USER],
+      });
+      console.log(`[DEBUG] Comet SAFE_USER balance after supply(WETH, 5e18): ${balAfterSupply}`);
+    } catch (e: any) {
+      console.log(`[DEBUG] Comet SAFE_USER balance read after supply failed: ${e.message}`);
+    }
     await sendTxSilent(
       client,
       SAFE_USER,
       COMET,
       encodeFunctionData({
         abi: cometAbi,
-        functionName: "borrow",
-        args: [500n * 10n ** 6n],
+        functionName: "withdraw",
+        args: [USDC, 500n * 10n ** 6n],
       }),
     );
+    try {
+      const balAfterWithdraw = await readContract(client, {
+        address: COMET,
+        abi: cometAbi,
+        functionName: "balanceOf",
+        args: [SAFE_USER],
+      });
+      console.log(
+        `[DEBUG] Comet SAFE_USER balance after withdraw(USDC, 500e6): ${balAfterWithdraw}`,
+      );
+    } catch (e: any) {
+      console.log(`[DEBUG] Comet SAFE_USER balance read after withdraw failed: ${e.message}`);
+    }
 
     // LIQ: 1 WETH / 2000 USDC (within LTV)
     await sendTxSilent(
@@ -323,11 +381,30 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       COMET,
       encodeFunctionData({
         abi: cometAbi,
-        functionName: "borrow",
-        args: [2000n * 10n ** 6n],
+        functionName: "withdraw",
+        args: [USDC, 2000n * 10n ** 6n],
       }),
     );
     if (!cometLiqBorrow) console.log("[WARN] Comet LIQ borrow failed");
+    try {
+      const liqBalAfterWithdraw = await readContract(client, {
+        address: COMET,
+        abi: cometAbi,
+        functionName: "balanceOf",
+        args: [LIQ_USER],
+      });
+      const liqCollateral = await readContract(client, {
+        address: COMET,
+        abi: cometAbi,
+        functionName: "collateralBalanceOf",
+        args: [LIQ_USER, WETH],
+      });
+      console.log(
+        `[DEBUG] Comet LIQ_USER after withdraw(USDC, 2000e6): baseBalance=${liqBalAfterWithdraw}, collateral(WETH)=${liqCollateral}, txHash=${cometLiqBorrow}`,
+      );
+    } catch (e: any) {
+      console.log(`[DEBUG] Comet LIQ_USER balance read after withdraw failed: ${e.message}`);
+    }
 
     // ═══ Moonwell Positions ═══
     await sendTxSilent(
@@ -419,7 +496,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       }),
     );
 
-    // LIQ: 1 WETH / 5000 USDC
+    // LIQ: 1 WETH / 2000 USDC (within LTV at origination; oracle crash later makes it liquidatable)
     await sendTxSilent(
       client,
       LIQ_USER,
@@ -437,7 +514,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       encodeFunctionData({
         abi: aaveAbi,
         functionName: "borrow",
-        args: [USDC, 5000n * 10n ** 6n, 2n, 0, LIQ_USER],
+        args: [USDC, 2000n * 10n ** 6n, 2n, 0, LIQ_USER],
       }),
     );
 
@@ -506,6 +583,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("1.3 Config validation", "PASS", "Comet+Moonwell+Aave enabled");
     } catch (e: any) {
       recordResult("1.3 Config validation", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -522,6 +600,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       );
     } catch (e: any) {
       recordResult("1.4 Config loader", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -537,6 +616,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("1.7 Pricer missing", "PASS", "checkProfit returns false for empty pricers");
     } catch (e: any) {
       recordResult("1.7 Pricer missing", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -553,6 +633,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("1.10 Flashbots", "PASS", "Mainnet=true, Base=false");
     } catch (e: any) {
       recordResult("1.10 Flashbots", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -642,12 +723,21 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("2.5 Morpho safe HF>1", "PASS", "5 WETH / 500 USDC remains safe");
     } catch (e: any) {
       recordResult("2.5 Morpho safe HF>1", "FAIL", e.message);
+      throw e;
     }
   });
 
   aaveBaseForkTest.sequential("2.6 Morpho: Liquidatable after oracle crash", async ({ client }) => {
     await ensureSetup(client);
     try {
+      // Each test gets its own isolated fork (see @morpho-org/test), so the oracle
+      // manipulation done in 2.4 does NOT carry over here — redo it locally.
+      await rawRpc(client, "anvil_setCode", [ORACLE_MORPHO, MORPHO_ORACLE_BYTECODE]);
+      const crashedPrice = 1734059412971713800n;
+      const hexValue = ("0x" + crashedPrice.toString(16).padStart(64, "0")) as Hex;
+      const slot = ("0x" + "0".repeat(64)) as Hex;
+      await rawRpc(client, "anvil_setStorageAt", [ORACLE_MORPHO, slot, hexValue]);
+
       const price = await readContract(client, {
         address: ORACLE_MORPHO,
         abi: parseAbi(["function price() view returns (uint256)"]),
@@ -657,6 +747,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("2.6 Morpho liq after crash", "PASS", `oracle=${price}, LIQ HF<<1`);
     } catch (e: any) {
       recordResult("2.6 Morpho liq after crash", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -666,6 +757,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("2.7 Morpho direct path", "PASS", `Encoder at ${encoder.address}`);
     } catch (e: any) {
       recordResult("2.7 Morpho direct path", "FAIL", e.message);
+      throw e;
     }
 
     try {
@@ -675,6 +767,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("2.8 Morpho flash loan", "PASS", "Balancer enabled");
     } catch (e: any) {
       recordResult("2.8 Morpho flash loan", "FAIL", e.message);
+      throw e;
     }
 
     recordResult("2.9 Morpho slippage", "PASS", "FLASH_LOAN_SLIPPAGE_BPS=300 enforced");
@@ -688,16 +781,19 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
   aaveBaseForkTest.sequential("3.1 Comet: Safe position supply", async ({ client }) => {
     await ensureSetup(client);
     try {
+      // balanceOf() only reflects the base asset (USDC); WETH is supplied as
+      // collateral, so it must be checked via collateralBalanceOf, not balanceOf.
       const bal = await readContract(client, {
         address: COMET,
         abi: cometAbi,
-        functionName: "balanceOf",
-        args: [SAFE_USER],
+        functionName: "collateralBalanceOf",
+        args: [SAFE_USER, WETH],
       });
       expect(bal).toBeGreaterThan(0n);
-      recordResult("3.1 Comet safe supply", "PASS", `balance=${bal}`);
+      recordResult("3.1 Comet safe supply", "PASS", `collateralBalance=${bal}`);
     } catch (e: any) {
       recordResult("3.1 Comet safe supply", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -724,13 +820,14 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       const bal = await readContract(client, {
         address: COMET,
         abi: cometAbi,
-        functionName: "balanceOf",
+        functionName: "borrowBalanceOf",
         args: [LIQ_USER],
       });
-      expect(bal).toBeLessThan(0n); // negative = borrowed
-      recordResult("3.3 Comet LIQ borrowed", "PASS", `balance=${bal}`);
+      expect(bal).toBeGreaterThan(0n); // positive = has outstanding borrow
+      recordResult("3.3 Comet LIQ borrowed", "PASS", `borrowBalance=${bal}`);
     } catch (e: any) {
       recordResult("3.3 Comet LIQ borrowed", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -803,6 +900,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       );
     } catch (e: any) {
       recordResult("3.6 Comet safe at $1", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -815,6 +913,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("3.7 Comet absorb encode", "PASS", `${calls.length} call(s)`);
     } catch (e: any) {
       recordResult("3.7 Comet absorb encode", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -825,6 +924,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("3.8 Comet multi-asset", "PASS", `${comets!.length} markets`);
     } catch (e: any) {
       recordResult("3.8 Comet multi-asset", "FAIL", e.message);
+      throw e;
     }
     recordResult(
       "3.9 Comet profit check",
@@ -851,6 +951,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("4.1 Moonwell safe mWETH", "PASS", `mWETH=${mBal}`);
     } catch (e: any) {
       recordResult("4.1 Moonwell safe mWETH", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -867,6 +968,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("4.2 Moonwell safe shortfall", "PASS", `error=${error}, shortfall=${shortfall}`);
     } catch (e: any) {
       recordResult("4.2 Moonwell safe shortfall", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -946,6 +1048,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       );
     } catch (e: any) {
       recordResult("5.1 Aave safe position", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -962,6 +1065,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("5.2 Aave HF WAD", "PASS", `HF=${Number(data[5]) / 1e18}`);
     } catch (e: any) {
       recordResult("5.2 Aave HF WAD", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -977,6 +1081,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("5.3 Aave LIQ HF", "PASS", `HF=${Number(data[5]) / 1e18}`);
     } catch (e: any) {
       recordResult("5.3 Aave LIQ HF", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -1037,6 +1142,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       );
     } catch (e: any) {
       recordResult("5.6 Aave close factor", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -1047,6 +1153,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("5.7 Aave reserves", "PASS", `${reserves!.length} configured`);
     } catch (e: any) {
       recordResult("5.7 Aave reserves", "FAIL", e.message);
+      throw e;
     }
     recordResult("5.8 Aave cache", "PASS", "isActive/isFrozen cached");
     recordResult("5.9 Aave multicall", "PASS", "Batch 50 items");
@@ -1060,7 +1167,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
     try {
       const d = decodeMorphoLog({
         topics: [
-          "0x312a5e5e1079f5dda4e95dbbd0b908b291fd5b992ef22073643f331af5a21171",
+          BORROW_TOPIC0,
           MARKET_ID_MORPHO,
           "0x000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266",
           "0x000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266",
@@ -1072,6 +1179,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("6.1 Borrow decode", "PASS", `event=${d?.eventName}`);
     } catch (e: any) {
       recordResult("6.1 Borrow decode", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -1079,7 +1187,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
     try {
       const d = decodeMorphoLog({
         topics: [
-          "0xa3b0dc5630cc0e4e97455af284e32093a6cfb8cbb5e28c5b5a5e37e0c2e23cf0",
+          SUPPLY_COLLATERAL_TOPIC0,
           MARKET_ID_MORPHO,
           "0x000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266",
           "0x000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266",
@@ -1090,6 +1198,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("6.2 SupplyCollateral decode", "PASS", `event=${d?.eventName}`);
     } catch (e: any) {
       recordResult("6.2 SupplyCollateral decode", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -1097,7 +1206,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
     try {
       const d = decodeMorphoLog({
         topics: [
-          "0x30a38af1079f5dda4e95dbbd0b908b291fd5b992ef22073643f331af5a21171",
+          REPAY_TOPIC0,
           MARKET_ID_MORPHO,
           "0x000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266",
           "0x000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266",
@@ -1108,6 +1217,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("6.3 Repay decode", "PASS", `event=${d?.eventName}`);
     } catch (e: any) {
       recordResult("6.3 Repay decode", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -1115,35 +1225,51 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
     try {
       const d = decodeMorphoLog({
         topics: [
-          "0x3e485a8ab28ce22e6e30e83edb56e84eae8bbce40c202f26f8f76f0e5b8ff369",
+          WITHDRAW_COLLATERAL_TOPIC0,
           MARKET_ID_MORPHO,
           "0x000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266",
           "0x000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266",
         ],
-        data: "0x00000000000000000000000000000000000000000000000000038d7ea4c68000",
+        // 2 non-indexed params: caller (address), assets (uint256)
+        data: encodeAbiParameters(
+          [{ type: "address" }, { type: "uint256" }],
+          [SAFE_USER, 1000000000000000000n],
+        ),
       });
       expect(d?.eventName).toBe("WithdrawCollateral");
       recordResult("6.4 WithdrawCollateral decode", "PASS", `event=${d?.eventName}`);
     } catch (e: any) {
       recordResult("6.4 WithdrawCollateral decode", "FAIL", e.message);
+      throw e;
     }
   });
 
   aaveBaseForkTest.sequential("6.5 Webhook: Liquidate decode", () => {
     try {
+      // Liquidate only has 2 indexed params (id, liquidator) per the ABI, so only 3 topics total.
       const d = decodeMorphoLog({
         topics: [
-          "0x600b35cf0cc0e4e97455af284e32093a6cfb8cbb5e28c5b5a5e37e0c2e23cf0",
+          LIQUIDATE_TOPIC0,
           MARKET_ID_MORPHO,
           "0x000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266",
-          "0x000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266",
         ],
-        data: "0x0000000000000000000000000000000000000000000000000000000000000000",
+        // 5 non-indexed params: user, repayAssets, repayShares, seizedAssets, seizedShares
+        data: encodeAbiParameters(
+          [
+            { type: "address" },
+            { type: "uint256" },
+            { type: "uint256" },
+            { type: "uint256" },
+            { type: "uint256" },
+          ],
+          [SAFE_USER, 1000000n, 1000000n, 500000000000000000n, 500000000000000000n],
+        ),
       });
       expect(d?.eventName).toBe("Liquidate");
       recordResult("6.5 Liquidate decode", "PASS", `event=${d?.eventName}`);
     } catch (e: any) {
       recordResult("6.5 Liquidate decode", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -1168,6 +1294,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("6.7 Webhook health", "PASS", `bots=${json.registeredBots}`);
     } catch (e: any) {
       recordResult("6.7 Webhook health", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -1187,6 +1314,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("6.8 Invalid payload", "PASS", `reason=${json.reason}`);
     } catch (e: any) {
       recordResult("6.8 Invalid payload", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -1222,6 +1350,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("6.9 Non-Morpho filter", "PASS", `reason=${json.reason}`);
     } catch (e: any) {
       recordResult("6.9 Non-Morpho filter", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -1236,7 +1365,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
               logs: [
                 {
                   topics: [
-                    "0x312a5e5e1079f5dda4e95dbbd0b908b291fd5b992ef22073643f331af5a21171",
+                    BORROW_TOPIC0,
                     MARKET_ID_MORPHO,
                     "0x000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266",
                     "0x000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266",
@@ -1273,6 +1402,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("6.10 Cooldown", "PASS", "1st=true, 2nd=cooldown");
     } catch (e: any) {
       recordResult("6.10 Cooldown", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -1287,6 +1417,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("7.1 Discovery load", "PASS", `${approved.length} markets`);
     } catch (e: any) {
       recordResult("7.1 Discovery load", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -1312,6 +1443,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("8.1 preLiquidate", "PASS", `${calls[0]!.length} chars`);
     } catch (e: any) {
       recordResult("8.1 preLiquidate", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -1324,6 +1456,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("8.2 buyCollateral", "PASS", `${calls[0]!.length} chars`);
     } catch (e: any) {
       recordResult("8.2 buyCollateral", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -1338,6 +1471,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("8.3 Multi-call batch", "PASS", `${calls.length} calls`);
     } catch (e: any) {
       recordResult("8.3 Multi-call batch", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -1350,6 +1484,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("8.4 Aave liqCall", "PASS", `${calls[0]!.length} chars`);
     } catch (e: any) {
       recordResult("8.4 Aave liqCall", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -1368,6 +1503,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
         recordResult("8.5 Flash loan seq", "PASS", `${calls.length} calls batched`);
       } catch (e: any) {
         recordResult("8.5 Flash loan seq", "FAIL", e.message);
+        throw e;
       }
     },
   );
@@ -1385,6 +1521,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("9.1 LiquidationState import", "PASS", "singleton exported");
     } catch (e: any) {
       recordResult("9.1 LiquidationState import", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -1420,6 +1557,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("9.2 Cross-proto flow", "PASS", "amount+USD correct");
     } catch (e: any) {
       recordResult("9.2 Cross-proto flow", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -1445,6 +1583,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("9.3 Same-proto excluded", "PASS", "self=0, other=100");
     } catch (e: any) {
       recordResult("9.3 Same-proto excluded", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -1467,6 +1606,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("9.5 All bots report", "PASS", `${botFiles.length} bots call report()`);
     } catch (e: any) {
       recordResult("9.5 All bots report", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -1480,6 +1620,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("10.1 Config badDebt", "PASS", "ALWAYS_REALIZE_BAD_DEBT=false");
     } catch (e: any) {
       recordResult("10.1 Config badDebt", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -1491,6 +1632,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("10.2 Morpho pre-filter", "PASS", "guard present in bot.ts");
     } catch (e: any) {
       recordResult("10.2 Morpho pre-filter", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -1502,6 +1644,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       recordResult("10.3 Aave pre-filter", "PASS", "guard present in aaveBot.ts");
     } catch (e: any) {
       recordResult("10.3 Aave pre-filter", "FAIL", e.message);
+      throw e;
     }
   });
 
@@ -1520,6 +1663,7 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
         );
       } catch (e: any) {
         recordResult("10.4 Comet+Moonwell", "FAIL", e.message);
+        throw e;
       }
     },
   );
