@@ -33,6 +33,8 @@ import { readContract } from "viem/actions";
 import { oracleAbi } from "./abis/morpho/oracle.js";
 import { PositionCache, type CachedMarketState, type CachedPosition } from "./positionCache.js";
 import {
+  classifyLiquidationFailure,
+  type CooldownClass,
   MarketsFetchingCooldownMechanism,
   PositionLiquidationCooldownMechanism,
 } from "./utils/cooldownMechanisms.js";
@@ -41,13 +43,17 @@ import { logLiquidationDebug } from "./utils/liquidationDebug.js";
 import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
 import { liquidationTracker } from "./utils/liquidationState.js";
 import { DEFAULT_LIQUIDATION_BUFFER_BPS, WAD, wMulDown } from "./utils/maths.js";
+import { RaceMetrics, elapsedMs, nowMs } from "./utils/raceMetrics.js";
+import { shouldWarmRoutes } from "./utils/rpcBudget.js";
 import {
   type SharedExecutionDeps,
   TOKEN_BLACKLIST,
   convertCollateralToLoan as sharedConvertCollateralToLoan,
+  isLiquidationRaceLostError,
   priceAsset,
   simulateAndExec,
   simulateAndExecFlashLoanWithFallback,
+  warmVenueRouteCache,
 } from "./utils/sharedExecution.js";
 import type { DecodedMorphoEvent } from "./webhook.js";
 import "@morpho-org/blue-sdk-viem/lib/augment";
@@ -98,6 +104,8 @@ export class LiquidationBot {
   /** Interval for slow-path full refresh (ms). Default: 5 minutes */
   private cacheRefreshInterval: number;
   private cacheRefreshTimer?: ReturnType<typeof setInterval>;
+  private raceMetrics = new RaceMetrics(20);
+  private slowPathTicks = 0;
 
   // ─── Health & monitoring stats ───
   private _liquidationsAttempted = 0;
@@ -250,6 +258,38 @@ export class LiquidationBot {
 
     // Save snapshot after successful initialization
     this.positionCache.saveToFile(cachePath);
+
+    // Prefill DEX route cache for unique (collateral, loan) pairs in covered markets
+    await this.warmDexRoutes();
+  }
+
+  /** Warm local-DEX routes for Morpho market pairs (process-lifetime venue cache). */
+  private async warmDexRoutes(): Promise<void> {
+    if (!shouldWarmRoutes()) {
+      console.log(`${this.logTag}🔥 DEX warm skipped (SKIP_ROUTE_WARM=1)`);
+      return;
+    }
+    const pairKeys = new Set<string>();
+    const pairs: { src: Address; dst: Address }[] = [];
+    for (const marketId of this.coveredMarkets) {
+      const m = this.positionCache.getMarket(marketId);
+      if (!m) continue;
+      const src = getAddress(m.params.collateralToken);
+      const dst = getAddress(m.params.loanToken);
+      const key = `${src.toLowerCase()}->${dst.toLowerCase()}`;
+      if (pairKeys.has(key)) continue;
+      pairKeys.add(key);
+      pairs.push({ src, dst });
+    }
+    if (pairs.length === 0) return;
+    console.log(`${this.logTag}🔥 Warming ${pairs.length} Morpho DEX routes (prefer local AMM)…`);
+    try {
+      await warmVenueRouteCache(this.sharedDeps, pairs);
+    } catch (e) {
+      console.warn(
+        `${this.logTag}⚠️ DEX warm failed (non-fatal): ${e instanceof Error ? e.message : e}`,
+      );
+    }
   }
 
   /**
@@ -520,10 +560,15 @@ export class LiquidationBot {
 
   async run() {
     this._lastCheckTimestamp = Math.floor(Date.now() / 1000);
+    this.slowPathTicks += 1;
+    const t0 = nowMs();
+
     await this.fetchMarkets();
 
+    const tFetch = nowMs();
     const { liquidatablePositions, preLiquidatablePositions } =
       await this.dataProvider.fetchLiquidatablePositions(this.client, this.coveredMarkets);
+    const fetchMs = elapsedMs(tFetch);
 
     // Update cache with fresh data
     for (const pos of liquidatablePositions) {
@@ -545,6 +590,19 @@ export class LiquidationBot {
       return bProfit > aProfit ? 1 : bProfit < aProfit ? -1 : 0;
     });
 
+    this.raceMetrics.onTick({
+      logTag: this.logTag,
+      mode: "full",
+      accounts: liquidatablePositions.length,
+      hot: liquidatablePositions.length,
+      liquidatable: liquidatablePositions.length,
+      hfScanMs: fetchMs,
+    });
+
+    console.log(
+      `${this.logTag}[RaceTick] slow-path fetchMs=${fetchMs} liquidatable=${liquidatablePositions.length} preLiq=${preLiquidatablePositions.length} totalMs=${elapsedMs(t0)}`,
+    );
+
     // Serial execution to ensure high-value positions are prioritized
     for (const position of liquidatablePositions) {
       await this.liquidate(position);
@@ -556,12 +614,15 @@ export class LiquidationBot {
 
   private async liquidate(position: AccrualPosition) {
     const marketParams = position.market.params;
+    const marketId = MarketUtils.getMarketId(marketParams);
+    const tTotal = nowMs();
 
     // SECURITY: Skip markets involving blacklisted tokens
     if (
       TOKEN_BLACKLIST.has(marketParams.loanToken.toLowerCase()) ||
       TOKEN_BLACKLIST.has(marketParams.collateralToken.toLowerCase())
     ) {
+      this.raceMetrics.recordOutcome("skip_blacklist");
       logLiquidationDebug({
         protocol: this.logTag,
         account: position.user,
@@ -578,7 +639,7 @@ export class LiquidationBot {
         decision: "skip",
         reason: "Blacklisted token in market",
         details: {
-          marketId: MarketUtils.getMarketId(marketParams),
+          marketId,
           loanTokenBlacklisted: TOKEN_BLACKLIST.has(marketParams.loanToken.toLowerCase()),
           collateralTokenBlacklisted: TOKEN_BLACKLIST.has(
             marketParams.collateralToken.toLowerCase(),
@@ -591,11 +652,9 @@ export class LiquidationBot {
     const seizableCollateral = position.seizableCollateral ?? 0n;
     const badDebtPosition = seizableCollateral === position.collateral;
 
-    // Bad debt pre-filter: skip early if collateral value < debt and we don't realize bad debt.
-    // Avoids wasting gas on simulation — and wasting a cooldown slot — for positions that
-    // can't be profitable. Runs BEFORE the cooldown check so these positions never
-    // trip the cooldown timer.
+    // Bad debt pre-filter — before cooldown so underwater never arms the timer
     if (!this.alwaysRealizeBadDebt && badDebtPosition) {
+      this.raceMetrics.recordOutcome("skip_bad_debt");
       logLiquidationDebug({
         protocol: this.logTag,
         account: position.user,
@@ -614,7 +673,7 @@ export class LiquidationBot {
         decision: "skip",
         reason: "Bad debt position (collateral fully seizable, no liquidation bonus)",
         details: {
-          marketId: MarketUtils.getMarketId(marketParams),
+          marketId,
           alwaysRealizeBadDebt: this.alwaysRealizeBadDebt,
           note: "Position is underwater and bot is configured to skip bad debt",
         },
@@ -622,9 +681,9 @@ export class LiquidationBot {
       return;
     }
 
-    // Cooldown check — only reached once we've decided this position is actually worth
-    // attempting, so the cooldown timer only ever reflects a real attempt.
-    if (!this.checkCooldown(MarketUtils.getMarketId(marketParams), position.user)) {
+    // Peek only — arm after real attempt (graded race/soft/hard)
+    if (this.isCoolingDown(marketId, position.user)) {
+      this.raceMetrics.recordOutcome("skip_cooldown");
       logLiquidationDebug({
         protocol: this.logTag,
         account: position.user,
@@ -643,7 +702,7 @@ export class LiquidationBot {
         decision: "skip",
         reason: "Position is in cooldown period",
         details: {
-          marketId: MarketUtils.getMarketId(marketParams),
+          marketId,
           note: "Recently attempted liquidation, waiting before retry",
         },
       });
@@ -669,7 +728,7 @@ export class LiquidationBot {
       decision: "liquidate",
       reason: "All checks passed, proceeding with liquidation",
       details: {
-        marketId: MarketUtils.getMarketId(marketParams),
+        marketId,
         useFlashLoan: this.useFlashLoan,
         alwaysRealizeBadDebt: this.alwaysRealizeBadDebt,
       },
@@ -683,6 +742,7 @@ export class LiquidationBot {
 
     if (this.useFlashLoan) {
       await this.liquidateWithFlashLoan(position, badDebtPosition);
+      this.raceMetrics.recordStage("totalLiq", elapsedMs(tTotal));
       return;
     }
 
@@ -695,14 +755,24 @@ export class LiquidationBot {
 
     const encoder = new LiquidationEncoder(executorAddress, client);
 
-    const { success: directSwapSuccess } = await sharedConvertCollateralToLoan(
+    const swap = await sharedConvertCollateralToLoan(
       this.sharedDeps,
       getAddress(marketParams.collateralToken),
       getAddress(marketParams.loanToken),
       this.decreaseSeizableCollateral(seizableCollateral, badDebtPosition),
       encoder,
+      { preferLocalDex: true },
     );
-    if (!directSwapSuccess) return;
+    this.recordConvertMetrics(swap);
+    if (!swap.success) {
+      this._liquidationsFailed++;
+      this.armCooldown(marketId, position.user, "soft", "no DEX route", "skip_no_route");
+      console.log(
+        `${this.logTag}No DEX route for ${marketParams.collateralToken} -> ${marketParams.loanToken}, skip direct`,
+      );
+      this.raceMetrics.recordStage("totalLiq", elapsedMs(tTotal));
+      return;
+    }
 
     // Only approve if allowance is insufficient (saves ~5k-21k gas per tx)
     const morphoAddress = this.chainAddresses.morpho;
@@ -735,6 +805,7 @@ export class LiquidationBot {
     const calls = encoder.flush();
 
     try {
+      const tSim = nowMs();
       const success = await simulateAndExec(
         this.sharedDeps,
         encoder,
@@ -745,9 +816,14 @@ export class LiquidationBot {
         undefined,
         getAddress(marketParams.collateralToken),
       );
+      this.raceMetrics.recordStage("simExec", elapsedMs(tSim));
+      console.log(
+        `${this.logTag}[LiqTiming] direct user=${position.user.slice(0, 10)}… simExecMs=${elapsedMs(tSim)} ok=${success}`,
+      );
 
       if (success) {
         this._liquidationsSucceeded++;
+        this.armCooldown(marketId, position.user, "success");
         const collateralUsd =
           (await priceAsset(
             this.sharedDeps,
@@ -761,22 +837,19 @@ export class LiquidationBot {
           collateralUsdEstimate: collateralUsd,
           timestamp: Date.now(),
         });
-        console.log(
-          `${this.logTag}Liquidated ${position.user} on ${MarketUtils.getMarketId(marketParams)}`,
-        );
+        console.log(`${this.logTag}Liquidated ${position.user} on ${marketId}`);
       } else {
-        console.log(
-          `${this.logTag}ℹ️ Skipped ${position.user} on ${MarketUtils.getMarketId(marketParams)} (not profitable)`,
-        );
+        this._liquidationsFailed++;
+        this.armCooldown(marketId, position.user, "soft", "not profitable");
+        console.log(`${this.logTag}ℹ️ Skipped ${position.user} on ${marketId} (not profitable)`);
       }
     } catch (error) {
       this._liquidationsFailed++;
       this._lastError = String(error);
-      console.error(
-        `${this.logTag}Failed to liquidate ${position.user} on ${MarketUtils.getMarketId(marketParams)}`,
-        error,
-      );
+      this.armCooldownFromError(marketId, position.user, error);
+      console.error(`${this.logTag}Failed to liquidate ${position.user} on ${marketId}`, error);
     }
+    this.raceMetrics.recordStage("totalLiq", elapsedMs(tTotal));
   }
 
   /**
@@ -792,6 +865,7 @@ export class LiquidationBot {
    */
   private async liquidateWithFlashLoan(position: AccrualPosition, badDebtPosition: boolean) {
     const marketParams = position.market.params;
+    const marketId = MarketUtils.getMarketId(marketParams);
     const seizableCollateral = position.seizableCollateral ?? 0n;
     const { client, executorAddress } = this;
 
@@ -799,40 +873,27 @@ export class LiquidationBot {
     const flashLoanAmount = position.borrowAssets ?? 0n;
     if (flashLoanAmount === 0n) return;
 
-    // DEBUG: Log liquidation parameters
     console.log(
       `${this.logTag}[FlashLoan Debug] ${position.user}: flashLoanAmount=${flashLoanAmount}, seizableCollateral=${seizableCollateral}, collateral=${position.collateral}, collateralValue=${position.collateralValue ?? "undefined"}, badDebt=${badDebtPosition}`,
     );
 
-    // ── Profitability pre-filter ──
-    // Position is already confirmed liquidatable (HF < 1) by the data provider.
-    // HF = (collateralValue × LLTV) / borrowAssets, so HF < 1 means:
-    //   collateralValue < borrowAssets / LLTV
-    // But collateralValue can still EXCEED borrowAssets (since LLTV < 1).
-    //
-    // Truly profitable: HF < 1 (liquidatable) AND collateralValue > debt.
-    //   → You borrow `debt` via flash loan, seize collateral worth MORE than debt,
-    //     swap it, repay flash loan, keep the difference.
-    //
-    // Bad debt (unprofitable): collateralValue < debt.
-    //   → Seized collateral won't cover the flash loan, skip.
+    // ── Profitability pre-filter (collateral value vs debt) ──
     const collateralValue = position.collateralValue;
     if (collateralValue !== undefined) {
       if (collateralValue < flashLoanAmount) {
+        this.raceMetrics.recordOutcome("skip_bad_debt");
         console.log(
           `${this.logTag}[FlashLoan] Skip ${position.user}: bad debt — collateral value (${collateralValue}) < debt (${flashLoanAmount})`,
         );
         return;
       }
 
-      // Proportional seizable value: the loan-token value of collateral we can
-      // actually seize. Must exceed the flash loan amount (debt) to be profitable.
-      // seizableValue = collateralValue × (seizableCollateral / totalCollateral)
       const totalCollateral = position.collateral;
       const seizableValue =
         totalCollateral > 0n ? (collateralValue * seizableCollateral) / totalCollateral : 0n;
 
       if (seizableValue < flashLoanAmount) {
+        this.raceMetrics.recordOutcome("fail_soft_profit");
         console.log(
           `${this.logTag}[FlashLoan] Skip ${position.user}: seizable value (${seizableValue}) < debt (${flashLoanAmount}) — not enough collateral to seize for profit`,
         );
@@ -840,35 +901,36 @@ export class LiquidationBot {
       }
     }
 
-    // Step 1: Build DEX swap calls (collateral → loan token)
-    // These are built on a temporary encoder to capture the raw calls
+    // Step 1: Build DEX swap (local AMM first)
     const tempEncoder = new LiquidationEncoder(executorAddress, client);
-    const { success: swapSuccess, impactBps: venueImpactBps } = await sharedConvertCollateralToLoan(
+    const swap = await sharedConvertCollateralToLoan(
       this.sharedDeps,
       getAddress(marketParams.collateralToken),
       getAddress(marketParams.loanToken),
       this.decreaseSeizableCollateral(seizableCollateral, badDebtPosition),
       tempEncoder,
+      { preferLocalDex: true },
     );
+    this.recordConvertMetrics(swap);
 
-    if (!swapSuccess) {
+    if (!swap.success) {
+      this._liquidationsFailed++;
+      this.armCooldown(marketId, position.user, "soft", "no DEX route", "skip_no_route");
       console.log(
         `${this.logTag}No DEX route for ${marketParams.collateralToken} -> ${marketParams.loanToken}, skipping flash loan liquidation`,
       );
       return;
     }
 
+    const venueImpactBps = swap.impactBps;
     const dexSwapCalls = tempEncoder.flush();
     console.log(
-      `${this.logTag}[FlashLoan Debug] DEX route found: ${dexSwapCalls.length} swap call(s) for ${marketParams.collateralToken.slice(0, 10)}... -> ${marketParams.loanToken.slice(0, 10)}...`,
+      `${this.logTag}[FlashLoan Debug] DEX route via=${swap.via} ${swap.elapsedMs ?? "?"}ms: ${dexSwapCalls.length} swap call(s)`,
     );
 
-    // Step 2: Build flash loan callback calls on a temp encoder.
-    // These execute INSIDE the Balancer callback, BEFORE the auto-appended repayment transfers.
-    // Order: approve → liquidate → DEX swap → skim profit to treasury
+    // Step 2: Build flash loan callback
     const callbackEncoder = new LiquidationEncoder(executorAddress, client);
 
-    // Only approve if allowance is insufficient (saves ~5k-21k gas per tx)
     const currentAllowance = await readContract(this.client, {
       address: marketParams.loanToken,
       abi: erc20Abi,
@@ -893,25 +955,17 @@ export class LiquidationBot {
       callbackEncoder.flush(),
     );
 
-    // Add DEX swap calls after liquidation
-    // SECURITY (C2): DEX swap currently has no explicit minAmountOut at the venue level.
-    // The erc20Skim to treasury captures whatever remains, acting as an implicit floor.
-    // For full sandwich-attack protection, the executor contract should enforce minAmountOut
-    // on the swap. Until then, the simulation-based profit check in handleFlashLoanSimulationAndExec
-    // provides a pre-execution safety net.
     for (const call of dexSwapCalls) {
       callbackEncoder.pushCall(executorAddress, 0n, call);
     }
 
-    // Skim profit to treasury — MUST be inside callback, before Vault repayment
-    // (erc20Skim uses a dynamic balance placeholder, so it transfers whatever the
-    //  executor holds AFTER swap but BEFORE the auto-appended repayment transfers)
     callbackEncoder.erc20Skim(marketParams.loanToken, this.treasuryAddress);
 
     const callbackCalls = callbackEncoder.flush();
 
-    // Step 3: Wrap with flash loan (with fallback providers) and simulate + execute.
+    // Step 3: simulate + execute
     try {
+      const tSim = nowMs();
       const success = await simulateAndExecFlashLoanWithFallback(
         this.sharedDeps,
         callbackCalls,
@@ -919,12 +973,18 @@ export class LiquidationBot {
         badDebtPosition,
         flashLoanAmount,
         getAddress(marketParams.collateralToken),
-        undefined, // cachedGasPrice
+        undefined,
         venueImpactBps,
+      );
+      const simMs = elapsedMs(tSim);
+      this.raceMetrics.recordStage("simExec", simMs);
+      console.log(
+        `${this.logTag}[LiqTiming] flash user=${position.user.slice(0, 10)}… simExecMs=${simMs} ok=${success}`,
       );
 
       if (success) {
         this._liquidationsSucceeded++;
+        this.armCooldown(marketId, position.user, "success");
         const collateralUsd =
           (await priceAsset(
             this.sharedDeps,
@@ -938,19 +998,20 @@ export class LiquidationBot {
           collateralUsdEstimate: collateralUsd,
           timestamp: Date.now(),
         });
-        console.log(
-          `${this.logTag}[FlashLoan] Liquidated ${position.user} on ${MarketUtils.getMarketId(marketParams)}`,
-        );
+        console.log(`${this.logTag}[FlashLoan] Liquidated ${position.user} on ${marketId}`);
       } else {
+        this._liquidationsFailed++;
+        this.armCooldown(marketId, position.user, "soft", "not profitable");
         console.log(
-          `${this.logTag}[FlashLoan] Skipped ${position.user} on ${MarketUtils.getMarketId(marketParams)} (not profitable)`,
+          `${this.logTag}[FlashLoan] Skipped ${position.user} on ${marketId} (not profitable)`,
         );
       }
     } catch (error) {
       this._liquidationsFailed++;
       this._lastError = String(error);
+      this.armCooldownFromError(marketId, position.user, error);
       console.error(
-        `${this.logTag}[FlashLoan] Failed to liquidate ${position.user} on ${MarketUtils.getMarketId(marketParams)}`,
+        `${this.logTag}[FlashLoan] Failed to liquidate ${position.user} on ${marketId}`,
         error,
       );
     }
@@ -970,12 +1031,16 @@ export class LiquidationBot {
       return;
     }
 
+    const marketId = MarketUtils.getMarketId(marketParams);
     const seizableCollateral = this.decreaseSeizableCollateral(
       position.seizableCollateral ?? 0n,
       false,
     );
 
-    if (!this.checkCooldown(MarketUtils.getMarketId(marketParams), position.user)) return;
+    if (this.isCoolingDown(marketId, position.user)) {
+      this.raceMetrics.recordOutcome("skip_cooldown");
+      return;
+    }
 
     this._liquidationsAttempted++;
 
@@ -983,14 +1048,20 @@ export class LiquidationBot {
 
     const encoder = new LiquidationEncoder(executorAddress, client);
 
-    const { success: preLiqSwapSuccess } = await sharedConvertCollateralToLoan(
+    const swap = await sharedConvertCollateralToLoan(
       this.sharedDeps,
       getAddress(marketParams.collateralToken),
       getAddress(marketParams.loanToken),
       seizableCollateral,
       encoder,
+      { preferLocalDex: true },
     );
-    if (!preLiqSwapSuccess) return;
+    this.recordConvertMetrics(swap);
+    if (!swap.success) {
+      this._liquidationsFailed++;
+      this.armCooldown(marketId, position.user, "soft", "no DEX route", "skip_no_route");
+      return;
+    }
 
     // Only approve if allowance is insufficient (saves ~5k-21k gas per tx)
     const currentAllowance = await readContract(this.client, {
@@ -1015,6 +1086,7 @@ export class LiquidationBot {
     const calls = encoder.flush();
 
     try {
+      const tSim = nowMs();
       const success = await simulateAndExec(
         this.sharedDeps,
         encoder,
@@ -1025,9 +1097,11 @@ export class LiquidationBot {
         undefined,
         getAddress(marketParams.collateralToken),
       );
+      this.raceMetrics.recordStage("simExec", elapsedMs(tSim));
 
       if (success) {
         this._liquidationsSucceeded++;
+        this.armCooldown(marketId, position.user, "success");
         const collateralUsd =
           (await priceAsset(
             this.sharedDeps,
@@ -1041,21 +1115,17 @@ export class LiquidationBot {
           collateralUsdEstimate: collateralUsd,
           timestamp: Date.now(),
         });
-        console.log(
-          `${this.logTag}Pre-liquidated ${position.user} on ${MarketUtils.getMarketId(marketParams)}`,
-        );
+        console.log(`${this.logTag}Pre-liquidated ${position.user} on ${marketId}`);
       } else {
-        console.log(
-          `${this.logTag}ℹ️ Skipped ${position.user} on ${MarketUtils.getMarketId(marketParams)} (not profitable)`,
-        );
+        this._liquidationsFailed++;
+        this.armCooldown(marketId, position.user, "soft", "not profitable");
+        console.log(`${this.logTag}ℹ️ Skipped ${position.user} on ${marketId} (not profitable)`);
       }
     } catch (error) {
       this._liquidationsFailed++;
       this._lastError = String(error);
-      console.error(
-        `${this.logTag}Failed to pre-liquidate ${position.user} on ${MarketUtils.getMarketId(marketParams)}`,
-        error,
-      );
+      this.armCooldownFromError(marketId, position.user, error);
+      console.error(`${this.logTag}Failed to pre-liquidate ${position.user} on ${marketId}`, error);
     }
   }
 
@@ -1068,14 +1138,64 @@ export class LiquidationBot {
     return wMulDown(seizableCollateral, WAD - parseUnits(liquidationBufferBps.toString(), 14));
   }
 
-  private checkCooldown(marketId: Hex, account: Address) {
-    if (
-      this.positionLiquidationCooldownMechanism !== undefined &&
-      !this.positionLiquidationCooldownMechanism.isPositionReady(marketId, account)
-    ) {
-      return false;
+  private isCoolingDown(marketId: Hex, account: Address): boolean {
+    return this.positionLiquidationCooldownMechanism?.isCoolingDown(marketId, account) ?? false;
+  }
+
+  private armCooldown(
+    marketId: Hex,
+    account: Address,
+    cls: CooldownClass,
+    detail?: string,
+    metricsOutcome?: "success" | "fail_race" | "fail_soft_profit" | "fail_hard" | "skip_no_route",
+  ): void {
+    if (metricsOutcome) {
+      this.raceMetrics.recordOutcome(metricsOutcome);
+    } else if (cls === "race") {
+      this.raceMetrics.recordOutcome("fail_race");
+    } else if (cls === "soft") {
+      this.raceMetrics.recordOutcome("fail_soft_profit");
+    } else if (cls === "success") {
+      this.raceMetrics.recordOutcome("success");
+    } else if (cls === "hard") {
+      this.raceMetrics.recordOutcome("fail_hard");
     }
-    return true;
+
+    if (!this.positionLiquidationCooldownMechanism) return;
+    const seconds = this.positionLiquidationCooldownMechanism.markClass(marketId, account, cls);
+    console.log(
+      `${this.logTag}⏳ Cooldown ${cls} ${seconds}s for ${account.slice(0, 10)}…` +
+        (detail ? ` (${detail.slice(0, 100)})` : ""),
+    );
+  }
+
+  private armCooldownFromError(marketId: Hex, account: Address, error: unknown): void {
+    if (isLiquidationRaceLostError(error) || classifyLiquidationFailure(error) === "race") {
+      this.armCooldown(
+        marketId,
+        account,
+        "race",
+        error instanceof Error ? error.message : String(error),
+      );
+      return;
+    }
+    const cls = classifyLiquidationFailure(error);
+    this.armCooldown(
+      marketId,
+      account,
+      cls,
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+
+  private recordConvertMetrics(swap: { success: boolean; via?: string; elapsedMs?: number }): void {
+    const ms = swap.elapsedMs ?? 0;
+    const via = !swap.success
+      ? "fail"
+      : swap.via === "cache" || swap.via === "probe" || swap.via === "same"
+        ? swap.via
+        : "probe";
+    this.raceMetrics.recordConvert(ms, via);
   }
 
   private async fetchMarkets() {
@@ -1131,6 +1251,7 @@ export class LiquidationBot {
       rpcErrorRate,
       lastError: this._lastError,
       isHealthy: rpcErrorRate < 0.3,
+      raceMetrics: this.raceMetrics.snapshot(),
     };
   }
 }

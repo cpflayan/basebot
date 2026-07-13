@@ -81,7 +81,22 @@ export interface AaveWatchlistConfig {
   poolAddress: Address;
   poolDeployBlock: number;
   reserves: Address[];
+  /** Fast path cadence (hot / near-liq accounts). Default 1 = every block. */
   pollIntervalBlocks?: number;
+  /**
+   * Full-registry HF scan every N fast ticks (default 10).
+   * Hot accounts (last HF below nearHealthFactor) are rechecked every pollIntervalBlocks.
+   */
+  fullScanIntervalBlocks?: number;
+  /**
+   * Accounts with last observed HF below this (as float, e.g. 1.05) join the hot set.
+   * Default 1.05 — prioritizes near-liquidation races.
+   */
+  nearHealthFactor?: number;
+  /** Multicall batch size for getUserAccountData (default 100 with paid RPCs). */
+  hfBatchSize?: number;
+  /** Concurrent multicall shards across the paid read pool (default = pool size or 4). */
+  hfConcurrency?: number;
   /** Safety margin above 1e18 to start evaluating — avoids wasting RPC calls on nearly-healthy accounts */
   minHealthFactorBuffer?: bigint;
   /** Slippage tolerance for DEX swaps in bps (default: 100 = 1%) */

@@ -70,12 +70,11 @@ export const COMET_SHARED = {
 
 export const cometViewAbi = [
   {
+    // Compound V3 Comet: isLiquidatable(address) returns a single bool
+    // (ABI previously wrongly listed a second uint256 — multicall decode could fail).
     inputs: [{ name: "account", type: "address" }],
     name: "isLiquidatable",
-    outputs: [
-      { name: "", type: "bool" },
-      { name: "", type: "uint256" },
-    ],
+    outputs: [{ name: "", type: "bool" }],
     stateMutability: "view",
     type: "function",
   },

@@ -44,11 +44,27 @@ import {
   type LiquidationPair,
   type ReserveConfig,
 } from "./utils/aaveAssetPairSelector.js";
-import { PositionLiquidationCooldownMechanism } from "./utils/cooldownMechanisms.js";
+import {
+  classifyLiquidationFailure,
+  type CooldownClass,
+  PositionLiquidationCooldownMechanism,
+} from "./utils/cooldownMechanisms.js";
 import { findDeployBlock } from "./utils/findDeployBlock.js";
 import { logLiquidationDebug } from "./utils/liquidationDebug.js";
 import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
 import { liquidationTracker } from "./utils/liquidationState.js";
+import { RaceMetrics, elapsedMs, nowMs } from "./utils/raceMetrics.js";
+import { ensureRegistryDataDir, resolveAccountRegistryPath } from "./utils/registryPaths.js";
+import {
+  defaultHfBatchSize,
+  defaultHfConcurrency,
+  resolveAaveFullScanInterval,
+  resolveAaveNearHealthFactor,
+  routeWarmMaxMajors,
+  rpcWaveGapMs,
+  shouldWarmRoutes,
+  sleep,
+} from "./utils/rpcBudget.js";
 import { createScanClient, ReadClientPool } from "./utils/rpcFallback.js";
 import {
   type SharedExecutionDeps,
@@ -57,8 +73,10 @@ import {
   SharedBlockBus,
   priceAsset,
   primeTokenDecimals,
+  isLiquidationRaceLostError,
   simulateAndExecFlashLoanWithFallback,
   simulateAndExec,
+  warmVenueRouteCache,
 } from "./utils/sharedExecution.js";
 
 export interface AaveLiquidationBotInputs {
@@ -103,6 +121,12 @@ export class AaveLiquidationBot {
   private alwaysRealizeBadDebt: boolean;
   private registry: AaveAccountRegistry;
   private pollIntervalBlocks: number;
+  /** Full-registry scan every N poll ticks (hot set runs every tick). */
+  private fullScanIntervalBlocks: number;
+  /** HF below this (WAD) → account stays on the every-block hot set. */
+  private nearHealthFactorWad: bigint;
+  private hfBatchSize: number;
+  private hfConcurrency: number;
   private minHealthFactorBuffer: bigint;
   private sharedDeps: SharedExecutionDeps;
   /** Read-only client using Base public RPC — for historical event scanning only */
@@ -113,6 +137,11 @@ export class AaveLiquidationBot {
   private tokenBlacklist: Set<string>;
   /** Cached reserve configs (liquidationBonus, decimals) — avoids repeated RPC calls */
   private cachedReserveConfigs = new Map<string, ReserveConfig>();
+  /** Last observed HF per account (lowercase) — drives hot-set prioritization. */
+  private lastHealthFactor = new Map<string, bigint>();
+  private pollTick = 0;
+  /** Aggregated race timings + outcome counters (flushed every ~20 ticks). */
+  private raceMetrics = new RaceMetrics(20);
 
   // ─── Health & monitoring stats ───
   private _liquidationsAttempted = 0;
@@ -143,7 +172,18 @@ export class AaveLiquidationBot {
     this.flashLoanProvider = inputs.flashLoanProvider ?? "balancer";
     this.flashLoanFallbackProviders = inputs.flashLoanFallbackProviders ?? [];
     this.alwaysRealizeBadDebt = inputs.alwaysRealizeBadDebt ?? false;
-    this.pollIntervalBlocks = inputs.aaveWatchlist.pollIntervalBlocks ?? 5;
+    this.pollIntervalBlocks = inputs.aaveWatchlist.pollIntervalBlocks ?? 1;
+    // Env wins over config (ops can tune without rebuild) — see rpcBudget.ts
+    this.fullScanIntervalBlocks = resolveAaveFullScanInterval(
+      inputs.aaveWatchlist.fullScanIntervalBlocks,
+    );
+    const nearHf = resolveAaveNearHealthFactor(inputs.aaveWatchlist.nearHealthFactor);
+    this.nearHealthFactorWad = BigInt(Math.floor(nearHf * 1e18));
+    this.hfBatchSize = defaultHfBatchSize(100, inputs.aaveWatchlist.hfBatchSize);
+    this.hfConcurrency = defaultHfConcurrency(
+      inputs.paidReadPool.size,
+      inputs.aaveWatchlist.hfConcurrency,
+    );
     this.minHealthFactorBuffer = inputs.aaveWatchlist.minHealthFactorBuffer ?? 0n;
 
     // Merge default + config token blacklists
@@ -154,7 +194,10 @@ export class AaveLiquidationBot {
       }
     }
 
-    const registryPath = inputs.registryFilePath ?? `./data/aave-accounts.${inputs.chainId}.json`;
+    // Prefer explicit path; else ACCOUNT_REGISTRY_DIR / REGISTRY_DATA_DIR / DATA_DIR / ./data
+    ensureRegistryDataDir();
+    const registryPath =
+      inputs.registryFilePath ?? resolveAccountRegistryPath(`aave-accounts.${inputs.chainId}.json`);
     this.registry = new AaveAccountRegistry(registryPath);
 
     this.sharedDeps = {
@@ -173,27 +216,138 @@ export class AaveLiquidationBot {
       morphoAddress: getChainAddresses(this.chainId).morpho,
     };
 
-    // Read-only client for historical scanning — uses paid Alchemy RPC for better rate limits
-    const paidRpcUrl = process.env.RPC_URL_BASE;
-    const scanRpcUrls = paidRpcUrl
-      ? [paidRpcUrl, "https://mainnet.base.org"]
-      : ["https://mainnet.base.org"];
+    // Read-only client for historical / incremental event scanning
+    // Prefer config.scanRpcUrls (RPC_URL_BASE + BASE2..7); fall back to primary + public
+    const fromInputs = (inputs.scanRpcUrls ?? []).filter(Boolean);
+    const scanRpcUrls =
+      fromInputs.length > 0
+        ? fromInputs
+        : [
+            process.env.RPC_URL_BASE,
+            process.env.RPC_URL_BASE2,
+            process.env.RPC_URL_BASE3,
+            process.env.RPC_URL_BASE4,
+            process.env.RPC_URL_BASE5,
+            process.env.RPC_URL_BASE6,
+            process.env.RPC_URL_BASE7,
+            "https://mainnet.base.org",
+          ].filter((u): u is string => Boolean(u));
     this.scanClient = createScanClient(base, scanRpcUrls);
   }
 
   // ─── Initialization ───
 
   /**
-   * Initialize: load registry from disk, find deploy block, scan historical events,
+   * Initialize: load registry from disk, ensure a checkpoint exists, catch up incrementally,
    * cache reserves list.
+   *
+   * Full historical eth_getLogs backfill is **not** done here by default (too slow / restart-hostile).
+   * Prefer offline `pnpm backfill:aave` (RPC or The Graph subgraph). See ensureAccountRegistry().
    */
   async initialize(): Promise<void> {
-    // Load persisted account registry
     this.registry.loadFromFile();
+    await this.ensureAccountRegistry();
 
-    // Find exact deploy block via binary search
-    const lastScanned = this.registry.getLastScannedBlock(this.poolAddress);
-    if (lastScanned === undefined) {
+    // Incremental catch-up only (from durable checkpoint → tip)
+    await this.registry.initialScan(
+      this.client,
+      this.poolAddress,
+      this.poolDeployBlock,
+      this.logTag,
+      this.scanClient,
+    );
+
+    await this.cacheReserves();
+    await this.cacheReserveConfigs();
+    await this.warmDexRoutes();
+
+    console.log(
+      `${this.logTag}🗄️ Aave registry initialized: ${this.registry.totalAccounts} total accounts, ${this.cachedReserves.length} reserves cached` +
+        ` (checkpoint @ ${this.registry.getLastScannedBlock(this.poolAddress) ?? "?"})`,
+    );
+  }
+
+  /**
+   * Prefill DEX route cache for common Aave reserve pairs (local DEX first).
+   * First live liquidation then hits cached venue instead of cold multi-venue probe.
+   */
+  private async warmDexRoutes(): Promise<void> {
+    if (!shouldWarmRoutes()) {
+      console.log(`${this.logTag}🔥 DEX warm skipped (SKIP_ROUTE_WARM=1)`);
+      return;
+    }
+    // Cap fan-out to cut startup RPC spike (default 6 majors ≈ 30 directed pairs)
+    const maxMajors = routeWarmMaxMajors(6);
+    const majors = [this.wNative.toLowerCase(), ...this.cachedReserves.map((a) => a.toLowerCase())]
+      .filter((v, i, arr) => arr.indexOf(v) === i)
+      .slice(0, maxMajors) as Address[];
+
+    const pairs: { src: Address; dst: Address }[] = [];
+    for (const src of majors) {
+      for (const dst of majors) {
+        if (src !== dst) pairs.push({ src, dst });
+      }
+    }
+
+    if (pairs.length === 0) return;
+    console.log(
+      `${this.logTag}🔥 Warming ${pairs.length} DEX routes (prefer local AMM, majors=${maxMajors})…`,
+    );
+    try {
+      await warmVenueRouteCache(this.sharedDeps, pairs);
+    } catch (e) {
+      console.warn(
+        `${this.logTag}⚠️ DEX warm failed (non-fatal): ${e instanceof Error ? e.message : e}`,
+      );
+    }
+  }
+
+  /**
+   * Ensure durable account list + checkpoint exist before the bot starts monitoring.
+   *
+   * Priority:
+   * 1. Existing data/aave-accounts.*.json (+ .checkpoint.json)
+   * 2. The Graph subgraph bootstrap (THEGRAPH_API_KEY / AAVE_SUBGRAPH_URL)
+   * 3. Inline multi-million-block RPC only if AAVE_INLINE_BACKFILL=1
+   * 4. Otherwise throw with instructions (do not silently start empty)
+   */
+  private async ensureAccountRegistry(): Promise<void> {
+    if (this.registry.hasCheckpoint(this.poolAddress)) {
+      console.log(
+        `${this.logTag}📂 Registry checkpoint present @ block ${this.registry.getLastScannedBlock(this.poolAddress)} — incremental only`,
+      );
+      return;
+    }
+
+    // Optional: bootstrap from official Aave protocol subgraph (borrowers with debt only)
+    const { canUseAaveSubgraph, fetchAaveBorrowersFromSubgraph } = await import(
+      "./utils/aaveAccountSources.js"
+    );
+    if (canUseAaveSubgraph(this.chainId)) {
+      console.log(`${this.logTag}📡 No local checkpoint — bootstrapping from Aave subgraph…`);
+      try {
+        const result = await fetchAaveBorrowersFromSubgraph(this.chainId, {
+          logTag: this.logTag,
+        });
+        const added = this.registry.importAccounts(this.poolAddress, result.accounts);
+        this.registry.markSynced(this.poolAddress, result.blockNumber);
+        this.registry.saveToFile();
+        console.log(
+          `${this.logTag}✅ Subgraph bootstrap: ${added} borrowers, checkpoint @ ${result.blockNumber}`,
+        );
+        return;
+      } catch (e) {
+        console.warn(
+          `${this.logTag}⚠️ Subgraph bootstrap failed: ${e instanceof Error ? e.message : e}`,
+        );
+      }
+    }
+
+    // Escape hatch: allow bot to run full eth_getLogs history (slow; not recommended)
+    if (process.env.AAVE_INLINE_BACKFILL === "1") {
+      console.warn(
+        `${this.logTag}⚠️ AAVE_INLINE_BACKFILL=1 — running full RPC historical scan from deploy block (prefer pnpm backfill:aave)`,
+      );
       const deployBlock = await findDeployBlock(
         this.scanClient,
         this.poolAddress,
@@ -206,25 +360,15 @@ export class AaveLiquidationBot {
         );
         this.poolDeployBlock = deployBlock;
       }
+      return; // initialScan in initialize() will full-scan from deploy
     }
 
-    // Historical scan using Base public RPC (scanClient)
-    await this.registry.initialScan(
-      this.client,
-      this.poolAddress,
-      this.poolDeployBlock,
-      this.logTag,
-      this.scanClient,
-    );
-
-    // Cache reserves list
-    await this.cacheReserves();
-
-    // Pre-cache reserve configs (liquidationBonus, decimals) via multicall
-    await this.cacheReserveConfigs();
-
-    console.log(
-      `${this.logTag}🗄️ Aave registry initialized: ${this.registry.totalAccounts} total accounts, ${this.cachedReserves.length} reserves cached`,
+    throw new Error(
+      `${this.logTag}No Aave account registry/checkpoint for pool ${this.poolAddress}. ` +
+        `Run offline backfill first:\n` +
+        `  pnpm backfill:aave -- --chain ${this.chainId} --source auto\n` +
+        `Or set THEGRAPH_API_KEY / AAVE_SUBGRAPH_URL for subgraph bootstrap, ` +
+        `or AAVE_INLINE_BACKFILL=1 to allow in-process full eth_getLogs (slow).`,
     );
   }
 
@@ -317,11 +461,17 @@ export class AaveLiquidationBot {
   // ─── Polling loop ───
 
   /**
-   * Start polling: check getUserAccountData on every N blocks.
-   * Returns an unwatch function.
+   * Start polling: race path rechecks near-liq accounts every N blocks (default 1).
+   * Full-registry scans run every fullScanIntervalBlocks ticks inside checkAave.
    */
   startPolling(bus: SharedBlockBus): void {
     bus.register(this.pollIntervalBlocks, () => this.checkAave(), this.logTag);
+    console.log(
+      `${this.logTag}⚡ Race mode: poll every ${this.pollIntervalBlocks} block(s), ` +
+        `full scan every ${this.fullScanIntervalBlocks} tick(s), ` +
+        `hot HF < ${Number(this.nearHealthFactorWad) / 1e18}, ` +
+        `batch=${this.hfBatchSize} concurrency=${this.hfConcurrency}`,
+    );
   }
 
   // ─── Health status ───
@@ -346,32 +496,70 @@ export class AaveLiquidationBot {
       rpcErrorRate,
       lastError: this._lastError,
       isHealthy: rpcErrorRate < 0.3, // unhealthy if >30% RPC error rate
+      raceMetrics: this.raceMetrics.snapshot(),
     };
   }
 
   /**
-   * Core check loop: scan new events, batch-check health factors, trigger liquidations.
+   * Race-critical check loop:
+   *  - Hot path (every poll tick): recheck near-liq accounts only (parallel multicall shards)
+   *  - Full path (every fullScanIntervalBlocks ticks): registry getLogs + full HF sweep
+   *  - Liquidate lowest-HF first (competitors win soft HF last)
    */
   async checkAave(): Promise<void> {
     try {
-      // Incremental scan for new accounts
-      await this.registry.scanNewEvents(this.scanClient, this.poolAddress, this.logTag);
+      this.pollTick += 1;
+      const doFullScan =
+        this.pollTick === 1 ||
+        this.pollTick % this.fullScanIntervalBlocks === 0 ||
+        this.lastHealthFactor.size === 0;
 
-      // Get all known accounts — prioritize recently active ones
-      // (accounts added later from event scanning have more recent activity)
-      const accounts = this.registry.getAccounts(this.poolAddress);
-      if (accounts.length === 0) return;
-      accounts.reverse(); // Most recently active first
+      // Event discovery is not on the hot path — only on full scans
+      if (doFullScan) {
+        await this.registry.scanNewEvents(this.scanClient, this.poolAddress, this.logTag);
+      }
 
-      // Batch check health factors
+      const accounts = doFullScan
+        ? this.registry.getAccounts(this.poolAddress)
+        : this.getHotAccounts();
+
+      if (accounts.length === 0) {
+        this.raceMetrics.onTick({
+          logTag: this.logTag,
+          mode: doFullScan ? "full" : "hot",
+          accounts: 0,
+          hot: this.countHotAccounts(),
+          liquidatable: 0,
+          hfScanMs: 0,
+        });
+        return;
+      }
+
+      const t0 = nowMs();
       const liquidatable = await this.batchCheckHealthFactor(accounts);
+      const scanMs = elapsedMs(t0);
 
-      // Update check metadata
       this._lastCheckTimestamp = Math.floor(Date.now() / 1000);
+
+      // Lowest HF first — most urgent / highest chance of still being open
+      liquidatable.sort((a, b) => (a.healthFactor < b.healthFactor ? -1 : 1));
+
+      this.raceMetrics.onTick({
+        logTag: this.logTag,
+        mode: doFullScan ? "full" : "hot",
+        accounts: accounts.length,
+        hot: this.countHotAccounts(),
+        liquidatable: liquidatable.length,
+        hfScanMs: scanMs,
+      });
 
       if (liquidatable.length === 0) return;
 
-      console.log(`${this.logTag}🎯 Aave Pool — ${liquidatable.length} liquidatable account(s)!`);
+      console.log(
+        `${this.logTag}🎯 Aave Pool — ${liquidatable.length} liquidatable ` +
+          `(${doFullScan ? "full" : "hot"} scan ${accounts.length} in ${scanMs}ms, ` +
+          `worstHF=${Number(liquidatable[0]!.healthFactor) / 1e18})`,
+      );
 
       for (const { account, healthFactor } of liquidatable) {
         await this.liquidateAave(account, healthFactor);
@@ -385,52 +573,98 @@ export class AaveLiquidationBot {
     }
   }
 
+  /** Accounts with last HF in the near-liq band (or unknown/missing from full set). */
+  private getHotAccounts(): Address[] {
+    const hot: Address[] = [];
+    for (const [key, hf] of this.lastHealthFactor) {
+      if (hf < this.nearHealthFactorWad) {
+        hot.push(key as Address);
+      }
+    }
+    // Prefer more distressed first when we re-check
+    hot.sort((a, b) => {
+      const ha = this.lastHealthFactor.get(a.toLowerCase()) ?? 0n;
+      const hb = this.lastHealthFactor.get(b.toLowerCase()) ?? 0n;
+      return ha < hb ? -1 : ha > hb ? 1 : 0;
+    });
+    return hot;
+  }
+
+  private countHotAccounts(): number {
+    let n = 0;
+    for (const hf of this.lastHealthFactor.values()) {
+      if (hf < this.nearHealthFactorWad) n++;
+    }
+    return n;
+  }
+
   /**
-   * Batch check getUserAccountData for multiple accounts using multicall.
-   * Processes accounts in batches of 50 to avoid RPC timeouts.
-   * Returns accounts with healthFactor < threshold (adjusted by buffer).
+   * Parallel-sharded multicall of getUserAccountData across paidReadPool.
+   * Updates lastHealthFactor cache for hot-set selection.
    */
   private async batchCheckHealthFactor(
     accounts: Address[],
   ): Promise<{ account: Address; healthFactor: bigint }[]> {
     const threshold = HEALTH_FACTOR_THRESHOLD + this.minHealthFactorBuffer;
-    const BATCH_SIZE = 50;
+    const batchSize = Math.max(10, this.hfBatchSize);
+    const concurrency = Math.max(
+      1,
+      Math.min(this.hfConcurrency, Math.max(1, this.paidReadPool.size)),
+    );
     const liquidatable: { account: Address; healthFactor: bigint }[] = [];
 
-    // Process in batches of 50 to avoid RPC timeouts on large account lists
-    for (let i = 0; i < accounts.length; i += BATCH_SIZE) {
-      const batch = accounts.slice(i, i + BATCH_SIZE);
+    const batches: Address[][] = [];
+    for (let i = 0; i < accounts.length; i += batchSize) {
+      batches.push(accounts.slice(i, i + batchSize));
+    }
 
-      try {
-        const results = await multicall(this.paidReadPool.next(), {
-          contracts: batch.map((account) => ({
-            address: this.poolAddress,
-            abi: aavePoolViewAbi,
-            functionName: "getUserAccountData" as const,
-            args: [account] as const,
-          })),
-          allowFailure: true,
-        });
+    const waveGap = rpcWaveGapMs();
+    for (let waveStart = 0; waveStart < batches.length; waveStart += concurrency) {
+      if (waveStart > 0 && waveGap > 0) await sleep(waveGap);
+      const wave = batches.slice(waveStart, waveStart + concurrency);
+      const waveResults = await Promise.all(
+        wave.map(async (batch) => {
+          const { client, label } = this.paidReadPool.nextWithLabel();
+          try {
+            const results = await multicall(client, {
+              contracts: batch.map((account) => ({
+                address: this.poolAddress,
+                abi: aavePoolViewAbi,
+                functionName: "getUserAccountData" as const,
+                args: [account] as const,
+              })),
+              allowFailure: true,
+            });
+            this.paidReadPool.recordSuccess(label);
+            this._rpcTotal += batch.length;
+            return { batch, results, ok: true as const };
+          } catch (e) {
+            this.paidReadPool.recordFailure(label);
+            this._rpcErrors += batch.length;
+            this._rpcTotal += batch.length;
+            console.warn(
+              `${this.logTag}⚠️ HF multicall failed on ${label}: ${e instanceof Error ? e.message : e}`,
+            );
+            return { batch, results: null, ok: false as const };
+          }
+        }),
+      );
 
-        this._rpcTotal += batch.length;
-
+      for (const { batch, results, ok } of waveResults) {
+        if (!ok || !results) continue;
         for (let j = 0; j < results.length; j++) {
           const result = results[j]!;
+          const account = batch[j]!;
           if (result.status !== "success") {
             this._rpcErrors++;
             continue;
           }
-          const healthFactor = result.result[5]; // healthFactor is index 5 (WAD-scaled)
+          const healthFactor = result.result[5]; // WAD-scaled
+          this.lastHealthFactor.set(account.toLowerCase(), healthFactor);
           if (healthFactor < threshold) {
-            liquidatable.push({ account: batch[j]!, healthFactor });
+            liquidatable.push({ account, healthFactor });
           }
         }
-      } catch (e) {
-        this._rpcErrors += batch.length;
-        this._rpcTotal += batch.length;
-        console.warn(
-          `${this.logTag}⚠️ batchCheckHealthFactor batch ${i / BATCH_SIZE} failed: ${e instanceof Error ? e.message : e}`,
-        );
       }
     }
 
@@ -440,9 +674,25 @@ export class AaveLiquidationBot {
   // ─── Liquidation execution ───
 
   private async liquidateAave(account: Address, healthFactor: bigint): Promise<void> {
-    // Select best (collateral, debt) pair — pass cached reserve configs to avoid RPC
+    const tTotal = nowMs();
+
+    // Peek cooldown only — do not arm until we actually attempt execution (race-friendly)
+    if (this.cooldown?.isCoolingDown(this.poolAddress, account)) {
+      this.raceMetrics.recordOutcome("skip_cooldown");
+      logLiquidationDebug({
+        protocol: this.logTag,
+        account,
+        healthFactor: Number(healthFactor) / 1e18,
+        decision: "skip",
+        reason: "Position is in cooldown period",
+      });
+      return;
+    }
+
+    // Pair select on paid read pool (keep write RPC free for sim/submit)
+    const tPair = nowMs();
     const pair = await selectBestLiquidationPair(
-      this.client,
+      this.paidReadPool.next(),
       this.poolAddress,
       account,
       healthFactor,
@@ -451,10 +701,13 @@ export class AaveLiquidationBot {
       this.wNative,
       this.cachedReserveConfigs.size > 0 ? this.cachedReserveConfigs : undefined,
     );
+    const pairMs = elapsedMs(tPair);
+    this.raceMetrics.recordStage("pair", pairMs);
 
     this._liquidationsAttempted++;
 
     if (!pair) {
+      this.raceMetrics.recordOutcome("skip_no_pair");
       logLiquidationDebug({
         protocol: this.logTag,
         account,
@@ -463,6 +716,7 @@ export class AaveLiquidationBot {
         reason: "No profitable liquidation pair found",
         details: {
           note: "Could not find collateral/debt pair with positive expected profit",
+          pairMs,
         },
       });
       this._liquidationsAttempted--; // Don't count skipped pairs as attempts
@@ -474,6 +728,7 @@ export class AaveLiquidationBot {
       this.tokenBlacklist.has(pair.collateralAsset.toLowerCase()) ||
       this.tokenBlacklist.has(pair.debtAsset.toLowerCase())
     ) {
+      this.raceMetrics.recordOutcome("skip_blacklist");
       logLiquidationDebug({
         protocol: this.logTag,
         account,
@@ -520,36 +775,82 @@ export class AaveLiquidationBot {
       details: {
         useFlashLoan: this.useFlashLoan,
         alwaysRealizeBadDebt: this.alwaysRealizeBadDebt,
+        pairMs,
       },
     });
 
     // Bad debt pre-filter: skip early if position is underwater and we don't realize bad debt.
-    // Runs BEFORE the cooldown check so these positions never trip the cooldown timer.
+    // No cooldown arm here — we never attempted a tx.
     if (!this.alwaysRealizeBadDebt && badDebtPosition) {
+      this.raceMetrics.recordOutcome("skip_bad_debt");
       return;
     }
 
-    // Cooldown check — only reached once we've decided this position is actually worth
-    // attempting, so the cooldown timer only ever reflects a real attempt.
-    if (this.cooldown && !this.cooldown.isPositionReady(this.poolAddress, account)) {
-      logLiquidationDebug({
-        protocol: this.logTag,
-        account,
-        healthFactor: Number(healthFactor) / 1e18,
-        decision: "skip",
-        reason: "Position is in cooldown period",
-        details: {
-          note: "Recently attempted liquidation, waiting before retry",
-        },
-      });
-      return;
-    }
-
+    // Cooldown is armed AFTER the attempt with a graded period (race/soft/hard/success).
     if (this.useFlashLoan) {
       await this.liquidateWithFlashLoan(account, pair, badDebtPosition);
     } else {
       await this.liquidateDirect(account, pair, badDebtPosition);
     }
+    this.raceMetrics.recordStage("totalLiq", elapsedMs(tTotal));
+  }
+
+  /**
+   * Graded cooldown after an execution attempt.
+   * race (15s): competitor / HF recovered — can re-enter hot set soon if price re-breaks.
+   * soft (120s): unprofitable / route — don't spam.
+   * hard/success (1h): structural fail or we already liquidated.
+   */
+  private armCooldown(
+    account: Address,
+    cls: CooldownClass,
+    detail?: string,
+    /** Override metrics bucket (e.g. skip_no_route uses soft cooldown but separate counter). */
+    metricsOutcome?: "success" | "fail_race" | "fail_soft_profit" | "fail_hard" | "skip_no_route",
+  ): void {
+    if (metricsOutcome) {
+      this.raceMetrics.recordOutcome(metricsOutcome);
+    } else if (cls === "race") {
+      this.raceMetrics.recordOutcome("fail_race");
+    } else if (cls === "soft") {
+      this.raceMetrics.recordOutcome("fail_soft_profit");
+    } else if (cls === "success") {
+      this.raceMetrics.recordOutcome("success");
+    } else if (cls === "hard") {
+      this.raceMetrics.recordOutcome("fail_hard");
+    }
+
+    if (!this.cooldown) return;
+    const seconds = this.cooldown.markClass(this.poolAddress, account, cls);
+    console.log(
+      `${this.logTag}⏳ Cooldown ${cls} ${seconds}s for ${account.slice(0, 10)}…` +
+        (detail ? ` (${detail.slice(0, 100)})` : ""),
+    );
+    // Drop from hot set (HF must be ≥ near threshold). THRESHOLD+1 still stays hot when
+    // near HF is 1.05 — use nearHealthFactorWad so race/success stop burning every-block RPC.
+    // Full scan / next successful HF batch re-samples the real value.
+    if (cls === "race" || cls === "success") {
+      this.lastHealthFactor.set(account.toLowerCase(), this.nearHealthFactorWad);
+    }
+  }
+
+  private armCooldownFromError(account: Address, error: unknown): void {
+    if (isLiquidationRaceLostError(error) || classifyLiquidationFailure(error) === "race") {
+      this.armCooldown(account, "race", error instanceof Error ? error.message : String(error));
+      return;
+    }
+    const cls = classifyLiquidationFailure(error);
+    this.armCooldown(account, cls, error instanceof Error ? error.message : String(error));
+  }
+
+  private recordConvertMetrics(swap: { success: boolean; via?: string; elapsedMs?: number }): void {
+    const ms = swap.elapsedMs ?? 0;
+    const via = !swap.success
+      ? "fail"
+      : swap.via === "cache" || swap.via === "probe" || swap.via === "same"
+        ? swap.via
+        : "probe";
+    this.raceMetrics.recordConvert(ms, via);
   }
 
   /**
@@ -575,15 +876,25 @@ export class AaveLiquidationBot {
       false, // receiveAToken = false (receive underlying)
     );
 
-    // DEX swap seized collateral → debt asset
+    // DEX swap seized collateral → debt asset (local AMM first; no white sim without route)
     if (pair.collateralAsset.toLowerCase() !== pair.debtAsset.toLowerCase()) {
-      await convertCollateralToLoan(
+      const swap = await convertCollateralToLoan(
         this.sharedDeps,
         pair.collateralAsset,
         pair.debtAsset,
         pair.seizableCollateral,
         encoder,
+        { preferLocalDex: true },
       );
+      this.recordConvertMetrics(swap);
+      if (!swap.success) {
+        this._liquidationsFailed++;
+        this.armCooldown(account, "soft", "no DEX route", "skip_no_route");
+        console.log(
+          `${this.logTag}No DEX route for ${pair.collateralAsset.slice(0, 10)}…→${pair.debtAsset.slice(0, 10)}…, skip direct`,
+        );
+        return;
+      }
     }
 
     // Skim profit to treasury
@@ -592,6 +903,7 @@ export class AaveLiquidationBot {
     const calls = encoder.flush();
 
     try {
+      const tSim = nowMs();
       const success = await simulateAndExec(
         this.sharedDeps,
         encoder,
@@ -602,9 +914,15 @@ export class AaveLiquidationBot {
         undefined,
         pair.collateralAsset,
       );
+      const simMs = elapsedMs(tSim);
+      this.raceMetrics.recordStage("simExec", simMs);
+      console.log(
+        `${this.logTag}[LiqTiming] direct account=${account.slice(0, 10)}… simExecMs=${simMs} ok=${success}`,
+      );
 
       if (success) {
         this._liquidationsSucceeded++;
+        this.armCooldown(account, "success");
         const collateralUsd =
           (await priceAsset(this.sharedDeps, pair.collateralAsset, pair.seizableCollateral)) ?? 0;
         liquidationTracker.report({
@@ -617,11 +935,13 @@ export class AaveLiquidationBot {
         console.log(`${this.logTag}Liquidated ${account} on Aave Pool (direct)`);
       } else {
         this._liquidationsFailed++;
+        this.armCooldown(account, "soft", "not profitable / sim soft-fail");
         console.log(`${this.logTag}Skipped ${account} on Aave Pool (direct, not profitable)`);
       }
     } catch (error) {
       this._liquidationsFailed++;
       this._lastError = String(error);
+      this.armCooldownFromError(account, error);
       console.error(
         `${this.logTag}Failed to liquidate ${account} on Aave Pool (direct): ${error instanceof Error ? error.message : error}`,
       );
@@ -663,18 +983,27 @@ export class AaveLiquidationBot {
       false, // receiveAToken = false
     );
 
-    // Step 3: DEX swap seized collateral → debt asset
+    // Step 3: DEX swap — fail fast if no route (do not burn flash sim)
+    let venueImpactBps: bigint | undefined;
     if (pair.collateralAsset.toLowerCase() !== pair.debtAsset.toLowerCase()) {
-      await convertCollateralToLoan(
+      const swap = await convertCollateralToLoan(
         this.sharedDeps,
         pair.collateralAsset,
         pair.debtAsset,
-        // Aave's seized amount is known off-chain (same value used by liquidationCall
-        // above and by the non-flash-loan path), so reuse it instead of a literal 0 —
-        // passing 0 here made every venue attempt a zero-amount swap and revert.
         pair.seizableCollateral,
         callbackEncoder,
+        { preferLocalDex: true },
       );
+      this.recordConvertMetrics(swap);
+      if (!swap.success) {
+        this._liquidationsFailed++;
+        this.armCooldown(account, "soft", "no DEX route", "skip_no_route");
+        console.log(
+          `${this.logTag}No DEX route for ${pair.collateralAsset.slice(0, 10)}…→${pair.debtAsset.slice(0, 10)}…, skip flash`,
+        );
+        return;
+      }
+      venueImpactBps = swap.impactBps;
     }
 
     // Step 4: Skim profit to treasury
@@ -682,8 +1011,9 @@ export class AaveLiquidationBot {
 
     const callbackCalls = callbackEncoder.flush();
 
-    // Step 5: Wrap with flash loan (with fallback providers) and simulate + execute.
+    // Step 5: Wrap with flash loan + simulate/exec (pass impact for dynamic slippage)
     try {
+      const tSim = nowMs();
       const success = await simulateAndExecFlashLoanWithFallback(
         this.sharedDeps,
         callbackCalls,
@@ -691,10 +1021,18 @@ export class AaveLiquidationBot {
         badDebtPosition,
         flashLoanAmount,
         pair.collateralAsset,
+        undefined, // cachedGasPrice
+        venueImpactBps,
+      );
+      const simMs = elapsedMs(tSim);
+      this.raceMetrics.recordStage("simExec", simMs);
+      console.log(
+        `${this.logTag}[LiqTiming] flash account=${account.slice(0, 10)}… simExecMs=${simMs} ok=${success}`,
       );
 
       if (success) {
         this._liquidationsSucceeded++;
+        this.armCooldown(account, "success");
         const collateralUsd =
           (await priceAsset(this.sharedDeps, pair.collateralAsset, pair.seizableCollateral)) ?? 0;
         liquidationTracker.report({
@@ -707,11 +1045,13 @@ export class AaveLiquidationBot {
         console.log(`${this.logTag}[FlashLoan] Liquidated ${account} on Aave Pool`);
       } else {
         this._liquidationsFailed++;
+        this.armCooldown(account, "soft", "not profitable / providers exhausted");
         console.log(`${this.logTag}[FlashLoan] Skipped ${account} on Aave Pool (not profitable)`);
       }
     } catch (error) {
       this._liquidationsFailed++;
       this._lastError = String(error);
+      this.armCooldownFromError(account, error);
       console.error(
         `${this.logTag}[FlashLoan] Failed to liquidate ${account} on Aave Pool: ${error instanceof Error ? error.message : error}`,
       );

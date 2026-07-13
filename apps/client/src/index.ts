@@ -2,6 +2,8 @@ import {
   MARKETS_FETCHING_COOLDOWN_PERIOD,
   POSITION_LIQUIDATION_COOLDOWN_ENABLED,
   POSITION_LIQUIDATION_COOLDOWN_PERIOD,
+  POSITION_LIQUIDATION_COOLDOWN_RACE_SECONDS,
+  POSITION_LIQUIDATION_COOLDOWN_SOFT_SECONDS,
   ALWAYS_REALIZE_BAD_DEBT,
   type ChainConfig,
 } from "@morpho-blue-liquidation-bot/config";
@@ -32,13 +34,15 @@ export const launchBot = async (
   const logTag = `[${config.chain.name} client]: `;
   console.log(`${logTag}Starting up`);
 
-  // Write client: Alchemy primary, failover to paid RPCs
+  // Write client: primary RPC, failover across RPC_URL_BASE2..7 + FALLBACK_RPC_URL
   const fallbackRpcUrl = process.env.FALLBACK_RPC_URL;
   const paidRpcUrls = [
-    process.env.PAID_RPC_COINBASE,
-    process.env.PAID_RPC_CHAINSTACK,
-    process.env.PAID_RPC_ZAN,
-    process.env.PAID_RPC_GETBLOCK,
+    process.env.RPC_URL_BASE2,
+    process.env.RPC_URL_BASE3,
+    process.env.RPC_URL_BASE4,
+    process.env.RPC_URL_BASE5,
+    process.env.RPC_URL_BASE6,
+    process.env.RPC_URL_BASE7,
   ].filter(Boolean);
   const rpcRetryOpts = { retryCount: 3, retryDelay: 1000 };
   const writeTransports = [
@@ -54,16 +58,17 @@ export const launchBot = async (
     account: privateKeyToAccount(config.liquidationPrivateKey),
   });
 
-  // Paid read pool: round-robin across paid RPCs for multicall reads
+  // Paid read pool: primary + BASE2..7 for parallel multicall / race-critical reads
   const paidReadPool = new ReadClientPool({
     chain: config.chain,
     entries: [
-      { label: "chainstack", url: process.env.PAID_RPC_CHAINSTACK },
-      { label: "coinbase", url: process.env.PAID_RPC_COINBASE },
-      { label: "zan", url: process.env.PAID_RPC_ZAN },
-      { label: "getblock", url: process.env.PAID_RPC_GETBLOCK },
-      { label: "nodereal", url: process.env.PAID_RPC_NODEREAL },
-      { label: "simplystaking", url: process.env.PAID_RPC_SIMPLYSTAKING },
+      { label: "base", url: process.env.RPC_URL_BASE ?? config.rpcUrl },
+      { label: "base2", url: process.env.RPC_URL_BASE2 },
+      { label: "base3", url: process.env.RPC_URL_BASE3 },
+      { label: "base4", url: process.env.RPC_URL_BASE4 },
+      { label: "base5", url: process.env.RPC_URL_BASE5 },
+      { label: "base6", url: process.env.RPC_URL_BASE6 },
+      { label: "base7", url: process.env.RPC_URL_BASE7 },
     ].filter((e): e is { label: string; url: string } => Boolean(e.url)),
   });
   console.log(`${logTag}💰 Paid read pool: ${paidReadPool.size} endpoints (round-robin)`);
@@ -102,6 +107,10 @@ export const launchBot = async (
   if (POSITION_LIQUIDATION_COOLDOWN_ENABLED) {
     positionLiquidationCooldownMechanism = new PositionLiquidationCooldownMechanism(
       POSITION_LIQUIDATION_COOLDOWN_PERIOD,
+      {
+        race: POSITION_LIQUIDATION_COOLDOWN_RACE_SECONDS,
+        soft: POSITION_LIQUIDATION_COOLDOWN_SOFT_SECONDS,
+      },
     );
   }
 

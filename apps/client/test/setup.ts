@@ -147,12 +147,32 @@ export interface AaveForkContext<chain extends Chain = Chain> {
 }
 
 /**
- * Base chain fork for Aave V3 integration tests.
+ * Base chain fork for multi-protocol integration tests (Aave / Morpho / Comet / Moonwell).
  * Uses a recent block where Aave V3 on Base has active positions.
  * Pool: 0xA238Dd80C259a72e81d7e4664a9801593F98d1c5 (deploy block: 2357134)
+ *
+ * RPC priority (skip empty strings — `??` alone does not):
+ *   FORK_RPC_URL → RPC_URL_BASE → RPC_URL_BASE2 → RPC_URL_8453 → PUBLIC_RPC_URL_BASE → public default
  */
+function firstNonEmpty(...vals: (string | undefined)[]): string | undefined {
+  for (const v of vals) {
+    if (v && v.trim().length > 0) return v.trim();
+  }
+  return undefined;
+}
+
+const baseForkUrl =
+  firstNonEmpty(
+    process.env.FORK_RPC_URL,
+    process.env.RPC_URL_BASE,
+    process.env.RPC_URL_BASE2,
+    process.env.RPC_URL_8453,
+    process.env.PUBLIC_RPC_URL_BASE,
+    base.rpcUrls.default.http[0],
+  ) ?? base.rpcUrls.default.http[0];
+
 export const aaveBaseForkTest = createViemTest(base, {
-  forkUrl: process.env.RPC_URL_8453 ?? base.rpcUrls.default.http[0],
+  forkUrl: baseForkUrl,
   forkBlockNumber: 25_000_000,
   timeout: 120_000,
 }).extend<AaveForkContext<typeof base>>({

@@ -16,9 +16,13 @@
  *     成功結果。查歷史區塊需要 RPC 有 archive 權限。
  *
  * Usage:
- *   RPC_URL_8453=https://... pnpm tsx apps/client/src/simulateExecutorCall.ts [aave|comet|moonwell|morpho|all]
+ *   pnpm tsx apps/client/src/simulateExecutorCall.ts [aave|comet|moonwell|morpho|all]
+ *   # 可選場景別名: aave-full | comet-full | moonwell-full
+ *   # RPC: FORK_RPC_URL / RPC_URL_BASE / RPC_URL_BASE2 / RPC_URL_8453 / PUBLIC_RPC_URL_BASE
  *   不帶參數預設跑 all（會自動跳過還沒填真實資料的場景，並印出 cast logs 指令）
  */
+import "dotenv/config";
+
 import { UniswapV3Venue } from "@morpho-blue-liquidation-bot/liquidity-venues";
 import { executorAbi } from "executooor-viem";
 import { createPublicClient, getAddress, http, maxUint256, type Hex } from "viem";
@@ -29,6 +33,13 @@ import { BALANCER_VAULT_ADDRESS } from "./abis/BalancerVault.js";
 import { cometViewAbi } from "./abis/Comet.js";
 import { mTokenAbi } from "./abis/Moonwell.js";
 import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
+
+function firstNonEmpty(...vals: (string | undefined)[]): string | undefined {
+  for (const v of vals) {
+    if (v && v.trim().length > 0) return v.trim();
+  }
+  return undefined;
+}
 
 // ─── 你之前部署、已經在 Basescan 上驗證過原始碼的真實 Executor ─────────────
 const EXECUTOR_ADDRESS = getAddress("0xca2Bb167A5bf92Dc0891088285dA48D9e66C0661");
@@ -187,43 +198,88 @@ const moonwellScenario: Scenario = {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 4. Morpho — 待填，而且比其他三個難：preLiquidate 走的是特定 PreLiquidation
-//    合約（每個市場一個獨立地址），而且該合約的 preLltv/preLCF/preLIF 曲線參數
-//    需要額外查該合約本身（不是查 Morpho Blue 主合約），才能算出合法的
-//    seizedAssets/repaidShares 組合，硬猜容易做出「看起來對但參數超出合約
-//    允許範圍」的假陽性。找到真實 PreLiquidate 事件後，最保險的作法是直接
-//    照抄那筆真實 tx 的 calldata 參數，而不是自己重新計算。
-//
-//    事件簽名已對照 apps/client/src/abis/PreLiquidation.ts 修正（之前給的版本
-//    參數數量錯了一個，這裡是確認過的正確版本）：
-//    PreLiquidate(indexed id, indexed liquidator, indexed borrower,
-//                 repaidAssets, repaidShares, seizedAssets)
-//    borrower 在 topics[3]（liquidator 在 topics[2]，id 在 topics[1]）。
-//    不帶 --address 是因為每個市場的 PreLiquidation 合約地址都不一樣，
-//    找到真實事件之後，topics[0] 之外還能順便確認 log 的 address 欄位
-//    就是這個市場真正的 PreLiquidation 合約地址（可能不是下面寫死的
-//    0xA28EE7eC...，要以你找到的真實 log 為準）。
+// 4. Morpho Blue liquidate — 真實 Liquidate 事件（WETH/USDC 市場）
+//    tx 0xef26a7b5077aecffe595b4802075c61e6e73e39b3434b433caee9800a96b4949
+//    block 48145750
+//    marketId 0x8793cf302b8ffd655ab97bd1c695dbd967807e8367a65cb2f4edaf1380ba1bda
+//    repaidAssets / repaidShares / seizedAssets 從 event data 照抄
 // ═══════════════════════════════════════════════════════════════════════════
+const MORPHO_BLUE = getAddress("0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb");
+const MORPHO_WETH_USDC_MARKET = {
+  loanToken: getAddress("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"), // USDC
+  collateralToken: getAddress("0x4200000000000000000000000000000000000006"), // WETH
+  oracle: getAddress("0xFEa2D58cEfCb9fcb597723c6bAE66fFE4193aFE4"),
+  irm: getAddress("0x46415998764C29aB2a25CbeA6254146D50D22687"),
+  lltv: 860000000000000000n,
+} as const;
+
 const morphoScenario: Scenario = {
   name: "morpho",
-  ready: false,
+  ready: true,
   findCommand:
-    'cast logs "PreLiquidate(bytes32,address,address,uint256,uint256,uint256)" --from-block <BLOCK-300000> --to-block latest --rpc-url $RPC_URL_8453\n' +
-    "  # 找到之後，用 cast tx <txHash> --rpc-url $RPC_URL_8453 把原始 calldata 整筆挖出來，\n" +
-    "  # 直接沿用該筆真實交易的 seizedAssets/repaidShares，不要自己重新計算。\n" +
-    "  # log 的 address 欄位就是真正的 PreLiquidation 合約地址，記得換掉下面寫死的那個。",
+    'cast logs --address 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb "Liquidate(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)" --from-block <BLOCK-500000> --to-block latest --rpc-url $RPC_URL_BASE',
   build: async (client) => {
-    const PRE_LIQUIDATION = getAddress("0xA28EE7eC4756b4c3340c30a8c8CB8Bd708E1DcDc"); // TODO: 確認這是不是你要測的市場
-    const LIQ_USER = getAddress("0x0000000000000000000000000000000000dEaD"); // TODO
-    const seizedAssets = 0n; // TODO：照抄真實 tx 的參數
-    const repaidShares = 0n; // TODO：照抄真實 tx 的參數
+    // 真實 Liquidate：block 48145750, borrower 在 topics[3]
+    const LIQ_USER = getAddress("0x5579c0eea13b3b7ac65df67e7107aba339d46d3b");
+    // event data: repaidAssets, repaidShares, seizedAssets, badDebtAssets, badDebtShares
+    const seizedAssets = 1831275589280431n; // 0x68228a3d462af wei WETH
+    // repaidShares=0 → Morpho 依 seizedAssets 推算應還 shares（與 bot 路徑一致）
 
     const le = new LiquidationEncoder(EXECUTOR_ADDRESS, client);
-    le.preLiquidate(PRE_LIQUIDATION, LIQ_USER, seizedAssets, repaidShares);
+    le.morphoBlueLiquidate(MORPHO_BLUE, { ...MORPHO_WETH_USDC_MARKET }, LIQ_USER, seizedAssets, 0n);
     return {
       calls: le.flush(),
-      blockNumber: 0n, // TODO
-      label: "Morpho preLiquidate（尚未填入真實資料）",
+      blockNumber: 48145749n, // 真實 tx block - 1
+      label: "Morpho Blue liquidate（block 48145750 真實 WETH/USDC 事件 -1）",
+    };
+  },
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 4b. Morpho 完整鏈路：Balancer flash USDC → liquidate → UniswapV3 WETH→USDC → 還款
+// ═══════════════════════════════════════════════════════════════════════════
+const morphoFullFlashLoanScenario: Scenario = {
+  name: "morpho-full",
+  ready: true,
+  findCommand: "（沿用 morpho 場景同一筆真實事件）",
+  build: async (client) => {
+    const USDC = MORPHO_WETH_USDC_MARKET.loanToken;
+    const WETH = MORPHO_WETH_USDC_MARKET.collateralToken;
+    const LIQ_USER = getAddress("0x5579c0eea13b3b7ac65df67e7107aba339d46d3b");
+    const seizedAssets = 1831275589280431n;
+    // flash 略多於 repaidAssets (3043214)，留一點餘量
+    const flashUsdc = 3043214n + 1000n;
+
+    const inner = new LiquidationEncoder(EXECUTOR_ADDRESS, client);
+    // approve Morpho to pull USDC for debt repayment
+    inner.erc20Approve(USDC, MORPHO_BLUE, maxUint256);
+    inner.morphoBlueLiquidate(
+      MORPHO_BLUE,
+      { ...MORPHO_WETH_USDC_MARKET },
+      LIQ_USER,
+      seizedAssets,
+      0n,
+    );
+
+    const uniswapV3 = new UniswapV3Venue();
+    const hasRoute = await uniswapV3.supportsRoute(inner, WETH, USDC);
+    if (!hasRoute) {
+      throw new Error("Base 上找不到 WETH/USDC 的 Uniswap V3 池子，換匯這步沒辦法組出來");
+    }
+    await uniswapV3.convert(inner, { src: WETH, dst: USDC, srcAmount: seizedAssets });
+    const callbackCalls = inner.flush();
+
+    const outer = new LiquidationEncoder(EXECUTOR_ADDRESS, client);
+    outer.balancerFlashLoan(
+      BALANCER_VAULT_ADDRESS,
+      [{ asset: USDC, amount: flashUsdc }],
+      callbackCalls,
+    );
+
+    return {
+      calls: outer.flush(),
+      blockNumber: 48145749n,
+      label: `Morpho 完整鏈路：flashloan USDC → liquidate(seized=${seizedAssets}) → UniswapV3 WETH→USDC → 自動還款`,
     };
   },
 };
@@ -354,6 +410,7 @@ const SCENARIOS: Scenario[] = [
   moonwellScenario,
   moonwellFullFlashLoanScenario,
   morphoScenario,
+  morphoFullFlashLoanScenario,
 ];
 
 async function runScenario(client: any, scenario: Scenario) {
@@ -389,21 +446,39 @@ async function runScenario(client: any, scenario: Scenario) {
 }
 
 async function main() {
-  const rpcUrl = process.env.RPC_URL_8453 ?? "https://mainnet.base.org";
-  const client = createPublicClient({ chain: base, transport: http(rpcUrl) });
+  // Prefer working Base RPCs (RPC_URL_8453 may be an inactive Alchemy app in the shell)
+  const rpcUrl =
+    firstNonEmpty(
+      process.env.FORK_RPC_URL,
+      process.env.RPC_URL_BASE,
+      process.env.RPC_URL_BASE2,
+      process.env.RPC_URL_8453,
+      process.env.PUBLIC_RPC_URL_BASE,
+      "https://mainnet.base.org",
+    ) ?? "https://mainnet.base.org";
 
-  const targets = process.argv.slice(2);
+  // Historical block simulation needs archive-capable RPC
+  const client = createPublicClient({
+    chain: base,
+    transport: http(rpcUrl, { timeout: 60_000 }),
+  });
+
+  const targets = process.argv.slice(2).filter((a) => !a.startsWith("-"));
   const target = targets.length > 0 ? targets.join(",") : "all";
 
   console.log("=== Executor 真實模擬呼叫 (eth_call，不花 gas) ===");
   console.log(`Executor:  ${EXECUTOR_ADDRESS}`);
   console.log(`Owner:     ${OWNER_ADDRESS}`);
-  console.log(`RPC:       ${rpcUrl}`);
+  console.log(
+    `RPC:       ${rpcUrl.replace(/\/v2\/[^/]+/, "/v2/***").replace(/api\/[^/]+\//, "api/***/")}`,
+  );
 
   const targetSet = new Set(targets);
   const toRun = target === "all" ? SCENARIOS : SCENARIOS.filter((s) => targetSet.has(s.name));
   if (toRun.length === 0) {
-    console.error(`找不到場景 "${target}"，可用: aave | comet | moonwell | morpho | all`);
+    console.error(
+      `找不到場景 "${target}"，可用: aave | aave-full | comet | comet-full | moonwell | moonwell-full | morpho | all`,
+    );
     process.exitCode = 1;
     return;
   }

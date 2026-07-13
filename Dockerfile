@@ -36,9 +36,13 @@ ENV LIQUIDATION_PRIVATE_KEY=${LIQUIDATION_PRIVATE_KEY}
 ENV WHITELIST_DATA_DIR=${WHITELIST_DATA_DIR}
 ENV RAILWAY_DEPLOYMENT_ID=${RAILWAY_DEPLOYMENT_ID}
 
-# Create cache directory and declare it as a volume to persist between runs
-RUN mkdir -p .cache
-VOLUME ["/app/.cache"]
+# Persist bot state across restarts:
+#   .cache  — misc cache
+#   data    — account registries + checkpoints (aave/comet/moonwell) — MUST be volume-mounted
+# Without a volume on /app/data, every deploy restarts Aave scan from poolDeployBlock.
+RUN mkdir -p .cache data
+VOLUME ["/app/.cache", "/app/data"]
+ENV ACCOUNT_REGISTRY_DIR=/app/data
 
 # Build the .env file dynamically at container start
 CMD ["sh", "-lc", "{ \
@@ -49,4 +53,5 @@ CMD ["sh", "-lc", "{ \
   done; \
   echo \"WHITELIST_DATA_DIR=$(printenv WHITELIST_DATA_DIR)\"; \
   echo \"RAILWAY_DEPLOYMENT_ID=$(printenv RAILWAY_DEPLOYMENT_ID)\"; \
+  echo \"ACCOUNT_REGISTRY_DIR=$(printenv ACCOUNT_REGISTRY_DIR)\"; \
 } > .env && pnpm run liquidate"]

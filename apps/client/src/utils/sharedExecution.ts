@@ -13,6 +13,7 @@ import {
   type Account,
   type Address,
   type Chain,
+  type Client,
   type Hex,
   type LocalAccount,
   type PublicClient,
@@ -56,7 +57,7 @@ const decimalsCache = new Map<string, number>();
 
 /** Resolve ERC-20 decimals with process-lifetime cache. Fallback 18 on failure. */
 export async function getTokenDecimals(
-  client: WalletClient<Transport, Chain, Account> | PublicClient,
+  client: WalletClient<Transport, Chain, Account> | PublicClient | Client<Transport, Chain>,
   asset: Address,
   wNative?: Address,
 ): Promise<number> {
@@ -128,6 +129,8 @@ export const TOKEN_BLACKLIST = new Set<string>([...DEFAULT_BLACKLIST, ...ENV_BLA
 export class SharedBlockBus {
   private listeners: {
     interval: number;
+    /** Fire when count % interval === phase (0..interval-1). Stagger bots to cut RPC bursts. */
+    phase: number;
     callback: () => Promise<void>;
     count: number;
     running: boolean;
@@ -135,9 +138,22 @@ export class SharedBlockBus {
   }[] = [];
   private unwatch: (() => void) | null = null;
 
-  register(interval: number, callback: () => Promise<void>, logTag: string): void {
-    this.listeners.push({ interval, callback, count: 0, running: false, logTag });
-    console.log(`${logTag}📡 Registered on shared block bus (every ${interval} blocks)`);
+  /**
+   * @param phase Offset in [0, interval). Same interval + different phase ⇒ bots don't all
+   *              hit multicall on the same block (helps avoid 429 spikes).
+   */
+  register(interval: number, callback: () => Promise<void>, logTag: string, phase = 0): void {
+    const iv = Math.max(1, interval);
+    const ph = ((phase % iv) + iv) % iv;
+    this.listeners.push({
+      interval: iv,
+      phase: ph,
+      callback,
+      count: 0,
+      running: false,
+      logTag,
+    });
+    console.log(`${logTag}📡 Registered on shared block bus (every ${iv} blocks, phase=${ph})`);
   }
 
   start(client: PublicClient, retryDelayMs = 5_000): () => void {
@@ -146,7 +162,8 @@ export class SharedBlockBus {
         onBlock: () => {
           for (const l of this.listeners) {
             l.count++;
-            if (l.count % l.interval !== 0) continue;
+            // phase stagger: e.g. interval=5 phase=0 → blocks 5,10,15; phase=2 → 2,7,12
+            if (l.count % l.interval !== l.phase) continue;
             if (l.running) continue;
             l.running = true;
             l.callback()
@@ -381,6 +398,25 @@ export interface ConvertCollateralToLoanResult {
   // was used (fully protocol-protected route, e.g. 1inch/0x) or impact couldn't be
   // estimated — callers should treat `undefined` as "apply the protected floor".
   impactBps: bigint | undefined;
+  /** How the route was resolved (for race metrics). */
+  via?: "same" | "cache" | "probe" | "fail";
+  /** Wall time for this convert attempt (ms). */
+  elapsedMs?: number;
+}
+
+export interface ConvertCollateralToLoanOptions {
+  /** Override venue list (default: deps.liquidityVenues). */
+  venues?: LiquidityVenue[];
+  /**
+   * Prefer on-chain AMMs (Aerodrome/Uni/wrappers). Only try aggregators (1inch/0x/LiFi)
+   * if local venues fail. Recommended for race-sensitive Aave path.
+   */
+  preferLocalDex?: boolean;
+}
+
+/** Aggregator / HTTP venues — slower; keep as fallback for race path. */
+function isAggregatorVenue(venue: LiquidityVenue): boolean {
+  return /oneinch|1inch|zeroex|0x|lifi|paraswap/i.test(venue.constructor.name);
 }
 
 async function tryVenueConvert(
@@ -420,13 +456,49 @@ async function tryVenueConvert(
   }
 }
 
-export async function convertCollateralToLoan(
+/**
+ * Core convert against an explicit venue list (preserves list order).
+ */
+async function convertWithVenues(
   deps: SharedExecutionDeps,
   collateralToken: Address,
   loanToken: Address,
   seizableCollateral: bigint,
   encoder: LiquidationEncoder,
+  venues: LiquidityVenue[],
 ): Promise<ConvertCollateralToLoanResult> {
+  const t0 = Date.now();
+  const done = (
+    success: boolean,
+    via: ConvertCollateralToLoanResult["via"],
+    impactBps?: bigint,
+  ): ConvertCollateralToLoanResult => {
+    const elapsedMs = Date.now() - t0;
+    if (success) {
+      console.log(
+        `${deps.logTag}[Route Timing] via=${via} ${elapsedMs}ms ` +
+          `${collateralToken.slice(0, 10)}…→${loanToken.slice(0, 10)}…`,
+      );
+    } else {
+      console.log(
+        `${deps.logTag}[Route Timing] via=fail ${elapsedMs}ms ` +
+          `${collateralToken.slice(0, 10)}…→${loanToken.slice(0, 10)}…`,
+      );
+    }
+    return { success, impactBps, via: success ? via : "fail", elapsedMs };
+  };
+
+  if (collateralToken.toLowerCase() === loanToken.toLowerCase()) {
+    return done(true, "same");
+  }
+  if (venues.length === 0 || seizableCollateral === 0n) {
+    return done(false, "fail");
+  }
+
+  // Snapshot so multi-hop / cached-route partials never pollute the caller encoder
+  // (preferLocalDex fallback and post-fail skip paths rely on a clean stack).
+  const encoderSnapshot = encoder.snapshotCalls();
+
   let toConvert = {
     src: collateralToken,
     dst: loanToken,
@@ -435,15 +507,12 @@ export async function convertCollateralToLoan(
   let maxImpactBps: bigint | undefined;
 
   console.log(
-    `${deps.logTag}[Route Debug] Trying to convert ${collateralToken.slice(0, 10)}... -> ${loanToken.slice(0, 10)}..., amount=${seizableCollateral}, venues=${deps.liquidityVenues.length}`,
+    `${deps.logTag}[Route Debug] Trying to convert ${collateralToken.slice(0, 10)}... -> ${loanToken.slice(0, 10)}..., amount=${seizableCollateral}, venues=${venues.length}`,
   );
 
   const cacheKey = pairCacheKey(collateralToken, loanToken);
 
-  // Fast path: replay the venue sequence that worked last time for this exact pair,
-  // skipping the priority-list probe entirely. Route availability rarely changes within
-  // a process lifetime, and we watch a small, fixed set of markets with recurring pairs,
-  // so this is the common case.
+  // Fast path: replay the venue sequence that worked last time for this exact pair.
   const cachedRoute = knownVenueForPair.get(cacheKey);
   if (cachedRoute !== undefined) {
     let cachedRouteOk = true;
@@ -464,25 +533,22 @@ export async function convertCollateralToLoan(
 
     if (cachedRouteOk && toConvert.src === toConvert.dst) {
       console.log(`${deps.logTag}[Route Debug] Conversion complete via cached route`);
-      return { success: true, impactBps: maxImpactBps };
+      return done(true, "cache", maxImpactBps);
     }
 
-    // Cached route no longer works (pool drained, liquidity moved, etc.) — drop it and
-    // fall back to a full probe from scratch.
+    // Cache miss/partial: wipe partial hops before full probe
     knownVenueForPair.delete(cacheKey);
+    encoder.restoreCalls(encoderSnapshot);
     toConvert = { src: collateralToken, dst: loanToken, srcAmount: seizableCollateral };
     maxImpactBps = undefined;
   }
 
-  // Full probe: check every venue's supportsRoute() concurrently instead of sequentially.
-  // This is what used to burn N RPC round-trips in series (one per venue tried before
-  // reaching the one that actually supports the pair) — now it's one round-trip wide.
   const usedVenues: LiquidityVenue[] = [];
 
   for (;;) {
     const currentHop = toConvert;
     const supportChecks = await Promise.all(
-      deps.liquidityVenues.map(async (venue) => {
+      venues.map(async (venue) => {
         try {
           const supported = await venue.supportsRoute(encoder, currentHop.src, currentHop.dst);
           return { venue, supported };
@@ -495,10 +561,8 @@ export async function convertCollateralToLoan(
       }),
     );
 
-    // Preserve configured priority order: walk the venue list in its original order,
-    // trying only the ones the parallel probe marked as supported, until one converts.
     let hopConverted = false;
-    for (const venue of deps.liquidityVenues) {
+    for (const venue of venues) {
       const check = supportChecks.find((c) => c.venue === venue);
       if (!check?.supported) {
         console.log(`${deps.logTag}[Route Debug] ${venue.constructor.name}: route not supported`);
@@ -523,20 +587,123 @@ export async function convertCollateralToLoan(
     if (toConvert.src === toConvert.dst) {
       knownVenueForPair.set(cacheKey, usedVenues);
       console.log(`${deps.logTag}[Route Debug] Conversion complete`);
-      return { success: true, impactBps: maxImpactBps };
+      return done(true, "probe", maxImpactBps);
     }
 
     if (!hopConverted) {
-      // No venue could make progress on the current hop — dead end.
       break;
     }
-    // Otherwise loop again: multi-hop route, probe for the next leg.
   }
 
+  // Full failure: drop any partial multi-hop calls so callers / fallbacks start clean
+  encoder.restoreCalls(encoderSnapshot);
   console.log(
     `${deps.logTag}[Route Debug] No venue found for ${collateralToken.slice(0, 10)}... -> ${loanToken.slice(0, 10)}...`,
   );
-  return { success: false, impactBps: undefined };
+  return done(false, "fail");
+}
+
+export async function convertCollateralToLoan(
+  deps: SharedExecutionDeps,
+  collateralToken: Address,
+  loanToken: Address,
+  seizableCollateral: bigint,
+  encoder: LiquidationEncoder,
+  options?: ConvertCollateralToLoanOptions,
+): Promise<ConvertCollateralToLoanResult> {
+  const allVenues = options?.venues ?? deps.liquidityVenues;
+
+  if (options?.preferLocalDex) {
+    const local = allVenues.filter((v) => !isAggregatorVenue(v));
+    const aggs = allVenues.filter((v) => isAggregatorVenue(v));
+
+    if (local.length > 0) {
+      const localResult = await convertWithVenues(
+        deps,
+        collateralToken,
+        loanToken,
+        seizableCollateral,
+        encoder,
+        local,
+      );
+      // convertWithVenues restores encoder on failure — safe to try aggregators next
+      if (localResult.success) return localResult;
+    }
+
+    if (aggs.length > 0) {
+      console.log(
+        `${deps.logTag}[Route Debug] Local DEX failed — falling back to aggregator(s): ${aggs.map((v) => v.constructor.name).join(", ")}`,
+      );
+      // Full list (local + agg) preserves multi-hop via wrapper then aggregator
+      return convertWithVenues(
+        deps,
+        collateralToken,
+        loanToken,
+        seizableCollateral,
+        encoder,
+        allVenues,
+      );
+    }
+
+    return { success: false, impactBps: undefined, via: "fail" };
+  }
+
+  return convertWithVenues(
+    deps,
+    collateralToken,
+    loanToken,
+    seizableCollateral,
+    encoder,
+    allVenues,
+  );
+}
+
+/**
+ * Prefill knownVenueForPair for common token pairs (process lifetime).
+ * Uses a tiny sample amount so we only discover routes / fill cache — not real sizes.
+ * Failures are logged and ignored (pair simply stays cold until first live convert).
+ */
+export async function warmVenueRouteCache(
+  deps: SharedExecutionDeps,
+  pairs: { src: Address; dst: Address }[],
+  sampleAmount: bigint = 10n ** 12n, // 0.000001 of 18-decimal token; enough for pool probes
+): Promise<{ warmed: number; failed: number }> {
+  let warmed = 0;
+  let failed = 0;
+  const seen = new Set<string>();
+
+  for (const { src, dst } of pairs) {
+    if (src.toLowerCase() === dst.toLowerCase()) continue;
+    const key = pairCacheKey(src, dst);
+    if (seen.has(key) || knownVenueForPair.has(key)) {
+      if (knownVenueForPair.has(key)) warmed++;
+      continue;
+    }
+    seen.add(key);
+
+    const encoder = new LiquidationEncoder(deps.executorAddress, deps.client);
+    try {
+      const result = await convertCollateralToLoan(deps, src, dst, sampleAmount, encoder, {
+        preferLocalDex: true,
+      });
+      if (result.success) {
+        warmed++;
+        console.log(`${deps.logTag}[Route Warm] ✓ ${src.slice(0, 10)}…→${dst.slice(0, 10)}…`);
+      } else {
+        failed++;
+      }
+    } catch (e) {
+      failed++;
+      console.warn(
+        `${deps.logTag}[Route Warm] ✗ ${src.slice(0, 10)}…→${dst.slice(0, 10)}…: ${e instanceof Error ? e.message : e}`,
+      );
+    }
+  }
+
+  console.log(
+    `${deps.logTag}[Route Warm] done: warmed=${warmed} failed=${failed} cachedPairs=${knownVenueForPair.size}`,
+  );
+  return { warmed, failed };
 }
 
 // ─── Simulation + Execution (flash loan path) ───
@@ -581,7 +748,12 @@ export async function simulateAndExecFlashLoan(
   ]);
 
   if (results[1].status !== "success") {
-    console.warn(`${deps.logTag}[FlashLoan] Simulation failed: ${results[1].error}`);
+    const simErr = results[1].error;
+    console.warn(`${deps.logTag}[FlashLoan] Simulation failed: ${simErr}`);
+    const raceReason = isNonRecoverableRevert(simErr);
+    if (raceReason !== undefined) {
+      throw new LiquidationRaceLostError(raceReason);
+    }
     return false;
   }
 
@@ -726,16 +898,36 @@ export function wrapWithFlashLoan(
 const NON_RECOVERABLE_REVERT_PATTERNS = [
   /position is healthy/i, // Morpho Blue
   /health factor.*not below/i, // Aave V3 (HEALTH_FACTOR_NOT_BELOW_THRESHOLD, code "51")
+  /HEALTH_FACTOR_NOT_BELOW_THRESHOLD/i,
   /\b51\b/, // Aave V3 numeric error code for the above
   /not.?liquidatable/i, // Compound V3 (Comet) NotLiquidatable()
   /insufficient shortfall/i, // Compound V2-style (Moonwell) comptroller rejection
   /collateral cannot be liquidated/i, // Aave V3
+  /already.?liquidat/i,
 ] as const;
 
 function isNonRecoverableRevert(error: unknown): string | undefined {
   const message = error instanceof Error ? error.message : String(error);
   const matched = NON_RECOVERABLE_REVERT_PATTERNS.find((pattern) => pattern.test(message));
   return matched ? message : undefined;
+}
+
+/** Thrown when the position is no longer liquidatable (competitor / HF recovered). */
+export class LiquidationRaceLostError extends Error {
+  readonly raceLost = true as const;
+  constructor(message: string) {
+    super(message);
+    this.name = "LiquidationRaceLostError";
+  }
+}
+
+export function isLiquidationRaceLostError(error: unknown): error is LiquidationRaceLostError {
+  return (
+    error instanceof LiquidationRaceLostError ||
+    (typeof error === "object" &&
+      error !== null &&
+      (error as { raceLost?: boolean }).raceLost === true)
+  );
 }
 
 export async function simulateAndExecFlashLoanWithFallback(
@@ -793,7 +985,8 @@ export async function simulateAndExecFlashLoanWithFallback(
         console.warn(
           `${deps.logTag}[FlashLoanFallback] Target no longer liquidatable (${nonRecoverableReason.slice(0, 120)}) — aborting fallback chain, ${providers.length - 1 - i} remaining provider(s) skipped`,
         );
-        return false;
+        // Surface as race-lost so callers can apply a short cooldown (not 1h hard lock).
+        throw new LiquidationRaceLostError(nonRecoverableReason);
       }
 
       console.warn(
@@ -847,7 +1040,12 @@ export async function simulateAndExec(
   ]);
 
   if (results[1].status !== "success") {
-    console.warn(`${deps.logTag}Transaction failed in simulation: ${results[1].error}`);
+    const simErr = results[1].error;
+    console.warn(`${deps.logTag}Transaction failed in simulation: ${simErr}`);
+    const raceReason = isNonRecoverableRevert(simErr);
+    if (raceReason !== undefined) {
+      throw new LiquidationRaceLostError(raceReason);
+    }
     return false;
   }
 

@@ -37,19 +37,35 @@ import { base } from "viem/chains";
 
 import { comptrollerAbi, mTokenAbi, MOONWELL_UNDERLYING_MAP } from "./abis/Moonwell.js";
 import { MoonwellAccountRegistry } from "./moonwellAccountRegistry.js";
-import { PositionLiquidationCooldownMechanism } from "./utils/cooldownMechanisms.js";
+import {
+  classifyLiquidationFailure,
+  type CooldownClass,
+  PositionLiquidationCooldownMechanism,
+} from "./utils/cooldownMechanisms.js";
 import { logLiquidationDebug } from "./utils/liquidationDebug.js";
 import { LiquidationEncoder } from "./utils/LiquidationEncoder.js";
 import { liquidationTracker } from "./utils/liquidationState.js";
+import { RaceMetrics, elapsedMs, nowMs } from "./utils/raceMetrics.js";
+import { ensureRegistryDataDir, resolveAccountRegistryPath } from "./utils/registryPaths.js";
+import {
+  defaultHfBatchSize,
+  defaultHfConcurrency,
+  routeWarmMaxMajors,
+  rpcWaveGapMs,
+  shouldWarmRoutes,
+  sleep,
+} from "./utils/rpcBudget.js";
 import { createScanClient, ReadClientPool } from "./utils/rpcFallback.js";
 import {
   type SharedExecutionDeps,
   TOKEN_BLACKLIST,
   convertCollateralToLoan,
   SharedBlockBus,
+  isLiquidationRaceLostError,
   priceAsset,
   simulateAndExecFlashLoanWithFallback,
   simulateAndExec,
+  warmVenueRouteCache,
 } from "./utils/sharedExecution.js";
 
 /** mantissa 精度 (1e18) */
@@ -106,15 +122,15 @@ export class MoonwellLiquidationBot {
   private alwaysRealizeBadDebt: boolean;
   private registry: MoonwellAccountRegistry;
   private pollIntervalBlocks: number;
+  private hfBatchSize: number;
+  private hfConcurrency: number;
   private sharedDeps: SharedExecutionDeps;
   /** Read-only client using Base public RPC — for historical event scanning only */
   private scanClient: Client<Transport, Chain>;
+  private raceMetrics = new RaceMetrics(20);
 
   /** Cached Comptroller params */
   private closeFactor = 0n;
-  /** Cached liquidation incentive (1e18-scaled), e.g. 1.08e18 = 8% bonus. Used as a
-   *  fallback sanity check; the swap amount itself is read via liquidateCalculateSeizeTokens. */
-  private liquidationIncentiveMantissa = 108n * 10n ** 16n; // default 8%, overwritten on cache
 
   /** Cached mToken → reserveFactor (for pre-filtering unprofitable markets) */
   private reserveFactors = new Map<Address, bigint>();
@@ -162,6 +178,8 @@ export class MoonwellLiquidationBot {
     this.flashLoanFallbackProviders = inputs.flashLoanFallbackProviders ?? [];
     this.alwaysRealizeBadDebt = inputs.alwaysRealizeBadDebt ?? false;
     this.pollIntervalBlocks = inputs.moonwellWatchlist.pollIntervalBlocks ?? 5;
+    this.hfBatchSize = defaultHfBatchSize(100);
+    this.hfConcurrency = defaultHfConcurrency(inputs.paidReadPool.size);
 
     this.mTokenList = inputs.moonwellWatchlist.mTokens.map((m) => ({
       address: m.address,
@@ -169,8 +187,10 @@ export class MoonwellLiquidationBot {
       deployBlock: m.deployBlock,
     }));
 
+    ensureRegistryDataDir();
     const registryPath =
-      inputs.registryFilePath ?? `./data/moonwell-accounts.${inputs.chainId}.json`;
+      inputs.registryFilePath ??
+      resolveAccountRegistryPath(`moonwell-accounts.${inputs.chainId}.json`);
     this.registry = new MoonwellAccountRegistry(registryPath);
 
     this.sharedDeps = {
@@ -225,9 +245,47 @@ export class MoonwellLiquidationBot {
       );
     }
 
+    await this.warmDexRoutes();
+
     console.log(
       `${this.logTag}🗄️ Moonwell registry initialized: ${this.registry.totalAccounts} total accounts across ${this.mTokenList.length} mTokens`,
     );
+  }
+
+  /** Prefill DEX routes among underlyings (local AMM first). */
+  private async warmDexRoutes(): Promise<void> {
+    if (!shouldWarmRoutes()) {
+      console.log(`${this.logTag}🔥 DEX warm skipped (SKIP_ROUTE_WARM=1)`);
+      return;
+    }
+    const maxMajors = routeWarmMaxMajors(6);
+    const underlyings = [
+      ...new Set(
+        this.mTokenList
+          .map((m) => this.getUnderlying(m.address).toLowerCase())
+          .concat(this.wNative.toLowerCase()),
+      ),
+    ]
+      .slice(0, maxMajors)
+      .map((a) => a as Address);
+
+    const pairs: { src: Address; dst: Address }[] = [];
+    for (const src of underlyings) {
+      for (const dst of underlyings) {
+        if (src !== dst) pairs.push({ src, dst });
+      }
+    }
+    if (pairs.length === 0) return;
+    console.log(
+      `${this.logTag}🔥 Warming ${pairs.length} Moonwell DEX routes (prefer local AMM, majors=${maxMajors})…`,
+    );
+    try {
+      await warmVenueRouteCache(this.sharedDeps, pairs);
+    } catch (e) {
+      console.warn(
+        `${this.logTag}⚠️ DEX warm failed (non-fatal): ${e instanceof Error ? e.message : e}`,
+      );
+    }
   }
 
   /**
@@ -300,7 +358,6 @@ export class MoonwellLiquidationBot {
         }),
       ]);
       this.closeFactor = cf;
-      this.liquidationIncentiveMantissa = li;
       console.log(
         `${this.logTag}📋 Comptroller params: closeFactor=${Number(cf) / 1e18}, liquidationIncentive=${Number(li) / 1e18}`,
       );
@@ -364,7 +421,13 @@ export class MoonwellLiquidationBot {
    * Returns an unwatch function.
    */
   startPolling(bus: SharedBlockBus): void {
-    bus.register(this.pollIntervalBlocks, () => this.checkAllMarkets(), this.logTag);
+    // phase=2 → blocks 2,7,12… when interval=5 (stagger vs Comet phase=0)
+    const phase = this.pollIntervalBlocks > 1 ? 2 % this.pollIntervalBlocks : 0;
+    bus.register(this.pollIntervalBlocks, () => this.checkAllMarkets(), this.logTag, phase);
+    console.log(
+      `${this.logTag}⚡ Race mode: poll every ${this.pollIntervalBlocks} block(s) phase=${phase}, ` +
+        `batch=${this.hfBatchSize} concurrency=${this.hfConcurrency} waveGap=${rpcWaveGapMs()}ms`,
+    );
   }
 
   /**
@@ -399,10 +462,28 @@ export class MoonwellLiquidationBot {
       }
     }
 
-    if (allAccounts.size === 0) return;
+    if (allAccounts.size === 0) {
+      this.raceMetrics.onTick({
+        logTag: this.logTag,
+        mode: "full",
+        accounts: 0,
+        liquidatable: 0,
+        hfScanMs: 0,
+      });
+      return;
+    }
 
-    // Batch check getAccountLiquidity for all accounts
+    const t0 = nowMs();
     const liquidatable = await this.batchCheckShortfall([...allAccounts] as Address[]);
+    const scanMs = elapsedMs(t0);
+
+    this.raceMetrics.onTick({
+      logTag: this.logTag,
+      mode: "full",
+      accounts: allAccounts.size,
+      liquidatable: liquidatable.length,
+      hfScanMs: scanMs,
+    });
 
     if (liquidatable.length === 0) return;
 
@@ -419,7 +500,8 @@ export class MoonwellLiquidationBot {
 
     const hotCount = liquidatable.filter((l) => hotAccountSet.has(l.account.toLowerCase())).length;
     console.log(
-      `${this.logTag}🎯 ${liquidatable.length} liquidatable account(s) found! (${hotCount} in hot markets, sorted by priority)`,
+      `${this.logTag}🎯 ${liquidatable.length} liquidatable account(s)! ` +
+        `(${hotCount} hot markets, scan ${allAccounts.size} in ${scanMs}ms)`,
     );
 
     for (const { account } of liquidatable) {
@@ -428,29 +510,57 @@ export class MoonwellLiquidationBot {
   }
 
   /**
-   * Batch check getAccountLiquidity for multiple accounts.
-   * Returns accounts with shortfall > 0, paired with their shortfall amount for sorting.
+   * Parallel-sharded multicall of getAccountLiquidity across paidReadPool.
    */
   private async batchCheckShortfall(
     accounts: Address[],
   ): Promise<{ account: Address; shortfall: bigint }[]> {
-    const BATCH_SIZE = 50;
+    const batchSize = Math.max(10, this.hfBatchSize);
+    const concurrency = Math.max(
+      1,
+      Math.min(this.hfConcurrency, Math.max(1, this.paidReadPool.size)),
+    );
     const liquidatable: { account: Address; shortfall: bigint }[] = [];
 
-    for (let i = 0; i < accounts.length; i += BATCH_SIZE) {
-      const batch = accounts.slice(i, i + BATCH_SIZE);
-      try {
-        this._rpcTotal += batch.length;
-        const results = await multicall(this.paidReadPool.next(), {
-          contracts: batch.map((account) => ({
-            address: this.comptroller,
-            abi: comptrollerAbi,
-            functionName: "getAccountLiquidity" as const,
-            args: [account] as const,
-          })),
-          allowFailure: true,
-        });
+    const batches: Address[][] = [];
+    for (let i = 0; i < accounts.length; i += batchSize) {
+      batches.push(accounts.slice(i, i + batchSize));
+    }
 
+    const waveGap = rpcWaveGapMs();
+    for (let waveStart = 0; waveStart < batches.length; waveStart += concurrency) {
+      if (waveStart > 0 && waveGap > 0) await sleep(waveGap);
+      const wave = batches.slice(waveStart, waveStart + concurrency);
+      const waveResults = await Promise.all(
+        wave.map(async (batch) => {
+          const { client, label } = this.paidReadPool.nextWithLabel();
+          try {
+            const results = await multicall(client, {
+              contracts: batch.map((account) => ({
+                address: this.comptroller,
+                abi: comptrollerAbi,
+                functionName: "getAccountLiquidity" as const,
+                args: [account] as const,
+              })),
+              allowFailure: true,
+            });
+            this.paidReadPool.recordSuccess(label);
+            this._rpcTotal += batch.length;
+            return { batch, results, ok: true as const };
+          } catch (e) {
+            this.paidReadPool.recordFailure(label);
+            this._rpcErrors += batch.length;
+            this._lastError = String(e);
+            console.warn(
+              `${this.logTag}⚠️ shortfall multicall failed on ${label}: ${e instanceof Error ? e.message : e}`,
+            );
+            return { batch, results: null, ok: false as const };
+          }
+        }),
+      );
+
+      for (const { batch, results, ok } of waveResults) {
+        if (!ok || !results) continue;
         for (let j = 0; j < results.length; j++) {
           const result = results[j]!;
           if (result.status !== "success") {
@@ -462,12 +572,6 @@ export class MoonwellLiquidationBot {
             liquidatable.push({ account: batch[j]!, shortfall });
           }
         }
-      } catch (e) {
-        this._rpcErrors += batch.length;
-        this._lastError = String(e);
-        console.warn(
-          `${this.logTag}⚠️ batchCheckShortfall batch ${i / BATCH_SIZE} failed: ${e instanceof Error ? e.message : e}`,
-        );
       }
     }
 
@@ -477,8 +581,11 @@ export class MoonwellLiquidationBot {
   // ─── Liquidation execution ───
 
   private async liquidateAccount(account: Address): Promise<void> {
-    // Cooldown check (use comptroller address as "market" key)
-    if (this.cooldown && !this.cooldown.isPositionReady(this.comptroller, account)) {
+    const tTotal = nowMs();
+
+    // Peek only — arm after real attempt (graded)
+    if (this.cooldown?.isCoolingDown(this.comptroller, account)) {
+      this.raceMetrics.recordOutcome("skip_cooldown");
       logLiquidationDebug({
         protocol: this.logTag,
         account,
@@ -496,6 +603,7 @@ export class MoonwellLiquidationBot {
     const accountKey = account.toLowerCase();
     const cooldownExpiry = this.simulationCooldowns.get(accountKey);
     if (cooldownExpiry && Date.now() < cooldownExpiry) {
+      this.raceMetrics.recordOutcome("skip_cooldown");
       logLiquidationDebug({
         protocol: this.logTag,
         account,
@@ -506,9 +614,8 @@ export class MoonwellLiquidationBot {
           note: "Previous simulation failed, waiting before retry",
         },
       });
-      return; // Still in cooldown, skip silently
+      return;
     }
-    // Cooldown expired, clear it
     if (cooldownExpiry) {
       this.simulationCooldowns.delete(accountKey);
       this.simulationFailures.delete(accountKey);
@@ -530,10 +637,10 @@ export class MoonwellLiquidationBot {
 
     this._liquidationsAttempted++;
 
-    // Single multicall: borrow balances + collateral balances (was 2 separate multicalls)
     const { borrowPositions, collateralMToken } = await this.findBorrowAndCollateral(account);
 
     if (borrowPositions.length === 0) {
+      this.raceMetrics.recordOutcome("skip_no_pair");
       logLiquidationDebug({
         protocol: this.logTag,
         account,
@@ -548,6 +655,7 @@ export class MoonwellLiquidationBot {
     }
 
     if (!collateralMToken) {
+      this.raceMetrics.recordOutcome("skip_no_pair");
       logLiquidationDebug({
         protocol: this.logTag,
         account,
@@ -563,8 +671,8 @@ export class MoonwellLiquidationBot {
     }
     const collateralUnderlying = this.getUnderlying(collateralMToken);
 
-    // SECURITY: Skip if collateral is blacklisted
     if (TOKEN_BLACKLIST.has(collateralUnderlying.toLowerCase())) {
+      this.raceMetrics.recordOutcome("skip_blacklist");
       logLiquidationDebug({
         protocol: this.logTag,
         account,
@@ -580,57 +688,61 @@ export class MoonwellLiquidationBot {
       return;
     }
 
-    // Try each borrow position (sorted by balance) until one succeeds
+    // Try each borrow position until one succeeds
     for (const { borrowMToken, borrowBalance } of borrowPositions) {
       const borrowUnderlying = this.getUnderlying(borrowMToken);
 
-      // Skip blacklisted borrow tokens
-      if (TOKEN_BLACKLIST.has(borrowUnderlying.toLowerCase())) {
-        continue;
-      }
-
-      // Skip if borrow and collateral are the same market (can't seize what you owe)
-      if (borrowMToken.toLowerCase() === collateralMToken.toLowerCase()) {
-        continue;
-      }
+      if (TOKEN_BLACKLIST.has(borrowUnderlying.toLowerCase())) continue;
+      if (borrowMToken.toLowerCase() === collateralMToken.toLowerCase()) continue;
 
       const maxRepay = (borrowBalance * this.closeFactor) / MANTISSA;
       if (maxRepay === 0n) continue;
 
       try {
-        if (this.useFlashLoan) {
-          await this.liquidateWithFlashLoan(
-            account,
-            borrowMToken,
-            collateralMToken,
-            borrowUnderlying,
-            collateralUnderlying,
-            maxRepay,
-          );
-        } else {
-          await this.liquidateDirect(
-            account,
-            borrowMToken,
-            collateralMToken,
-            borrowUnderlying,
-            collateralUnderlying,
-            maxRepay,
-          );
+        const ok = this.useFlashLoan
+          ? await this.liquidateWithFlashLoan(
+              account,
+              borrowMToken,
+              collateralMToken,
+              borrowUnderlying,
+              collateralUnderlying,
+              maxRepay,
+            )
+          : await this.liquidateDirect(
+              account,
+              borrowMToken,
+              collateralMToken,
+              borrowUnderlying,
+              collateralUnderlying,
+              maxRepay,
+            );
+
+        if (ok) {
+          this.simulationFailures.set(accountKey, 0);
+          this._liquidationsSucceeded++;
+          this.armCooldown(account, "success");
+          this.raceMetrics.recordStage("totalLiq", elapsedMs(tTotal));
+          return;
         }
-        // Success — reset failure counter and stop trying other borrow positions
-        this.simulationFailures.set(accountKey, 0);
-        this._liquidationsSucceeded++;
-        return;
+        // soft fail (not profitable / no route) — try next borrow market
       } catch (error) {
         console.warn(
           `${this.logTag}  ⚠️ Liquidation via ${borrowMToken.slice(0, 10)}... failed, trying next borrow...: ${error instanceof Error ? error.message : error}`,
         );
+        // Keep last error for graded cooldown after all attempts
+        this._lastError = String(error);
       }
     }
 
-    // All borrow positions exhausted — record failure
+    // All borrow positions exhausted
     this._liquidationsFailed++;
-    this._lastError = "all borrow positions exhausted";
+    if (this._lastError) {
+      this.armCooldownFromError(account, this._lastError);
+    } else {
+      this.armCooldown(account, "soft", "all borrow positions exhausted");
+    }
+    this._lastError = this._lastError ?? "all borrow positions exhausted";
+
     const failures = (this.simulationFailures.get(accountKey) ?? 0) + 1;
     this.simulationFailures.set(accountKey, failures);
 
@@ -643,6 +755,7 @@ export class MoonwellLiquidationBot {
     }
 
     console.log(`${this.logTag}  ${account} — all borrow positions exhausted, skipping`);
+    this.raceMetrics.recordStage("totalLiq", elapsedMs(tTotal));
   }
 
   /**
@@ -694,6 +807,7 @@ export class MoonwellLiquidationBot {
    *   5. Skim profit to treasury
    *   6. Auto-repay Balancer flash loan
    */
+  /** @returns true if liquidation executed successfully */
   private async liquidateWithFlashLoan(
     account: Address,
     borrowMToken: Address,
@@ -701,10 +815,9 @@ export class MoonwellLiquidationBot {
     borrowUnderlying: Address,
     collateralUnderlying: Address,
     repayAmount: bigint,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const callbackEncoder = new LiquidationEncoder(this.executorAddress, this.client);
 
-    // Step 1: Approve borrow mToken to spend flash loan funds — only if needed
     const currentAllowance = await readContract(this.client, {
       address: borrowUnderlying,
       abi: erc20Abi,
@@ -715,15 +828,10 @@ export class MoonwellLiquidationBot {
       callbackEncoder.erc20Approve(borrowUnderlying, borrowMToken, maxUint256);
     }
 
-    // Step 2: liquidateBorrow — repay debt, seize collateral mToken
     callbackEncoder.moonwellLiquidateBorrow(borrowMToken, collateralMToken, account, repayAmount);
-
-    // Step 3: redeem — convert seized mToken to underlying
-    // Use redeem(maxUint256) to burn ALL seized mTokens. Do NOT use redeemUnderlying(0)
-    // — in Compound V2, redeemUnderlying(0) is a no-op (redeems 0 underlying tokens).
     callbackEncoder.moonwellRedeem(collateralMToken, maxUint256);
 
-    // Step 4: DEX swap collateral underlying → borrow underlying (if different tokens)
+    let venueImpactBps: bigint | undefined;
     if (collateralUnderlying.toLowerCase() !== borrowUnderlying.toLowerCase()) {
       const expectedCollateral = await this.estimateSeizedUnderlying(
         borrowMToken,
@@ -732,23 +840,33 @@ export class MoonwellLiquidationBot {
       );
       if (expectedCollateral === 0n) {
         console.log(`${this.logTag}  ${account} could not estimate seized collateral, skipping`);
-        return;
+        return false;
       }
-      await convertCollateralToLoan(
+      const swap = await convertCollateralToLoan(
         this.sharedDeps,
         collateralUnderlying,
         borrowUnderlying,
         expectedCollateral,
         callbackEncoder,
+        { preferLocalDex: true },
       );
+      this.recordConvertMetrics(swap);
+      if (!swap.success) {
+        // Do not arm cooldown here — parent may try another borrow market
+        this.raceMetrics.recordOutcome("skip_no_route");
+        console.log(
+          `${this.logTag}No DEX route for ${collateralUnderlying.slice(0, 10)}…→${borrowUnderlying.slice(0, 10)}…, try next borrow`,
+        );
+        return false;
+      }
+      venueImpactBps = swap.impactBps;
     }
 
-    // Step 5: Skim profit to treasury
     callbackEncoder.erc20Skim(borrowUnderlying, this.treasuryAddress);
-
     const callbackCalls = callbackEncoder.flush();
 
     try {
+      const tSim = nowMs();
       const success = await simulateAndExecFlashLoanWithFallback(
         this.sharedDeps,
         callbackCalls,
@@ -756,6 +874,13 @@ export class MoonwellLiquidationBot {
         false,
         repayAmount,
         collateralUnderlying,
+        undefined,
+        venueImpactBps,
+      );
+      const simMs = elapsedMs(tSim);
+      this.raceMetrics.recordStage("simExec", simMs);
+      console.log(
+        `${this.logTag}[LiqTiming] flash account=${account.slice(0, 10)}… simExecMs=${simMs} ok=${success}`,
       );
 
       if (success) {
@@ -771,18 +896,21 @@ export class MoonwellLiquidationBot {
         console.log(
           `${this.logTag}[FlashLoan] Liquidated ${account} via ${borrowMToken.slice(0, 10)}... (repay=${repayAmount})`,
         );
-      } else {
-        console.log(`${this.logTag}[FlashLoan] Skipped ${account} (not profitable)`);
+        return true;
       }
+      console.log(`${this.logTag}[FlashLoan] Skipped ${account} (not profitable)`);
+      return false;
     } catch (error) {
       console.error(
         `${this.logTag}[FlashLoan] Failed to liquidate ${account}: ${error instanceof Error ? error.message : error}`,
       );
+      throw error; // rethrow so liquidateAccount can try next borrow / grade cooldown
     }
   }
 
   /**
    * Direct liquidation path (no flash loan — requires pre-funded underlying).
+   * @returns true if liquidation executed successfully
    */
   private async liquidateDirect(
     account: Address,
@@ -791,10 +919,9 @@ export class MoonwellLiquidationBot {
     borrowUnderlying: Address,
     collateralUnderlying: Address,
     repayAmount: bigint,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const encoder = new LiquidationEncoder(this.executorAddress, this.client);
 
-    // Approve borrow mToken — only if allowance insufficient
     const currentAllowance = await readContract(this.client, {
       address: borrowUnderlying,
       abi: erc20Abi,
@@ -805,13 +932,9 @@ export class MoonwellLiquidationBot {
       encoder.erc20Approve(borrowUnderlying, borrowMToken, maxUint256);
     }
 
-    // liquidateBorrow
     encoder.moonwellLiquidateBorrow(borrowMToken, collateralMToken, account, repayAmount);
-
-    // redeem — convert seized mToken to underlying
     encoder.moonwellRedeem(collateralMToken, maxUint256);
 
-    // DEX swap collateral underlying → borrow underlying (if different tokens)
     if (collateralUnderlying.toLowerCase() !== borrowUnderlying.toLowerCase()) {
       const expectedCollateral = await this.estimateSeizedUnderlying(
         borrowMToken,
@@ -820,23 +943,31 @@ export class MoonwellLiquidationBot {
       );
       if (expectedCollateral === 0n) {
         console.log(`${this.logTag}  ${account} could not estimate seized collateral, skipping`);
-        return;
+        return false;
       }
-      await convertCollateralToLoan(
+      const swap = await convertCollateralToLoan(
         this.sharedDeps,
         collateralUnderlying,
         borrowUnderlying,
         expectedCollateral,
         encoder,
+        { preferLocalDex: true },
       );
+      this.recordConvertMetrics(swap);
+      if (!swap.success) {
+        this.raceMetrics.recordOutcome("skip_no_route");
+        console.log(
+          `${this.logTag}No DEX route for ${collateralUnderlying.slice(0, 10)}…→${borrowUnderlying.slice(0, 10)}…, try next borrow`,
+        );
+        return false;
+      }
     }
 
-    // Skim profit
     encoder.erc20Skim(borrowUnderlying, this.treasuryAddress);
-
     const calls = encoder.flush();
 
     try {
+      const tSim = nowMs();
       const success = await simulateAndExec(
         this.sharedDeps,
         encoder,
@@ -846,6 +977,11 @@ export class MoonwellLiquidationBot {
         undefined,
         undefined,
         collateralUnderlying,
+      );
+      const simMs = elapsedMs(tSim);
+      this.raceMetrics.recordStage("simExec", simMs);
+      console.log(
+        `${this.logTag}[LiqTiming] direct account=${account.slice(0, 10)}… simExecMs=${simMs} ok=${success}`,
       );
 
       if (success) {
@@ -861,14 +997,61 @@ export class MoonwellLiquidationBot {
         console.log(
           `${this.logTag}Liquidated ${account} via ${borrowMToken.slice(0, 10)}... (repay=${repayAmount})`,
         );
-      } else {
-        console.log(`${this.logTag}Skipped ${account} (not profitable)`);
+        return true;
       }
+      console.log(`${this.logTag}Skipped ${account} (not profitable)`);
+      return false;
     } catch (error) {
       console.error(
         `${this.logTag}Failed to liquidate ${account}: ${error instanceof Error ? error.message : error}`,
       );
+      throw error;
     }
+  }
+
+  private armCooldown(
+    account: Address,
+    cls: CooldownClass,
+    detail?: string,
+    metricsOutcome?: "success" | "fail_race" | "fail_soft_profit" | "fail_hard" | "skip_no_route",
+  ): void {
+    if (metricsOutcome) {
+      this.raceMetrics.recordOutcome(metricsOutcome);
+    } else if (cls === "race") {
+      this.raceMetrics.recordOutcome("fail_race");
+    } else if (cls === "soft") {
+      this.raceMetrics.recordOutcome("fail_soft_profit");
+    } else if (cls === "success") {
+      this.raceMetrics.recordOutcome("success");
+    } else if (cls === "hard") {
+      this.raceMetrics.recordOutcome("fail_hard");
+    }
+
+    if (!this.cooldown) return;
+    const seconds = this.cooldown.markClass(this.comptroller, account, cls);
+    console.log(
+      `${this.logTag}⏳ Cooldown ${cls} ${seconds}s for ${account.slice(0, 10)}…` +
+        (detail ? ` (${detail.slice(0, 100)})` : ""),
+    );
+  }
+
+  private armCooldownFromError(account: Address, error: unknown): void {
+    if (isLiquidationRaceLostError(error) || classifyLiquidationFailure(error) === "race") {
+      this.armCooldown(account, "race", error instanceof Error ? error.message : String(error));
+      return;
+    }
+    const cls = classifyLiquidationFailure(error);
+    this.armCooldown(account, cls, error instanceof Error ? error.message : String(error));
+  }
+
+  private recordConvertMetrics(swap: { success: boolean; via?: string; elapsedMs?: number }): void {
+    const ms = swap.elapsedMs ?? 0;
+    const via = !swap.success
+      ? "fail"
+      : swap.via === "cache" || swap.via === "probe" || swap.via === "same"
+        ? swap.via
+        : "probe";
+    this.raceMetrics.recordConvert(ms, via);
   }
 
   // ─── Helpers ───
@@ -1078,6 +1261,7 @@ export class MoonwellLiquidationBot {
       rpcErrorRate,
       lastError: this._lastError,
       isHealthy: rpcErrorRate < 0.3,
+      raceMetrics: this.raceMetrics.snapshot(),
     };
   }
 }

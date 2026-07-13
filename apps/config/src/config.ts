@@ -54,7 +54,15 @@ export const TOKEN_BLACKLIST_CONFIG = process.env.TOKEN_BLACKLIST
 
 export const MARKETS_FETCHING_COOLDOWN_PERIOD = 60 * 60 * 24; // 24 hours (1 day)
 export const POSITION_LIQUIDATION_COOLDOWN_ENABLED = true; // true if you want to enable the cooldown mechanism
+/** Hard / success cooldown after a real liquidation attempt (seconds). */
 export const POSITION_LIQUIDATION_COOLDOWN_PERIOD = 60 * 60; // 1 hour
+/**
+ * Race-lost cooldown (competitor took the liq / HF recovered) — short so we can retry if
+ * price re-breaks the position. Used by Aave graded cooldown.
+ */
+export const POSITION_LIQUIDATION_COOLDOWN_RACE_SECONDS = 15;
+/** Soft failure (unprofitable / slippage / route) — medium. */
+export const POSITION_LIQUIDATION_COOLDOWN_SOFT_SECONDS = 120;
 
 /// Chains configurations
 
@@ -272,15 +280,24 @@ export const chainConfigs: Record<number, Config> = {
           "0x236aa50979D5f3De3Bd1Eeb40E81137F22ab794b", // xETH
           "0x660975730059246A68521a3e2FBD4740173100f5", // rgUSD
         ],
-        pollIntervalBlocks: 5,
+        // Race: every block hot set; full registry less often to cut 429 bursts
+        // (hot path still catches near-liq; full only refreshes membership)
+        pollIntervalBlocks: 1,
+        fullScanIntervalBlocks: 15,
+        nearHealthFactor: 1.05,
+        hfBatchSize: 100,
+        // concurrency capped in bot via HF_CONCURRENCY / defaultHfConcurrency (≤3)
       },
       // BUGFIX: 原本只用免費的 mainnet.base.org 做歷史事件掃描(可能要掃幾千萬個區塊),
       // 極容易被 rate limit。現在優先用已設定的付費 RPC,免費節點降級為最後備援。
       scanRpcUrls: [
-        process.env.PAID_RPC_CHAINSTACK,
-        process.env.PAID_RPC_COINBASE,
-        process.env.PAID_RPC_ZAN,
-        process.env.PAID_RPC_SIMPLYSTAKING,
+        process.env.RPC_URL_BASE,
+        process.env.RPC_URL_BASE2,
+        process.env.RPC_URL_BASE3,
+        process.env.RPC_URL_BASE4,
+        process.env.RPC_URL_BASE5,
+        process.env.RPC_URL_BASE6,
+        process.env.RPC_URL_BASE7,
         process.env.PUBLIC_RPC_URL_BASE,
         "https://mainnet.base.org",
       ].filter((u): u is string => Boolean(u)),

@@ -1,29 +1,151 @@
 import { Address, Hex } from "viem";
 
+/**
+ * Graded cooldown after liquidation attempts.
+ *
+ * - race:  someone else liquidated / HF recovered — short retry window
+ * - soft:  unprofitable / route/slippage — medium
+ * - hard:  structural or unknown failure — long (default 1h)
+ * - success: we liquidated — long (avoid re-hitting empty husk)
+ */
+export type CooldownClass = "race" | "soft" | "hard" | "success";
+
+export interface CooldownPeriods {
+  /** Default / hard / success period (seconds). */
+  hard: number;
+  /** Race-lost period (seconds). Default 15. */
+  race: number;
+  /** Soft business failure (seconds). Default 120. */
+  soft: number;
+}
+
+const DEFAULT_RACE_SECONDS = 15;
+const DEFAULT_SOFT_SECONDS = 120;
+
+/** Target no longer liquidatable — competitor or price recovered. */
+const RACE_LOST_PATTERNS: readonly RegExp[] = [
+  /position is healthy/i, // Morpho Blue
+  /health factor.*not below/i, // Aave V3
+  /HEALTH_FACTOR_NOT_BELOW_THRESHOLD/i,
+  /\b51\b/, // Aave V3 error code 51
+  /not.?liquidatable/i, // Comet
+  /insufficient shortfall/i, // Moonwell / CToken
+  /collateral cannot be liquidated/i, // Aave
+  /already.?liquidat/i,
+  /no debt/i,
+  /user has no.*debt/i,
+  /zero debt/i,
+  /must be liquidatable/i,
+];
+
+/** Business / venue failures that may clear soon. */
+const SOFT_FAIL_PATTERNS: readonly RegExp[] = [
+  /profit/i,
+  /slippage/i,
+  /too little received/i,
+  /insufficient.*output/i,
+  /insufficient.*liquidity/i,
+  /STF\b/i,
+  /TRANSFER_FROM_FAILED/i,
+  /below threshold/i,
+  /not profitable/i,
+  /Simulation failed/i,
+];
+
+export function classifyLiquidationFailure(error: unknown): CooldownClass {
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : error == null
+          ? ""
+          : JSON.stringify(error);
+  if (RACE_LOST_PATTERNS.some((p) => p.test(message))) return "race";
+  if (SOFT_FAIL_PATTERNS.some((p) => p.test(message))) return "soft";
+  return "hard";
+}
+
+export function isRaceLostFailure(error: unknown): boolean {
+  return classifyLiquidationFailure(error) === "race";
+}
+
 export class PositionLiquidationCooldownMechanism {
-  private cooldownPeriod: number;
+  private periods: CooldownPeriods;
   private positionReadyAt: Record<Hex, Record<Address, number>>;
 
-  constructor(cooldownPeriod: number) {
-    this.cooldownPeriod = cooldownPeriod;
+  constructor(hardPeriodSeconds: number, periods?: Partial<Omit<CooldownPeriods, "hard">>) {
+    this.periods = {
+      hard: hardPeriodSeconds,
+      race: periods?.race ?? DEFAULT_RACE_SECONDS,
+      soft: periods?.soft ?? DEFAULT_SOFT_SECONDS,
+    };
     this.positionReadyAt = {};
   }
 
+  get cooldownPeriod(): number {
+    return this.periods.hard;
+  }
+
+  /** Legacy Morpho/Comet/Moonwell: peek + arm hard cooldown in one call. */
   isPositionReady(marketId: Hex, account: Address) {
+    if (this.isCoolingDown(marketId, account)) {
+      return false;
+    }
+    this.markAttempted(marketId, account, "hard");
+    return true;
+  }
+
+  /** Peek only — does not arm the timer. */
+  isCoolingDown(marketId: Hex, account: Address): boolean {
+    const byMarket = this.positionReadyAt[marketId];
+    if (!byMarket) return false;
+    const readyAt = byMarket[account];
+    if (readyAt === undefined) return false;
+    return readyAt > Math.floor(Date.now() / 1000);
+  }
+
+  /**
+   * Arm cooldown. Prefer `markClass` for race-sensitive bots.
+   * @param classOrSeconds CooldownClass or explicit seconds
+   */
+  markAttempted(
+    marketId: Hex,
+    account: Address,
+    classOrSeconds: CooldownClass | number = "hard",
+  ): void {
+    const seconds =
+      typeof classOrSeconds === "number" ? classOrSeconds : this.secondsForClass(classOrSeconds);
+
     if (this.positionReadyAt[marketId] === undefined) {
       this.positionReadyAt[marketId] = {};
     }
+    this.positionReadyAt[marketId][account] = Math.floor(Date.now() / 1000) + Math.max(0, seconds);
+  }
 
-    if (this.positionReadyAt[marketId][account] === undefined) {
-      this.positionReadyAt[marketId][account] = 0;
+  markClass(marketId: Hex, account: Address, cls: CooldownClass): number {
+    this.markAttempted(marketId, account, cls);
+    return this.secondsForClass(cls);
+  }
+
+  secondsForClass(cls: CooldownClass): number {
+    switch (cls) {
+      case "race":
+        return this.periods.race;
+      case "soft":
+        return this.periods.soft;
+      case "success":
+      case "hard":
+      default:
+        return this.periods.hard;
     }
+  }
 
-    if (this.positionReadyAt[marketId][account] > Math.floor(Date.now() / 1000)) {
-      return false;
-    }
-
-    this.positionReadyAt[marketId][account] = Math.floor(Date.now() / 1000) + this.cooldownPeriod;
-    return true;
+  /** Seconds remaining, or 0 if ready. */
+  remainingSeconds(marketId: Hex, account: Address): number {
+    const readyAt = this.positionReadyAt[marketId]?.[account];
+    if (readyAt === undefined) return 0;
+    return Math.max(0, readyAt - Math.floor(Date.now() / 1000));
   }
 }
 

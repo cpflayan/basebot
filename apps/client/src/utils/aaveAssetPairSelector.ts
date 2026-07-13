@@ -10,7 +10,7 @@
  * - Aave: user can have multiple collateral AND debt assets in one Pool
  */
 import type { Pricer } from "@morpho-blue-liquidation-bot/pricers";
-import type { Address, Transport, Chain, Account, WalletClient } from "viem";
+import type { Address, Transport, Chain, Account, Client, PublicClient, WalletClient } from "viem";
 import { formatUnits } from "viem";
 import { multicall } from "viem/actions";
 
@@ -96,8 +96,14 @@ export function calculateCloseFactor(healthFactor: bigint): bigint {
  * @param cachedReserveConfigs - Pre-cached reserve configs (skips RPC calls for liquidationBonus/decimals)
  * @returns Best liquidation pair, or null if no profitable option exists
  */
+/** Any viem client that supports public multicall (wallet, public, or read pool). */
+export type AaveReadClient =
+  | WalletClient<Transport, Chain, Account>
+  | PublicClient
+  | Client<Transport, Chain>;
+
 export async function selectBestLiquidationPair(
-  client: WalletClient<Transport, Chain, Account>,
+  client: AaveReadClient,
   poolAddress: Address,
   user: Address,
   healthFactor: bigint,
@@ -347,12 +353,13 @@ function evaluatePair(
 // ─── Helpers ───
 
 async function priceAssetOnce(
-  client: WalletClient<Transport, Chain, Account>,
+  client: AaveReadClient,
   asset: Address,
   pricers: Pricer[],
 ): Promise<number | undefined> {
   for (const pricer of pricers) {
-    const price = await pricer.price(client, asset);
+    // Pricers only need public read methods; cast from union client types
+    const price = await pricer.price(client as WalletClient<Transport, Chain, Account>, asset);
     if (price !== undefined) return price;
   }
   return undefined;

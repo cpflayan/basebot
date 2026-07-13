@@ -18,6 +18,7 @@
     "build:pricers": "pnpm --filter @morpho-blue-liquidation-bot/pricers build",
     "deploy:executor": "pnpm build && tsx apps/client/src/deployExecutor.ts",
     "liquidate": "pnpm build && tsx apps/client/src/script.ts --env-file=.env",
+    "backfill:aave": "tsx apps/client/src/backfillAaveAccounts.ts --env-file=.env",
     "discovery": "cd morpho-liquidation-discovery && node dist/src/discovery/run.js",
     "start": "pnpm build && concurrently --names BOT,DISCO -c blue,green \"tsx apps/client/src/script.ts --env-file=.env\" \"cd morpho-liquidation-discovery && node dist/src/discovery/run.js\"",
     "skim": "pnpm build && tsx apps/client/src/skim.ts --env-file=.env"
