@@ -2,92 +2,88 @@
 
 ## Overview
 
-The bot now includes comprehensive debug logging for all liquidation decisions. This helps verify that the liquidation logic is making correct decisions.
+All protocol bots emit structured decision logs and periodic race metrics so you can verify *why* a position was attempted or skipped, and where time is spent.
 
-## What Gets Logged
+## Decision log (`logLiquidationDebug`)
 
-### For Every Liquidation Check:
+Emitted for skip/liquidate decisions across Morpho, Comet, Moonwell, and Aave.
 
-1. **Account Information**
-   - Account address
-   - Health Factor (color-coded: 🔴 <1.0, 🟡 1.0-1.1, 🟢 >1.1)
+### Fields
 
-2. **Position Details**
-   - Collateral token and amount
-   - Debt token and amount
-   - Seizable collateral amount
-   - Bad debt status (underwater position)
+1. **Account** — address  
+2. **Health factor** (when available) — color-coded in console (🔴 &lt;1.0, 🟡 1.0–1.1, 🟢 &gt;1.1)  
+3. **Collateral / debt** — token + amount when known  
+4. **Decision** — `LIQUIDATE` or `SKIP`  
+5. **Reason** — human-readable cause  
+6. **Details** — market id, blacklist flags, cooldown, flash loan flag, etc.
 
-3. **Decision & Reason**
-   - `LIQUIDATE` or `SKIP`
-   - Detailed reason for the decision
-   - Additional context (market ID, blacklist status, cooldown, etc.)
+### Common SKIP reasons
 
-## Decision Reasons
+| Reason | Notes |
+| ------ | ----- |
+| Position is in cooldown period | Graded cooldown still active (peek only — does not re-arm) |
+| Simulation failure cooldown | Moonwell: repeated sim failures (separate map) |
+| No profitable liquidation pair | Aave: no (collateral, debt) with positive estimate |
+| Blacklisted token | `TOKEN_BLACKLIST` / config blacklist |
+| Bad debt position | Underwater and `alwaysRealizeBadDebt` disabled |
+| No DEX route | Convert failed; soft cooldown / try next market |
 
-### SKIP Reasons:
+## Race metrics
 
-- **No profitable liquidation pair found** — Could not find collateral/debt pair with positive expected profit
-- **Blacklisted token in liquidation pair** — Token is in TOKEN_BLACKLIST
-- **Position is in cooldown period** — Recently attempted liquidation, waiting before retry
-- **Bad debt position** — Position is underwater (collateral < debt) and `alwaysRealizeBadDebt` is disabled
-- **Blacklisted token in market** — Market involves blacklisted tokens
+Implemented in `apps/client/src/utils/raceMetrics.ts`. Each bot flushes approximately every 20 ticks.
 
-### LIQUIDATE Reasons:
-
-- **Best pair selected** — Found profitable collateral/debt pair, proceeding with liquidation
-- **Position evaluation in progress** — Initial check passed, continuing evaluation
-
-## Example Output
+### `[RaceTick]`
 
 ```
-================================================================================
-[Base client Liquidation Debug] ⏭️ SKIP
-================================================================================
-Account: 0x1234...5678
-Health Factor: 🔴 0.850000
-
-Collateral:
-  Token: 0xABC...DEF
-  Amount: 1000000000000000000
-
-Debt:
-  Token: 0x123...789
-  Amount: 500000000
-
-Seizable Collateral: 1000000000000000000
-Bad Debt: ⚠️ YES (underwater)
-
-Decision: SKIP
-Reason: Bad debt position (collateral fully seizable, no liquidation bonus)
-
-Details:
-  marketId: 0xMARKET...ID
-  alwaysRealizeBadDebt: false
-  note: Position is underwater and bot is configured to skip bad debt
-================================================================================
+[Base aave][RaceTick] mode=hot accounts=42 hot=12 liq=1 hfScanMs=180
 ```
 
-## Configuration
+- `mode=hot|full` — Aave hot set vs full registry  
+- `hfScanMs` — multicall health/shortfall scan wall time  
 
-The debug logger is always enabled and logs to stdout. No additional configuration needed.
+### `[RaceSummary]`
 
-## When to Check Debug Logs
+```
+[Base aave][RaceSummary] ticks=20 liquidatableSeen=3 convertCacheHit=80% ...
+  hfScan:{avg=… max=… n=…} pair:{…} convert:{…} simExec:{…} |
+  outcomes: fail_race=2 success=1 skip_cooldown=5 ...
+```
 
-1. **After webhook events** — See why the bot did or didn't liquidate after receiving Morpho events
-2. **During periodic scans** — Verify Aave/Comet/Moonwell liquidation decisions
-3. **When troubleshooting** — Understand why a position wasn't liquidated
-4. **Before deploying changes** — Verify liquidation logic is working correctly
+| Stage | What it measures |
+| ----- | ---------------- |
+| `hfScan` | Batch HF / isLiquidatable / shortfall multicall |
+| `pair` | Aave pair selection (etc.) |
+| `convert` | DEX route build (local first, then aggregators) |
+| `simExec` | simulateCalls + send |
 
-## Files Modified
+| Outcome | Meaning |
+| ------- | ------- |
+| `success` | Tx path returned success |
+| `fail_race` | Position no longer liquidatable |
+| `fail_soft_profit` | Sim soft-fail / not profitable |
+| `fail_hard` | Structural / unknown |
+| `skip_no_route` | No venue path |
+| `skip_cooldown` / `skip_blacklist` / `skip_bad_debt` / `skip_no_pair` | Pre-exec filters |
 
-- `apps/client/src/utils/liquidationDebug.ts` — Debug logger implementation
-- `apps/client/src/aaveBot.ts` — Aave liquidation debug logging
-- `apps/client/src/bot.ts` — Morpho liquidation debug logging
+Hints after enough samples (e.g. HF scan dominates → tighten hot set / raise concurrency carefully).
 
-## Future Enhancements
+## Where logs go
 
-- Add USD value estimates for collateral/debt
-- Log expected profit calculation details
-- Add simulation results
-- Track liquidation success/failure rates
+| Sink | Path |
+| ---- | ---- |
+| Console | Colorized by protocol tag |
+| File | `logs/bot.log` (ANSI stripped) |
+
+`logs/` is gitignored.
+
+## When to use this
+
+1. After webhook Morpho events — did we liquidate or skip?  
+2. High 429 rate — check `hfScan` avg + concurrency env  
+3. Many `fail_race` — detection/submit latency (need faster tip / event watch)  
+4. Many `skip_no_route` — warm cache / venue list / pair selection  
+
+## Related
+
+- [docs/operations.md](./operations.md) — env knobs for RPC budget  
+- [ARCHITECTURE.md](../ARCHITECTURE.md) — protocol flows  

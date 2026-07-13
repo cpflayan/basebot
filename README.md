@@ -1,182 +1,171 @@
 # Multi-Protocol Liquidation Bot
 
-A simple, fast, and easily deployable liquidation bot for **Morpho Blue**, **Compound V3 (Comet)**, and **Moonwell (Compound V2)** lending protocols. This bot is entirely based on **RPC calls** and is designed to be **easy to configure**, **customizable**, and **ready to deploy** on any EVM-compatible chain.
+A simple, fast, and easily deployable liquidation bot for **Morpho Blue**, **Compound V3 (Comet)**, **Moonwell (Compound V2)**, and **Aave V3**. This bot is based on **RPC calls**, designed to be **easy to configure**, **customizable**, and **ready to deploy** on EVM chains (primary target: Base).
 
 ## Features
 
-- **Multi-protocol support**: Automatically detects and liquidates positions across three lending protocols:
-  - **Morpho Blue**: Isolated lending markets with oracle-based pricing
-  - **Compound V3 (Comet)**: Single borrowing market per Comet with absorb + buyCollateral
-  - **Moonwell**: Compound V2 fork with liquidateBorrow + redeemUnderlying
-- Multi-chain compatible.
-- Modular architecture with pluggable [data providers](./apps/data-providers/README.md), [liquidity venues](./apps/liquidity-venues/README.md), and [pricers](./apps/pricers/README.md).
-- Profit evaluation thanks to configurable pricers.
-- **Flash loan support**: Balancer V2 (0% fee) and Aave V3 (0.05% fee) for capital-efficient liquidations.
-- **Event-driven fast path** (Morpho only): Alchemy webhook integration for instant liquidation opportunities.
-- **Dual-RPC architecture** (Comet & Moonwell): Base public RPC for historical scanning + Alchemy for trading.
-- Minimal setup and dependencies (RPC-only, no extra infra required).
+- **Four protocols** in one process:
+  - **Morpho Blue** — isolated markets, API/cache + webhook fast path
+  - **Compound V3 (Comet)** — absorb + buyCollateral
+  - **Moonwell** — liquidateBorrow + redeemUnderlying
+  - **Aave V3** — multi-collateral / multi-debt `liquidationCall` with pair selection
+- **Race-oriented path**: hot HF sets (Aave), graded cooldowns, local DEX first, parallel multicall shards
+- **RPC budget controls**: concurrency caps, wave gaps, SharedBlockBus phase stagger (fewer 429s)
+- **Flash loans**: Balancer V2 (0% fee) and Aave V3 premium; primary + fallback providers
+- **Durable account registries**: split accounts JSON + checkpoint cursor; Aave subgraph backfill
+- Modular [data providers](./apps/data-providers/README.md), [liquidity venues](./apps/liquidity-venues/README.md), [pricers](./apps/pricers/README.md)
 
-### ⚠️ Disclaimer
+### Disclaimer
 
-This bot is provided as-is, without any warranty. The **Morpho Association is not responsible** for any potential loss of funds resulting from the use of this bot, including (but not limited to) gas fees, failed transactions, or liquidations on malicious or misconfigured markets (although the market whitelisting mechanism is designed to protect against unsafe liquidations).
-
-Use at your own risk.
+This bot is provided as-is, without any warranty. Use at your own risk. The Morpho Association (and any other protocol) is not responsible for losses (gas, failed txs, or liquidations on misconfigured markets).
 
 ## Packages
 
 | Package                                            | Description                                                              |
 | -------------------------------------------------- | ------------------------------------------------------------------------ |
-| [`apps/config`](./apps/config)                     | Chain configurations, module registrations, and all tunable parameters   |
-| [`apps/client`](./apps/client)                     | Bot orchestration, on-chain execution, and transaction management        |
-| [`apps/data-providers`](./apps/data-providers)     | Data provider implementations for fetching market and position data      |
-| [`apps/hyperindex`](./apps/hyperindex)             | Envio HyperIndex indexer for self-hosted on-chain data                   |
-| [`apps/liquidity-venues`](./apps/liquidity-venues) | Liquidity venue implementations for converting collateral to loan tokens |
-| [`apps/pricers`](./apps/pricers)                   | Pricer implementations for USD pricing and profitability checks          |
+| [`apps/config`](./apps/config)                     | Chain configurations, module registrations, tunable parameters           |
+| [`apps/client`](./apps/client)                     | Bot orchestration, registries, execution, health/webhook                 |
+| [`apps/data-providers`](./apps/data-providers)     | Market/position data providers                                           |
+| [`apps/hyperindex`](./apps/hyperindex)             | Envio HyperIndex indexer (optional Morpho data path)                     |
+| [`apps/liquidity-venues`](./apps/liquidity-venues) | Collateral → loan conversion venues                                      |
+| [`apps/pricers`](./apps/pricers)                   | USD pricing for profit checks                                            |
 
 ## Requirements
 
 - Node.js >= 20
-- [pnpm](https://pnpm.io/) (this repo uses `pnpm` as package manager)
-- A valid RPC URL (via Alchemy, Infura, etc)
-- The private key of an EOA with enough funds to pay for gas.
-- An executor contract deployed for this EOA (see [Executor Contract Deployment](#executor-contract-deployment)).
+- [pnpm](https://pnpm.io/)
+- At least one paid Base RPC (`RPC_URL_BASE` / `RPC_URL_8453`); extra `RPC_URL_BASE2`–`BASE7` for parallel reads
+- EOA private key with gas
+- Deployed executor contract for that EOA ([Executor Contract Deployment](#executor-contract-deployment))
 
 ## Installation
 
 ```bash
-git clone https://github.com/morpho-org/morpho-blue-liquidation-bot.git
-cd morpho-blue-liquidation-bot
+git clone <your-fork-or-repo>
+cd base-bot   # or repo root
 pnpm install
+cp .env.example .env   # fill secrets
 ```
 
-## Chain Configuration
+## Chain configuration
 
-The bot can be configured to run on any EVM-compatible chain where the Morpho stack has been deployed. The chain configuration is done in the `apps/config/src/config.ts` file.
+Edit `apps/config/src/config.ts` for each chain: `wNative`, Morpho whitelist, liquidity venues, pricers, flash loan, and optional:
 
-For each chain, here are the parameters that need to be configured:
+- `cometWatchlist` — Compound V3 markets
+- `moonwellWatchlist` — Moonwell mTokens
+- `aaveWatchlist` — Aave V3 Pool + reserves
+- `blockInterval`, `useFlashLoan`, `flashLoanProvider`, `flashLoanFallbackProviders`
 
-### Chain Wrapped Native Asset
+Details: [ARCHITECTURE.md](./ARCHITECTURE.md).
 
-- `wNative`: The chain's wrapped native asset (ex: WETH's address on Ethereum mainnet).
+### Secrets (`.env`)
 
-### Options
+See [`.env.example`](./.env.example). Core keys:
 
-- `options.dataProvider`: The [data provider](./apps/data-providers/README.md) to use for fetching market and position data. Currently supported: `"morphoApi"`, `"hyperIndex"`.
+| Variable | Role |
+| -------- | ---- |
+| `RPC_URL_BASE` or `RPC_URL_8453` | Primary write/read RPC |
+| `RPC_URL_BASE2` … `BASE7` | Paid read pool (round-robin multicall) |
+| `WATCH_RPC_URL` | Free/public RPC for `watchBlocks` only |
+| `FALLBACK_RPC_URL` / `PUBLIC_RPC_URL_BASE` | Write failover / historical scan fallback |
+| `EXECUTOR_ADDRESS_8453` | Executor contract |
+| `LIQUIDATION_PRIVATE_KEY_8453` | Liquidator EOA |
+| `ACCOUNT_REGISTRY_DIR` | Persist registries (Docker: `/app/data`) |
+| `THEGRAPH_API_KEY` | Optional Aave subgraph backfill |
+| `TOKEN_BLACKLIST` | Extra blacklisted tokens (comma-separated) |
 
-- `options.vaultWhitelist`: List of MetaMorpho vault addresses. All the markets listed by those vaults will be whitelisted. Can also be set to `"morpho-api"` to dynamically resolve whitelisted vaults.
+### Race / RPC budget (optional env)
 
-- `options.additionalMarketsWhitelist`: List of market IDs to whitelist (even if they are not listed by any vault).
+Defaults favor **fewer 429s** while keeping the Aave hot path every block. **Env wins over config** when set.
 
-- `options.liquidityVenues`: Array of [liquidity venue](./apps/liquidity-venues/README.md) names. The order is the order in which venues will be tried.
+| Variable | Default | Meaning |
+| -------- | ------- | ------- |
+| `HF_CONCURRENCY` | `min(3, poolSize)` | Parallel multicall shards |
+| `HF_BATCH_SIZE` | `100` | Accounts per multicall |
+| `RPC_WAVE_GAP_MS` | `40` | Pause between shards |
+| `AAVE_FULL_SCAN_INTERVAL_BLOCKS` | `15` | Full registry cadence (hot set still every poll) |
+| `AAVE_NEAR_HEALTH_FACTOR` | `1.05` | Hot-set threshold |
+| `SKIP_ROUTE_WARM` | off | `1` skips DEX route warm-up |
+| `ROUTE_WARM_MAX_MAJORS` | `6` | Cap warm fan-out tokens |
 
-- `options.pricers` (optional): Array of [pricer](./apps/pricers/README.md) names. The order is the fallback order when pricing assets. Leave undefined or empty to disable profit checks.
+Ops guide: [docs/operations.md](./docs/operations.md).
 
-- `options.treasuryAddress` (optional): Address to receive liquidation profits. Defaults to the bot's EOA.
+### Cooldown
 
-- `options.useFlashbots`: Set to `true` to use Flashbots (requires `FLASHBOTS_PRIVATE_KEY` env var).
+- `POSITION_LIQUIDATION_COOLDOWN_*` in config: **graded** race / soft / hard / success periods (not a single hard lock on every peek).
 
-- `options.liquidationBufferBps` (optional): Buffer in basis points to reduce seizable collateral, protecting against price movements before execution. Default: 10 bps. Not applied when realizing bad debt.
-
-- `options.blockInterval` (optional): Run liquidation checks every N blocks. Default: every block.
-
-- `options.watchBlocksRetryDelayMs` (optional): Delay in milliseconds before restarting the block watcher after an RPC error. Default: 5000.
-
-- `options.useFlashLoan` (optional): Enable Balancer V2 flash loans for capital-efficient liquidations. Default: false.
-
-- `options.flashLoanProvider` (optional): Flash loan provider — `"balancer"` (0% fee) or `"aave"` (0.05% fee). Default: `"balancer"`.
-
-- `options.cometWatchlist` (optional): Compound V3 Comet market configuration. See [ARCHITECTURE.md](./ARCHITECTURE.md#compound-v3-configuration) for details.
-
-- `options.moonwellWatchlist` (optional): Moonwell (Compound V2) market configuration. See [ARCHITECTURE.md](./ARCHITECTURE.md#moonwell-configuration) for details.
-
-### Secrets
-
-Secrets are set in the `.env` file at the root of the repository, with the following keys:
-
-- `RPC_URL_<chainId>` — RPC URL for the chain.
-- `EXECUTOR_ADDRESS_<chainId>` — Address of the deployed executor contract.
-- `LIQUIDATION_PRIVATE_KEY_<chainId>` — Private key of the EOA.
-- `FLASHBOTS_PRIVATE_KEY` (optional) — Flashbots private key, only if using Flashbots.
-
-Example for mainnet (chainId 1):
-
-```
-RPC_URL_1=https://eth-mainnet.g.alchemy.com/v2/<your-api-key>
-EXECUTOR_ADDRESS_1=0x...
-LIQUIDATION_PRIVATE_KEY_1=0x...
-```
-
-### Cooldown Mechanisms
-
-- `MARKETS_FETCHING_COOLDOWN_PERIOD`: Cooldown (in seconds) between vault market re-fetches. Configured in `apps/config/src/config.ts`.
-- `POSITION_LIQUIDATION_COOLDOWN_ENABLED` / `POSITION_LIQUIDATION_COOLDOWN_PERIOD`: Optional cooldown before retrying a failed liquidation. Useful when venues rely on rate-limited APIs.
-
-### Bad Debt Realization
-
-Set `ALWAYS_REALIZE_BAD_DEBT` to `true` in `apps/config/src/config.ts` to always fully liquidate bad debt positions, even if not profitable.
-
-## Executor Contract Deployment
-
-The bot uses an executor contract to execute liquidations ([executor repository](https://github.com/Rubilmax/executooor)). These contracts are gated (only callable by the owner), so you need to deploy your own.
-
-Set `RPC_URL_<chainId>` and `LIQUIDATION_PRIVATE_KEY_<chainId>` in `.env`, then:
+## Executor contract
 
 ```bash
 pnpm deploy:executor
 ```
 
-You can also deploy via [this interface](https://rubilmax.github.io/executooor/).
+Or deploy via [executooor UI](https://rubilmax.github.io/executooor/).
 
-## Run the bot
+## Run
 
 ```bash
+# Bot only
 pnpm liquidate
+
+# Bot + Morpho discovery (concurrent)
+pnpm start
+
+# Offline Aave account backfill (subgraph preferred)
+pnpm backfill:aave
+
+# Skim profit tokens from executor
+pnpm skim --chainId 8453 --token 0x... --recipient 0x...
 ```
 
-### Claim Profit
+Logs: colored console + `logs/bot.log` (directory gitignored).
 
-Liquidation profits are held by the Executor Contract. To transfer them:
-
-```bash
-pnpm skim --chainId 1 --token 0x... --recipient 0x...
-```
-
-- `chainId` (required): Chain ID where the tokens are held.
-- `token` (required): Token address to claim.
-- `recipient` (optional): Recipient address. Defaults to the bot's EOA.
-
-## Liquidation Process
+## Liquidation process
 
 ![Process](./img/liquidation-process-high-level.png)
 
-### Morpho Blue Flow
+### Morpho Blue
 
-1. **Slow path**: `watchBlocks` → `bot.run()` → fetch liquidatable positions from Morpho API → attempt liquidation
-2. **Fast path**: Alchemy webhook → decode MorphoBlue events → update `PositionCache` → fetch fresh oracle price → recalculate HF → liquidate if HF < 1
-3. For each position: try liquidity venues → simulate → check profit → execute via executor contract or Flashbots
+1. **Slow path**: shared block bus → `bot.run()` → data provider liquidatable positions  
+2. **Fast path**: Alchemy webhook → `PositionCache` + oracle refresh → HF → liquidate  
+3. Venues (local DEX first) → simulate → profit → execute (optional flash loan)
 
-### Compound V3 (Comet) Flow
+### Compound V3
 
-1. **Account discovery**: `CometAccountRegistry` scans `SupplyCollateral`/`WithdrawCollateral` events to build account list
-2. **Polling**: `watchBlocks` → batch `isLiquidatable()` checks → attempt liquidation
-3. For each liquidatable account: estimate debt → Balancer flash loan → `absorb()` → `buyCollateral()` → DEX swap → repay flash loan → skim profit
+1. `CometAccountRegistry` event discovery  
+2. Every N blocks (phase 0): multicall `isLiquidatable` → absorb + buyCollateral + swap  
 
-### Moonwell (Compound V2) Flow
+### Moonwell
 
-1. **Account discovery**: `MoonwellAccountRegistry` scans `Borrow` events per mToken to find accounts with debt
-2. **Polling**: `watchBlocks` → batch `getAccountLiquidity()` checks → find accounts with shortfall > 0
-3. For each liquidatable account: find borrow/collateral mTokens → Balancer flash loan → `liquidateBorrow()` → `redeemUnderlying()` → DEX swap → repay flash loan → skim profit
+1. Per-mToken registry  
+2. Every N blocks (phase 2, staggered vs Comet): `getAccountLiquidity` shortfall → liquidateBorrow + redeem  
 
-## Security Features
+### Aave V3
 
-- **Token blacklist**: Markets involving depegged/risky tokens (e.g., USR) are skipped entirely
-- **Pricer mandatory**: Bot refuses to execute trades without configured pricers (cannot verify profitability)
-- **Slippage protection**: Flash loan path enforces 1% slippage margin between simulation and execution
-- **Simulation-first**: All transactions simulated before execution; failed simulations are skipped
-- **Treasury separation**: Profits sent to configured treasury address (not EOA) for reduced private key exposure
-- **Encoder snapshot/restore**: Failed venue attempts don't corrupt encoder state
+1. Registry: split `aave-accounts.<chainId>.json` + `.checkpoint.json`; prefer `pnpm backfill:aave`  
+2. **Hot path** (default every block): near-HF accounts only  
+3. **Full path** (default every 15 ticks): getLogs + full HF sweep  
+4. `selectBestLiquidationPair` → flash/direct liquidationCall + DEX  
+
+## Security
+
+- Token blacklist, mandatory pricers, simulation-first, dynamic slippage from route impact  
+- Encoder snapshot/restore on failed venue probes  
+- Treasury address separate from EOA when configured  
 
 ## Documentation
 
-- [ARCHITECTURE.md](./ARCHITECTURE.md) — Detailed architecture, bot flows, and configuration
-- [TECHNICAL_SPEC.md](./TECHNICAL_SPEC.md) — Technical specifications and implementation details
+| Doc | Contents |
+| --- | -------- |
+| [ARCHITECTURE.md](./ARCHITECTURE.md) | Protocol flows, shared bus, registries, config shapes |
+| [docs/operations.md](./docs/operations.md) | RPC budget, backfill, Docker data, log metrics |
+| [docs/liquidation-debug-guide.md](./docs/liquidation-debug-guide.md) | Decision debug logs + RaceSummary |
+
+## Development
+
+```bash
+pnpm build
+pnpm test:client          # unit (excludes broken forks if RPC unavailable)
+pnpm test:fork-suite      # allBots fork suite (needs RPC)
+pnpm lint
+```

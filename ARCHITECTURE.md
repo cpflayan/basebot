@@ -35,31 +35,35 @@ Workspace monorepo with six packages:
 - **`CometAccountRegistry`** (`apps/client/src/cometAccountRegistry.ts`) — Account discovery module for Compound V3. Scans `SupplyCollateral`/`WithdrawCollateral` events to build a deduplicated account list per Comet. Persists state to JSON for incremental scanning across restarts.
 - **`MoonwellAccountRegistry`** (`apps/client/src/moonwellAccountRegistry.ts`) — Account discovery module for Moonwell. Scans `Borrow`/`LiquidateBorrow` events to build a deduplicated account list per mToken. Persists state to JSON for incremental scanning across restarts. Key difference from Comet registry: tracks per-mToken (not per-Comet), focuses on borrowers since only they can be liquidated.
 - **`AaveLiquidationBot`** (`apps/client/src/aaveBot.ts`) — Aave V3 orchestrator. Runs in parallel with Morpho, Comet, and Moonwell bots. Uses `Pool.getUserAccountData()` to check `healthFactor` (WAD-scaled, 18 decimals), executes via `Pool.liquidationCall(collateralAsset, debtAsset, user, debtToCover, receiveAToken)`. Key differences from Comet/Moonwell: single Pool per chain (not per-market), users can have multiple collateral AND debt assets, dynamic close factor based on health factor level. Shares liquidity venues, pricers, and execution utilities with other bots.
-- **`AaveAccountRegistry`** (`apps/client/src/aaveAccountRegistry.ts`) — Account discovery module for Aave V3. Scans `Supply`/`Borrow`/`Repay`/`Withdraw` events to build a deduplicated account list per Pool. Persists state to JSON for incremental scanning across restarts. Tracks all users who have interacted with the Pool (suppliers and borrowers).
-- **`SharedExecution`** (`apps/client/src/utils/sharedExecution.ts`) — Shared execution utilities used by Comet and Moonwell bots. Extracted from `bot.ts` to avoid duplication. Provides: `SharedExecutionDeps` (dependency injection type), `checkProfit` (USD profitability verification), `convertCollateralToLoan` (DEX swap with encoder snapshot/restore), `simulateAndExecFlashLoan` (flash loan simulation + slippage margin + execution), `simulateAndExec` (direct path simulation + execution).
-- **`LiquidationEncoder`** (`apps/client/src/utils/LiquidationEncoder.ts`) — Builds batched calldata for the on-chain executor contract. Extends `ExecutorEncoder` with pre-liquidation support.
+- **`AaveAccountRegistry`** (`apps/client/src/aaveAccountRegistry.ts`) — Account discovery for Aave V3. Scans `Supply`/`Borrow`/`Repay`/`Withdraw`/`LiquidationCall` user fields (not `liquidator`). Split persistence: large `aave-accounts.<chainId>.json` + tiny `.checkpoint.json` cursors. Prefer offline `pnpm backfill:aave` (The Graph or RPC) before first live full history scan.
+- **`BaseAccountRegistry`** (`apps/client/src/utils/baseAccountRegistry.ts`) — Shared scan orchestration (mid-scan checkpoints, rate-limit retry, durable `accountsSyncedBlock` resume).
+- **`SharedBlockBus`** (`apps/client/src/utils/sharedExecution.ts`) — Single `watchBlocks` subscription; bots register `(interval, callback, phase)` so Comet/Moonwell can stagger multicall bursts.
+- **`SharedExecution`** (`apps/client/src/utils/sharedExecution.ts`) — Shared by Morpho, Comet, Moonwell, and Aave: profit check, `convertCollateralToLoan` (`preferLocalDex`, venue cache, encoder snapshot on fail), flash-loan simulate/exec with race-lost abort, route warm-up.
+- **`rpcBudget`** (`apps/client/src/utils/rpcBudget.ts`) — Env-tunable HF concurrency, batch size, wave gap, warm-up caps (env wins over config).
+- **`RaceMetrics`** (`apps/client/src/utils/raceMetrics.ts`) — Stage timings + outcome counters; periodic `[RaceSummary]` for bottleneck diagnosis.
+- **`LiquidationEncoder`** (`apps/client/src/utils/LiquidationEncoder.ts`) — Builds batched calldata for the on-chain executor contract. Extends `ExecutorEncoder` with protocol liquidations + snapshot/restore.
 - **`PositionCache`** (`apps/client/src/positionCache.ts`) — In-memory cache for Morpho positions and market state. Enables the event-driven fast path: events update cache incrementally, fresh oracle prices are fetched on demand, and HF is recalculated to identify at-risk positions without a full API round-trip. Uses `@morpho-org/blue-sdk` `Market` and `AccrualPosition` for accurate HF computation.
 - **`WebhookServer`** (`apps/client/src/webhook.ts`) — Fastify HTTP server that receives Alchemy webhook POST payloads, decodes MorphoBlue events from logs, and triggers `handleEvents()` on all registered bots for event-driven liquidation. Supports 6 event types: `Borrow`, `WithdrawCollateral`, `Withdraw`, `SupplyCollateral`, `Repay`, `Liquidate`. Includes a 2-second cooldown to prevent rapid re-triggering.
 - **`HealthServer`** (`apps/client/src/health.ts`) — Singleton Fastify server exposing a `/health` endpoint for container orchestration and monitoring. Binds to `127.0.0.1` by default for security.
 
 ### Flow
 
-All four bots run in parallel within a single process, sharing infrastructure (liquidity venues, pricers, executor contract, treasury).
+All four bots run in parallel within a single process, sharing infrastructure (liquidity venues, pricers, executor contract, treasury, paid read pool, SharedBlockBus).
 
 1. Config defines which chains, data provider, vaults, venues, and pricers to use
 2. `script.ts` starts the `HealthServer` (liveness probe on port 3000) and `WebhookServer` (Alchemy event-driven triggering on port 3001)
 3. `script.ts` reads all chain configs, groups chains by data provider, creates shared providers (awaiting `init()` for backfill), then launches one bot per chain via `launchBot()`
-4. `launchBot()` in `index.ts` creates the Morpho `LiquidationBot`, and conditionally starts `CometLiquidationBot`, `MoonwellLiquidationBot`, and `AaveLiquidationBot` if their respective watchlists are enabled
+4. `launchBot()` in `index.ts` builds a **paid `ReadClientPool`** (`RPC_URL_BASE` + `BASE2`–`7`), a free **`watchClient`**, Morpho `LiquidationBot`, and conditionally Comet / Moonwell / Aave bots — all registered on one **SharedBlockBus**
 
 #### Morpho Blue Bot Flow
 
 5. Each Morpho bot initializes its `PositionCache`: fetches covered markets (vault whitelist + discovery-layer approved markets) and caches liquidatable positions + market state from the data provider
-6. **Slow path** (block-watcher loop): `watchBlocks` triggers `bot.run()` at configured `blockInterval` — fetches fresh liquidatable positions from the data provider, updates cache, and attempts liquidation
-7. **Fast path** (event-driven): Alchemy webhook → `WebhookServer` decodes MorphoBlue events → `handleEvents()` updates cache incrementally, fetches fresh oracle prices, recalculates HF, and triggers liquidation for newly at-risk positions
-8. For each liquidatable position: try liquidity venues in order to convert collateral → loan token (with encoder state snapshot/restore on failure)
-9. Simulate the full liquidation via `simulateCalls`, check profitability via pricers (profit must exceed gas costs)
-10. Execute via `writeContract` or Flashbots bundle (mainnet only)
-11. **Flash loan path** (optional): when `useFlashLoan` is enabled, the bot uses a Balancer V2 flash loan (0% fee) to borrow loan tokens, liquidate the position, swap seized collateral via DEX, repay the flash loan, and skim profit to treasury — all within a single executor transaction. A slippage safety margin protects against sandwich attacks between simulation and execution.
+6. **Slow path**: SharedBlockBus → `bot.run()` at `blockInterval` — fetch liquidatable positions, update cache, attempt liquidation
+7. **Fast path** (event-driven): Alchemy webhook → `WebhookServer` → `handleEvents()` → cache + oracle HF → liquidate
+8. Convert: **prefer local AMM** first, then aggregators; venue pair cache + encoder snapshot on failure
+9. Simulate via `simulateCalls`, profit via pricers; **graded cooldown** after attempt (race / soft / hard / success)
+10. Execute via `writeContract` or Flashbots (mainnet)
+11. **Flash loan path**: Balancer (or Morpho/Aave fallback) → liquidate → DEX → repay → skim; non-recoverable reverts abort the fallback chain as race-lost
 
 ### Compound V3 (Comet) Flow
 
@@ -75,9 +79,10 @@ The `CometLiquidationBot` runs in parallel with the Morpho `LiquidationBot`, sha
 
 ### Polling Loop
 
-- `watchBlocks` triggers periodic checks at configured `pollIntervalBlocks` (default: 5 blocks)
-- Each cycle: incremental event scan → batch `isLiquidatable()` checks (via `Promise.allSettled`) → trigger liquidations
-- Overlapping runs prevented by `running` flag
+- SharedBlockBus at `pollIntervalBlocks` (default: 5), **phase 0** (staggered vs Moonwell phase 2)
+- Each cycle: incremental event scan → parallel-sharded multicall `isLiquidatable()` on paid read pool (wave gap from `rpcBudget`) → liquidate
+- Overlapping runs prevented by per-listener `running` flag
+- ABI: `isLiquidatable(address) returns (bool)` only (single return)
 
 ### Liquidation Execution
 
@@ -223,32 +228,34 @@ The `AaveLiquidationBot` runs in parallel with Morpho, Comet, and Moonwell bots,
 | Collateral/debt | Single collateral, single base debt | Multiple mTokens, one borrow target | Multiple collateral AND multiple debt assets per user |
 | Seize collateral | `absorb()` + `buyCollateral()` | `liquidateBorrow()` seizes mToken | `liquidationCall(collateral, debt, user, amount, receiveAToken)` |
 | Close factor | 100% (full debt) | 50% (governance-set) | Dynamic based on health factor level |
-| Account discovery events | `SupplyCollateral` / `WithdrawCollateral` | `Borrow` / `LiquidateBorrow` | `Supply` / `Borrow` / `Repay` / `Withdraw` |
-| Registry granularity | Per-Comet | Per-mToken | Per-Pool |
+| Account discovery events | `SupplyCollateral` / `WithdrawCollateral` | `Borrow` / `LiquidateBorrow` | `Supply` / `Borrow` / `Repay` / `Withdraw` / `LiquidationCall` (user only) |
+| Registry granularity | Per-Comet | Per-mToken | Per-Pool (+ split checkpoint) |
+| Race poll default | every 5 blocks, phase 0 | every 5 blocks, phase 2 | every block hot; full every 15 |
 
 ### Account Discovery (`AaveAccountRegistry`)
 
-- Scans `Supply`, `Borrow`, `Repay`, `Withdraw` events per Pool to discover all users who have interacted with the protocol
-- Batch size: 10,000 blocks per `eth_getLogs` call (Base public RPC limit)
-- Persists to `./data/aave-accounts.<chainId>.json`
-- Incremental scanning on restart (only new blocks since last scan)
-- On first startup: uses `findDeployBlock()` binary search to find exact Pool deploy block if not configured
-- Fallback: broad log scan if event-specific filter fails
+- Scans `Supply`, `Borrow`, `Repay`, `Withdraw`, `LiquidationCall` — tracks `user` / `onBehalfOf` / `repayer` / `to` only (**not** `liquidator`)
+- Batch size: tuned via env / paid-RPC detection (default ~2k–5k, not always 10k)
+- **Split files**: `aave-accounts.<chainId>.json` (accounts) + `aave-accounts.<chainId>.checkpoint.json` (cursors)
+- Durable resume: `accountsSyncedBlock` never advances past unsaved discoveries
+- Prefer **`pnpm backfill:aave`** (The Graph subgraph or RPC) before first multi-million-block catch-up
+- Mid-scan: tiny checkpoint every ~5k blocks; accounts flush every ~25k when dirty
 
-### Polling Loop
+### Polling Loop (race mode)
 
-- `watchBlocks` triggers at `pollIntervalBlocks` (default: 5 blocks)
-- Each cycle: incremental event scan → batch `getUserAccountData()` checks via multicall (batches of 50) → trigger liquidations for accounts with healthFactor < (threshold + buffer)
-- Overlapping runs prevented by `running` flag
+- Default `pollIntervalBlocks: 1` (every block)
+- **Hot path** (every tick): recheck accounts with last HF &lt; `nearHealthFactor` (default 1.05) via paid multicall shards
+- **Full path** (every `fullScanIntervalBlocks`, default 15): incremental getLogs + full registry HF sweep
+- Liquidatable sorted by **lowest HF first**
+- Wave concurrency capped (`HF_CONCURRENCY`, default ≤3) + `RPC_WAVE_GAP_MS`
 
 ### Liquidation Execution
 
-- **Pair selection**: `selectBestLiquidationPair()` evaluates all (collateral, debt) combinations for the underwater account, using cached reserve configs (liquidationBonus, decimals) to estimate profitability
-- **Reserve caching**: At startup, `getReservesList()` + `getReserveConfigurationMap()` are cached via multicall to avoid repeated RPC calls during liquidation evaluation
-- **Debt to cover**: Calculated based on the dynamic close factor (proportional to how far healthFactor is below 1)
-- **Flash loan path**: Balancer flash loan → ERC20 approve Pool → `Pool.liquidationCall()` → DEX swap seized collateral → repay flash loan → skim profit
-- **Direct path**: same flow without Balancer wrapper
-- Profit check: via shared `simulateAndExecFlashLoan` / `simulateAndExec`
+- **Pair selection**: `selectBestLiquidationPair()` on paid read client; cached reserve configs
+- **Convert**: `preferLocalDex: true` then aggregators; convert failure restores encoder calls
+- **Debt to cover**: dynamic close factor from health factor
+- **Flash / direct**: shared simulate+exec; graded cooldown after attempt; race-lost drops from hot set
+- Dynamic slippage from naked-venue impact bps
 
 ### Reserve Configuration Caching
 
@@ -264,15 +271,20 @@ Aave V3 Pool is configured in `apps/config/src/config.ts` under `options.aaveWat
 ```typescript
 aaveWatchlist: {
   enabled: boolean;
-  poolAddress: Address;         // Aave V3 Pool contract address
-  poolDeployBlock: number;      // Block number where the Pool was deployed
-  reserves: Address[];          // Configured reserve asset addresses (fallback if on-chain query fails)
-  pollIntervalBlocks?: number;  // Polling frequency (default: 5)
-  minHealthFactorBuffer?: bigint;  // Safety margin above 1e18 threshold (default: 0n)
-  slippageBps?: number;         // Slippage tolerance for DEX swaps in bps (default: 100 = 1%)
-  tokenBlacklist?: Address[];   // Additional token addresses to skip during liquidation
+  poolAddress: Address;              // Aave V3 Pool
+  poolDeployBlock: number;           // Deploy block (verified via findDeployBlock if needed)
+  reserves: Address[];               // Fallback list if on-chain getReservesList fails
+  pollIntervalBlocks?: number;       // Hot-path cadence (default: 1 = every block)
+  fullScanIntervalBlocks?: number;   // Full registry + getLogs cadence (default: 15)
+  nearHealthFactor?: number;         // Hot-set threshold e.g. 1.05 (env AAVE_NEAR_HEALTH_FACTOR wins)
+  hfBatchSize?: number;              // Multicall batch (env HF_BATCH_SIZE wins)
+  hfConcurrency?: number;            // Parallel shards (env HF_CONCURRENCY wins, default ≤3)
+  minHealthFactorBuffer?: bigint;    // Extra margin above 1e18 (default: 0n)
+  tokenBlacklist?: Address[];        // Extra skip list
 }
 ```
+
+Ops env overrides (no rebuild): see [docs/operations.md](./docs/operations.md).
 
 ### Base Chain Aave V3 Pool (Verified)
 
@@ -423,8 +435,12 @@ At startup, `apps/config/src/config.ts` reads `discovered-markets.8453.json` and
 - `pnpm test:liquidity-venues` — Run liquidity venue tests
 - `pnpm test:pricers` — Run pricer tests
 - `pnpm test:client` — Run client/bot tests
+- `pnpm test:fork-suite` — Multi-protocol Anvil fork suite (needs RPC)
 - `pnpm test:hyperindex` — Run HyperIndex indexer tests
-- `pnpm liquidate` — Run the bot (requires `.env`)
-- `pnpm skim` — Rescue stuck tokens from executor contract (requires `--chainId`, `--token`, optional `--recipient`)
+- `pnpm liquidate` / `pnpm start` — Run bot (+ discovery for `start`)
+- `pnpm backfill:aave` — Offline Aave registry (subgraph or RPC)
+- `pnpm skim` — Rescue stuck tokens from executor
 - `pnpm deploy:executor` — Deploy executor contract
 - `pnpm lint` — Lint all packages
+
+Further ops: [docs/operations.md](./docs/operations.md) · debug logs: [docs/liquidation-debug-guide.md](./docs/liquidation-debug-guide.md)
