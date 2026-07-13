@@ -496,21 +496,6 @@ export class AaveLiquidationBot {
       return;
     }
 
-    // Cooldown check
-    if (this.cooldown && !this.cooldown.isPositionReady(this.poolAddress, account)) {
-      logLiquidationDebug({
-        protocol: this.logTag,
-        account,
-        healthFactor: Number(healthFactor) / 1e18,
-        decision: "skip",
-        reason: "Position is in cooldown period",
-        details: {
-          note: "Recently attempted liquidation, waiting before retry",
-        },
-      });
-      return;
-    }
-
     const badDebtPosition = pair.isBadDebt;
 
     logLiquidationDebug({
@@ -538,8 +523,25 @@ export class AaveLiquidationBot {
       },
     });
 
-    // Bad debt pre-filter: skip early if position is underwater and we don't realize bad debt
+    // Bad debt pre-filter: skip early if position is underwater and we don't realize bad debt.
+    // Runs BEFORE the cooldown check so these positions never trip the cooldown timer.
     if (!this.alwaysRealizeBadDebt && badDebtPosition) {
+      return;
+    }
+
+    // Cooldown check — only reached once we've decided this position is actually worth
+    // attempting, so the cooldown timer only ever reflects a real attempt.
+    if (this.cooldown && !this.cooldown.isPositionReady(this.poolAddress, account)) {
+      logLiquidationDebug({
+        protocol: this.logTag,
+        account,
+        healthFactor: Number(healthFactor) / 1e18,
+        decision: "skip",
+        reason: "Position is in cooldown period",
+        details: {
+          note: "Recently attempted liquidation, waiting before retry",
+        },
+      });
       return;
     }
 

@@ -37,6 +37,16 @@ import { liquidationTracker } from "./liquidationState.js";
 
 const BPS_DENOMINATOR = 10_000n;
 
+// Remembers which venue successfully handled a (collateralToken, loanToken) pair last time.
+// Route availability for a given pair rarely changes within a process lifetime, so on repeat
+// liquidations (same handful of Morpho/Comet/Moonwell markets) we can skip straight to the
+// known-good venue instead of re-probing the full priority list from the top every time.
+const knownVenueForPair = new Map<string, LiquidityVenue[]>();
+
+function pairCacheKey(src: Address, dst: Address): string {
+  return `${src.toLowerCase()}->${dst.toLowerCase()}`;
+}
+
 /**
  * Process-lifetime ERC-20 decimals cache.
  * Decimals are immutable on-chain; caching eliminates repeated `decimals()` RPCs
@@ -373,6 +383,43 @@ export interface ConvertCollateralToLoanResult {
   impactBps: bigint | undefined;
 }
 
+async function tryVenueConvert(
+  deps: SharedExecutionDeps,
+  venue: LiquidityVenue,
+  toConvert: { src: Address; dst: Address; srcAmount: bigint },
+  encoder: LiquidationEncoder,
+): Promise<
+  | { ok: true; result: { src: Address; dst: Address; srcAmount: bigint }; impactBps?: bigint }
+  | { ok: false }
+> {
+  const snapshot = encoder.snapshotCalls();
+  const venueName = venue.constructor.name;
+  try {
+    const result = await venue.convert(encoder, toConvert);
+    if (result.src === toConvert.src && result.dst === toConvert.dst) {
+      console.log(
+        `${deps.logTag}[Route Debug] ${venueName}: route supported but convert returned same tokens, skipping`,
+      );
+      encoder.restoreCalls(snapshot);
+      return { ok: false };
+    }
+    console.log(`${deps.logTag}[Route Debug] ${venueName}: conversion successful`);
+    const impactBps = venue.estimatePriceImpactBps?.();
+    if (impactBps !== undefined) {
+      console.log(
+        `${deps.logTag}[Route Debug] ${venueName}: estimated price impact ${impactBps} bps`,
+      );
+    }
+    return { ok: true, result, impactBps };
+  } catch (error) {
+    console.error(
+      `${deps.logTag}[Route Debug] ${venueName}: error — ${error instanceof Error ? error.message : error}`,
+    );
+    encoder.restoreCalls(snapshot);
+    return { ok: false };
+  }
+}
+
 export async function convertCollateralToLoan(
   deps: SharedExecutionDeps,
   collateralToken: Address,
@@ -391,49 +438,99 @@ export async function convertCollateralToLoan(
     `${deps.logTag}[Route Debug] Trying to convert ${collateralToken.slice(0, 10)}... -> ${loanToken.slice(0, 10)}..., amount=${seizableCollateral}, venues=${deps.liquidityVenues.length}`,
   );
 
-  for (const venue of deps.liquidityVenues) {
-    const snapshot = encoder.snapshotCalls();
-    const venueName = venue.constructor.name;
+  const cacheKey = pairCacheKey(collateralToken, loanToken);
 
-    try {
-      const routeSupported = await venue.supportsRoute(encoder, toConvert.src, toConvert.dst);
-      if (routeSupported) {
-        const convertSnapshot = { ...toConvert };
-        toConvert = await venue.convert(encoder, toConvert);
-        if (toConvert.src === convertSnapshot.src && toConvert.dst === convertSnapshot.dst) {
-          console.log(
-            `${deps.logTag}[Route Debug] ${venueName}: route supported but convert returned same tokens, skipping`,
-          );
-          encoder.restoreCalls(snapshot);
-          continue;
-        }
-        console.log(`${deps.logTag}[Route Debug] ${venueName}: conversion successful`);
-
-        // SECURITY (C2): accumulate this hop's price impact (if the venue is "naked")
-        const hopImpactBps = venue.estimatePriceImpactBps?.();
-        if (hopImpactBps !== undefined) {
-          maxImpactBps =
-            maxImpactBps === undefined || hopImpactBps > maxImpactBps ? hopImpactBps : maxImpactBps;
-          console.log(
-            `${deps.logTag}[Route Debug] ${venueName}: estimated price impact ${hopImpactBps} bps`,
-          );
-        }
-      } else {
-        console.log(`${deps.logTag}[Route Debug] ${venueName}: route not supported`);
-        encoder.restoreCalls(snapshot);
+  // Fast path: replay the venue sequence that worked last time for this exact pair,
+  // skipping the priority-list probe entirely. Route availability rarely changes within
+  // a process lifetime, and we watch a small, fixed set of markets with recurring pairs,
+  // so this is the common case.
+  const cachedRoute = knownVenueForPair.get(cacheKey);
+  if (cachedRoute !== undefined) {
+    let cachedRouteOk = true;
+    for (const venue of cachedRoute) {
+      const outcome = await tryVenueConvert(deps, venue, toConvert, encoder);
+      if (!outcome.ok) {
+        cachedRouteOk = false;
+        break;
       }
-    } catch (error) {
-      console.error(
-        `${deps.logTag}[Route Debug] ${venueName}: error — ${error instanceof Error ? error.message : error}`,
-      );
-      encoder.restoreCalls(snapshot);
-      continue;
+      toConvert = outcome.result;
+      if (outcome.impactBps !== undefined) {
+        maxImpactBps =
+          maxImpactBps === undefined || outcome.impactBps > maxImpactBps
+            ? outcome.impactBps
+            : maxImpactBps;
+      }
+    }
+
+    if (cachedRouteOk && toConvert.src === toConvert.dst) {
+      console.log(`${deps.logTag}[Route Debug] Conversion complete via cached route`);
+      return { success: true, impactBps: maxImpactBps };
+    }
+
+    // Cached route no longer works (pool drained, liquidity moved, etc.) — drop it and
+    // fall back to a full probe from scratch.
+    knownVenueForPair.delete(cacheKey);
+    toConvert = { src: collateralToken, dst: loanToken, srcAmount: seizableCollateral };
+    maxImpactBps = undefined;
+  }
+
+  // Full probe: check every venue's supportsRoute() concurrently instead of sequentially.
+  // This is what used to burn N RPC round-trips in series (one per venue tried before
+  // reaching the one that actually supports the pair) — now it's one round-trip wide.
+  const usedVenues: LiquidityVenue[] = [];
+
+  for (;;) {
+    const currentHop = toConvert;
+    const supportChecks = await Promise.all(
+      deps.liquidityVenues.map(async (venue) => {
+        try {
+          const supported = await venue.supportsRoute(encoder, currentHop.src, currentHop.dst);
+          return { venue, supported };
+        } catch (error) {
+          console.error(
+            `${deps.logTag}[Route Debug] ${venue.constructor.name}: supportsRoute error — ${error instanceof Error ? error.message : error}`,
+          );
+          return { venue, supported: false };
+        }
+      }),
+    );
+
+    // Preserve configured priority order: walk the venue list in its original order,
+    // trying only the ones the parallel probe marked as supported, until one converts.
+    let hopConverted = false;
+    for (const venue of deps.liquidityVenues) {
+      const check = supportChecks.find((c) => c.venue === venue);
+      if (!check?.supported) {
+        console.log(`${deps.logTag}[Route Debug] ${venue.constructor.name}: route not supported`);
+        continue;
+      }
+
+      const outcome = await tryVenueConvert(deps, venue, toConvert, encoder);
+      if (!outcome.ok) continue;
+
+      toConvert = outcome.result;
+      usedVenues.push(venue);
+      if (outcome.impactBps !== undefined) {
+        maxImpactBps =
+          maxImpactBps === undefined || outcome.impactBps > maxImpactBps
+            ? outcome.impactBps
+            : maxImpactBps;
+      }
+      hopConverted = true;
+      break;
     }
 
     if (toConvert.src === toConvert.dst) {
-      console.log(`${deps.logTag}[Route Debug] Conversion complete via ${venueName}`);
+      knownVenueForPair.set(cacheKey, usedVenues);
+      console.log(`${deps.logTag}[Route Debug] Conversion complete`);
       return { success: true, impactBps: maxImpactBps };
     }
+
+    if (!hopConverted) {
+      // No venue could make progress on the current hop — dead end.
+      break;
+    }
+    // Otherwise loop again: multi-hop route, probe for the next leg.
   }
 
   console.log(
@@ -620,6 +717,27 @@ export function wrapWithFlashLoan(
  * Attempts primary provider first, then fallbacks in order.
  * Returns true if any provider succeeds.
  */
+// Revert reasons that mean the liquidation target itself is no longer valid — retrying with
+// a different flash loan provider cannot fix these, since the problem isn't the provider,
+// it's that the position moved (someone else liquidated it, price recovered, debt was repaid,
+// etc.) between detection and simulation. Matching one of these should abort the whole
+// fallback chain immediately instead of burning simulation calls on the remaining providers.
+// Extend this list as new protocol-specific "not liquidatable" reasons are observed in logs.
+const NON_RECOVERABLE_REVERT_PATTERNS = [
+  /position is healthy/i, // Morpho Blue
+  /health factor.*not below/i, // Aave V3 (HEALTH_FACTOR_NOT_BELOW_THRESHOLD, code "51")
+  /\b51\b/, // Aave V3 numeric error code for the above
+  /not.?liquidatable/i, // Compound V3 (Comet) NotLiquidatable()
+  /insufficient shortfall/i, // Compound V2-style (Moonwell) comptroller rejection
+  /collateral cannot be liquidated/i, // Aave V3
+] as const;
+
+function isNonRecoverableRevert(error: unknown): string | undefined {
+  const message = error instanceof Error ? error.message : String(error);
+  const matched = NON_RECOVERABLE_REVERT_PATTERNS.find((pattern) => pattern.test(message));
+  return matched ? message : undefined;
+}
+
 export async function simulateAndExecFlashLoanWithFallback(
   deps: SharedExecutionDeps,
   callbackCalls: Hex[],
@@ -670,6 +788,14 @@ export async function simulateAndExecFlashLoanWithFallback(
         return true;
       }
     } catch (error) {
+      const nonRecoverableReason = isNonRecoverableRevert(error);
+      if (nonRecoverableReason !== undefined) {
+        console.warn(
+          `${deps.logTag}[FlashLoanFallback] Target no longer liquidatable (${nonRecoverableReason.slice(0, 120)}) — aborting fallback chain, ${providers.length - 1 - i} remaining provider(s) skipped`,
+        );
+        return false;
+      }
+
       console.warn(
         `${deps.logTag}[FlashLoanFallback] Provider ${provider} failed: ${error instanceof Error ? error.message : error}`,
       );

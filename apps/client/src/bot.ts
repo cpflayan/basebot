@@ -591,34 +591,10 @@ export class LiquidationBot {
     const seizableCollateral = position.seizableCollateral ?? 0n;
     const badDebtPosition = seizableCollateral === position.collateral;
 
-    if (!this.checkCooldown(MarketUtils.getMarketId(marketParams), position.user)) {
-      logLiquidationDebug({
-        protocol: this.logTag,
-        account: position.user,
-        healthFactor:
-          position.healthFactor !== undefined ? Number(position.healthFactor) / 1e18 : undefined,
-        collateral: {
-          token: marketParams.collateralToken,
-          amount: position.collateral,
-        },
-        debt: {
-          token: marketParams.loanToken,
-          amount: position.borrowShares,
-        },
-        seizableCollateral,
-        isBadDebt: badDebtPosition,
-        decision: "skip",
-        reason: "Position is in cooldown period",
-        details: {
-          marketId: MarketUtils.getMarketId(marketParams),
-          note: "Recently attempted liquidation, waiting before retry",
-        },
-      });
-      return;
-    }
-
     // Bad debt pre-filter: skip early if collateral value < debt and we don't realize bad debt.
-    // Avoids wasting gas on simulation for positions that can't be profitable.
+    // Avoids wasting gas on simulation — and wasting a cooldown slot — for positions that
+    // can't be profitable. Runs BEFORE the cooldown check so these positions never
+    // trip the cooldown timer.
     if (!this.alwaysRealizeBadDebt && badDebtPosition) {
       logLiquidationDebug({
         protocol: this.logTag,
@@ -641,6 +617,34 @@ export class LiquidationBot {
           marketId: MarketUtils.getMarketId(marketParams),
           alwaysRealizeBadDebt: this.alwaysRealizeBadDebt,
           note: "Position is underwater and bot is configured to skip bad debt",
+        },
+      });
+      return;
+    }
+
+    // Cooldown check — only reached once we've decided this position is actually worth
+    // attempting, so the cooldown timer only ever reflects a real attempt.
+    if (!this.checkCooldown(MarketUtils.getMarketId(marketParams), position.user)) {
+      logLiquidationDebug({
+        protocol: this.logTag,
+        account: position.user,
+        healthFactor:
+          position.healthFactor !== undefined ? Number(position.healthFactor) / 1e18 : undefined,
+        collateral: {
+          token: marketParams.collateralToken,
+          amount: position.collateral,
+        },
+        debt: {
+          token: marketParams.loanToken,
+          amount: position.borrowShares,
+        },
+        seizableCollateral,
+        isBadDebt: badDebtPosition,
+        decision: "skip",
+        reason: "Position is in cooldown period",
+        details: {
+          marketId: MarketUtils.getMarketId(marketParams),
+          note: "Recently attempted liquidation, waiting before retry",
         },
       });
       return;
