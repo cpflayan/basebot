@@ -324,20 +324,23 @@ export class HyperIndexDataProvider implements DataProvider {
       }
 
       // 4. Fetch all oracle prices on-chain in parallel (deduplicated)
+      const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
       const oraclePrices = new Map<Address, bigint | undefined>();
       await Promise.all(
-        [...oracleAddresses].map(async (oracle) => {
-          try {
-            const price = await readContract(client, {
-              address: oracle,
-              abi: oracleAbi,
-              functionName: "price",
-            });
-            oraclePrices.set(oracle, price);
-          } catch {
-            oraclePrices.set(oracle, undefined);
-          }
-        }),
+        [...oracleAddresses]
+          .filter((o) => o !== ZERO_ADDR)
+          .map(async (oracle) => {
+            try {
+              const price = await readContract(client, {
+                address: oracle,
+                abi: oracleAbi,
+                functionName: "price",
+              });
+              oraclePrices.set(oracle, price);
+            } catch {
+              oraclePrices.set(oracle, undefined);
+            }
+          }),
       );
 
       // 5. Build Market objects from indexed data + on-chain oracle prices

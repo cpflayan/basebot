@@ -74,6 +74,8 @@ const KNOWN_REVERT_SELECTORS: Record<string, string> = {
   "0x42301c23": "InsufficientOutputAmount()", // Aerodrome / UniV2-style swap minOut
   "0x08c379a0": "Error(string)", // standard Solidity Error
   "0x4e487b71": "Panic(uint256)",
+  "0xb629b0e4": "MustNotLeaveDust()", // Morpho Blue flash-loan: executor retains >dust loan-asset balance
+  "0x32b219b6": "AggregatorError()", // 1inch / LiFi aggregator swap revert (stale quote or insufficient liquidity)
 };
 
 /** Balancer V2 string reasons that show up as Error(string) after decode, or raw in logs. */
@@ -934,18 +936,25 @@ export function wrapWithFlashLoan(
   amount: bigint,
   callbackCalls: Hex[],
 ): Hex[] {
-  const encoder = new LiquidationEncoder(deps.executorAddress, deps.client);
+  const wrapperEncoder = new LiquidationEncoder(deps.executorAddress, deps.client);
 
+  // IMPORTANT: Do NOT inject erc20Skim into any flash-loan callback.
+  // erc20Skim transfers the executor's FULL balance (placeholder-resolved) to treasury.
+  // Inside a flash-loan callback the executor holds flashLoanAmount + profit;
+  // skimming sends ALL of it away, so the provider's repay (transfer / transferFrom)
+  // reverts with "ERC20: transfer amount exceeds balance".
+  // Pre-existing executor dust should be cleaned operationally via src/skim.ts
+  // BEFORE the bot starts, not inside the flash-loan callback.
   switch (provider) {
     case "balancer":
-      encoder.balancerFlashLoan(BALANCER_VAULT_ADDRESS, [{ asset, amount }], callbackCalls);
+      wrapperEncoder.balancerFlashLoan(BALANCER_VAULT_ADDRESS, [{ asset, amount }], callbackCalls);
       break;
 
     case "morpho": {
       if (!deps.morphoAddress) {
         throw new Error(`${deps.logTag}Morpho address not configured for flash loan fallback`);
       }
-      encoder.morphoBlueFlashLoan(deps.morphoAddress, asset, amount, callbackCalls);
+      wrapperEncoder.morphoBlueFlashLoan(deps.morphoAddress, asset, amount, callbackCalls);
       break;
     }
 
@@ -954,7 +963,7 @@ export function wrapWithFlashLoan(
       if (!aavePoolAddress) {
         throw new Error(`${deps.logTag}Aave V3 pool not configured for chain ${deps.chainId}`);
       }
-      encoder.aaveFlashLoanWithPremium(
+      wrapperEncoder.aaveFlashLoanWithPremium(
         aavePoolAddress,
         [{ asset, amount }],
         AAVE_FLASH_LOAN_PREMIUM_BPS,
@@ -964,7 +973,7 @@ export function wrapWithFlashLoan(
     }
   }
 
-  return encoder.flush();
+  return wrapperEncoder.flush();
 }
 
 // ─── Flash Loan Fallback Execution ───

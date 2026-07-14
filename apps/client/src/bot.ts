@@ -531,12 +531,21 @@ export class LiquidationBot {
             }
           }
 
-          const freshPrice = await readContract(this.client, {
-            address: cachedMarket.params.oracle,
-            abi: oracleAbi,
-            functionName: "price",
-          });
-          this.positionCache.updateOraclePrice(marketId, freshPrice);
+          // Guard: skip oracle price refresh if oracle address is zero/invalid
+          const oracleAddr = cachedMarket.params.oracle;
+          let freshPrice: bigint | undefined;
+          if (oracleAddr && oracleAddr !== "0x0000000000000000000000000000000000000000") {
+            freshPrice = await readContract(this.client, {
+              address: oracleAddr,
+              abi: oracleAbi,
+              functionName: "price",
+            });
+            this.positionCache.updateOraclePrice(marketId, freshPrice);
+          } else {
+            console.warn(
+              `${this.logTag}  Market ${marketId.slice(0, 10)}… has zero oracle address — skip price refresh`,
+            );
+          }
 
           const eventsForMarket = events.filter((e) => e.marketId === marketId);
           for (const event of eventsForMarket) {

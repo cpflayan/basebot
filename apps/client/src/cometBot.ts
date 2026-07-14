@@ -74,6 +74,15 @@ function isCometDustDebt(amount: bigint, baseAsset: Address): boolean {
   return amount < 10n ** 12n;
 }
 
+/** Check if base asset is a 6-decimal stablecoin (USDC/USDbC). */
+function isUsdcLike(baseAsset: Address): boolean {
+  const t = baseAsset.toLowerCase();
+  return (
+    t === "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" || // Base USDC
+    t === "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca" // USDbC
+  );
+}
+
 export interface CometLiquidationBotInputs {
   logTag: string;
   client: WalletClient<Transport, Chain, Account>;
@@ -540,6 +549,23 @@ export class CometLiquidationBot {
     }
 
     // Dust debt → swap minOut (InsufficientOutputAmount) always fails; soft cooldown
+    // For flash loans, the threshold is higher: tiny amounts (<$1) lose precision
+    // during buyCollateral + DEX swap, causing "transfer amount exceeds balance"
+    // on the flash-loan repay.
+    const flashLoanDustThreshold = isUsdcLike(comet.baseAsset) ? 100_000_000n : 10n ** 17n; // $100 or 0.1 ETH
+    if (flashLoanAmount < flashLoanDustThreshold) {
+      this.armCooldown(
+        comet.address,
+        account,
+        "soft",
+        `dust flashLoanAmount=${flashLoanAmount} < threshold=${flashLoanDustThreshold}`,
+        "fail_soft_profit",
+      );
+      console.log(
+        `${this.logTag}  ${account} dust flash loan (${flashLoanAmount} base units < ${flashLoanDustThreshold}) — skip`,
+      );
+      return;
+    }
     if (isCometDustDebt(flashLoanAmount, comet.baseAsset)) {
       this.armCooldown(
         comet.address,
@@ -641,13 +667,24 @@ export class CometLiquidationBot {
         ? BigInt(Math.floor(flashLoanValueUsd * 1e6))
         : 0n;
 
+    // SAFETY: if we can't price the flash loan amount in USD, we cannot allocate
+    // budgets proportionally across collaterals. With N>1 collaterals the first one
+    // would consume the entire flashLoanAmount and the rest get nothing; even with
+    // N=1 the lack of price info means we can't verify profitability. Skip.
+    if (flashUsdScaled === 0n) {
+      console.warn(
+        `${this.logTag}⚠️ Cannot price base asset for flash-loan budget allocation — skip flash loan path`,
+      );
+      return;
+    }
+
     for (let i = 0; i < candidates.length; i++) {
       if (remainingBudget <= 0n) break;
       const { collateral, reserveAmount } = candidates[i]!;
       const reserveValueUsd = reserveValuesUsd[i];
 
       let baseAmountForThisCollateral = remainingBudget;
-      if (flashUsdScaled > 0n && reserveValueUsd !== undefined && reserveValueUsd > 0) {
+      if (reserveValueUsd !== undefined && reserveValueUsd > 0) {
         const reserveUsdScaled = BigInt(Math.floor(reserveValueUsd * 1e6));
         // 95% safety margin so price micro-errors don't overspend budget
         const proportional =
@@ -766,6 +803,14 @@ export class CometLiquidationBot {
     const primaryCollateral = collateralAssets.find(
       (c) =>
         !TOKEN_BLACKLIST.has(c.toLowerCase()) && c.toLowerCase() !== comet.baseAsset.toLowerCase(),
+    );
+
+    // Diagnostic: log budget allocation vs flash loan amount
+    const totalBudgetAllocated = buyPlans.reduce((sum, p) => sum + p.baseAmount, 0n);
+    console.log(
+      `${this.logTag}[FlashLoan Debug] flashLoanAmount=${flashLoanAmount} budgetAllocated=${totalBudgetAllocated} ` +
+        `buyPlans=${buyPlans.length} swapsAttempted=${swapsAttempted} anySwapOk=${anySwapOk} ` +
+        `callbackCalls=${callbackCalls.length}`,
     );
 
     // Step 7: flash loan sim + exec

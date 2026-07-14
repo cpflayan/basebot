@@ -14,6 +14,14 @@ interface PoolInfo {
 
 const BPS_DENOMINATOR = 10_000n;
 
+/**
+ * Slippage tolerance applied on top of the quoted getAmountOut.
+ * getAmountOut is a point-in-time read; between that RPC and the actual
+ * swap execution (simulation or on-chain) reserves may shift slightly.
+ * 0.5% buffer prevents InsufficientOutputAmount reverts from minor reserve drift.
+ */
+const AERODROME_SLIPPAGE_BPS = 50n; // 0.5%
+
 export class AerodromeVenue implements LiquidityVenue {
   private pools: Record<Address, Record<Address, PoolInfo | null>> = {};
   // SECURITY (C2): set as a byproduct of convert(), consumed by estimatePriceImpactBps()
@@ -76,8 +84,14 @@ export class AerodromeVenue implements LiquidityVenue {
       this.lastImpactBps =
         srcReserve > 0n ? (srcAmount * BPS_DENOMINATOR) / (srcReserve + srcAmount) : undefined;
 
-      const amount0Out = srcIsToken0 ? 0n : amountOut;
-      const amount1Out = srcIsToken0 ? amountOut : 0n;
+      // Apply slippage tolerance to the quoted output to prevent
+      // InsufficientOutputAmount() reverts from minor reserve drift between
+      // the getAmountOut read and the actual swap execution.
+      const minAmountOut =
+        (amountOut * (BPS_DENOMINATOR - AERODROME_SLIPPAGE_BPS)) / BPS_DENOMINATOR;
+
+      const amount0Out = srcIsToken0 ? 0n : minAmountOut;
+      const amount1Out = srcIsToken0 ? minAmountOut : 0n;
 
       // Step 1: Transfer input token to the pool
       encoder.pushCall(

@@ -86,24 +86,14 @@ function isMoonwellSimFailureMessage(msg: string): boolean {
   );
 }
 
-/** Skip repay amounts too small to cover swap minOut + gas (underlying units). */
-function isMoonwellDustRepay(amount: bigint, underlying: Address): boolean {
-  if (amount === 0n) return true;
-  const t = underlying.toLowerCase();
-  // USDC / USDbC / EURC-style 6 decimals: under $0.01
-  if (
-    t === "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" ||
-    t === "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca" ||
-    t === "0x60a3e35cc302bfa44cb288bc5a4f316fdb1adb42"
-  ) {
-    return amount < 10_000n;
-  }
-  // 8-dec (cbBTC etc.): under 0.000001
-  if (t === "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf") {
-    return amount < 100n;
-  }
-  // 18-dec: under 1e12 wei
-  return amount < 10n ** 12n;
+/** Check if token is a 6-decimal stablecoin (USDC/USDbC/EURC). */
+function isUsdcLikeToken(token: Address): boolean {
+  const t = token.toLowerCase();
+  return (
+    t === "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" || // Base USDC
+    t === "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca" || // USDbC
+    t === "0x60a3e35cc302bfa44cb288bc5a4f316fdb1adb42" // EURC
+  );
 }
 
 export interface MoonwellLiquidationBotInputs {
@@ -762,9 +752,16 @@ export class MoonwellLiquidationBot {
         continue;
       }
 
-      if (isMoonwellDustRepay(repayAmount, borrowUnderlying)) {
+      // For flash loans, use a higher dust threshold: tiny amounts (<$1) lose precision
+      // during liquidateBorrow + DEX swap, causing "transfer amount exceeds balance" on repay.
+      const dustThreshold = this.useFlashLoan
+        ? isUsdcLikeToken(borrowUnderlying)
+          ? 100_000_000n
+          : 10n ** 17n // $100 or 0.1 ETH
+        : 10_000n; // $0.01 for direct liquidation
+      if (repayAmount < dustThreshold) {
         console.log(
-          `${this.logTag}  ${account} dust repay ${repayAmount} via ${borrowMToken.slice(0, 10)}… — skip`,
+          `${this.logTag}  ${account} dust repay ${repayAmount} < ${dustThreshold} via ${borrowMToken.slice(0, 10)}… — skip`,
         );
         continue;
       }

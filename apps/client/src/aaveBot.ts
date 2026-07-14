@@ -1002,6 +1002,19 @@ export class AaveLiquidationBot {
       return;
     }
 
+    // Dust flash-loan amounts (<$1) lose precision during liquidationCall + DEX swap,
+    // causing "transfer amount exceeds balance" on the flash-loan repay.
+    const isUsdcLike =
+      pair.debtAsset.toLowerCase() === "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" ||
+      pair.debtAsset.toLowerCase() === "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca";
+    const dustThreshold = isUsdcLike ? 100_000_000n : 10n ** 17n; // $100 or 0.1 ETH
+    if (flashLoanAmount < dustThreshold) {
+      console.log(
+        `${this.logTag}  ${account} dust flash loan (${flashLoanAmount} < ${dustThreshold}) — skip`,
+      );
+      return;
+    }
+
     // ── Build callback calls (executed inside flash loan) ──
 
     // Step 1: Approve Pool to spend debt asset
@@ -1042,6 +1055,15 @@ export class AaveLiquidationBot {
 
     // Do NOT erc20Skim before flash repay (appended after callbacks).
     const callbackCalls = callbackEncoder.flush();
+
+    // Diagnostic: log pair details before simulation
+    console.log(
+      `${this.logTag}[FlashLoan Debug] account=${account.slice(0, 10)}… ` +
+        `debtAsset=${pair.debtAsset.slice(0, 10)}… collateralAsset=${pair.collateralAsset.slice(0, 10)}… ` +
+        `debtToCover=${pair.debtToCover} seizableCollateral=${pair.seizableCollateral} ` +
+        `liquidationBonus=${pair.liquidationBonus} isBadDebt=${pair.isBadDebt} ` +
+        `callbackCalls=${callbackCalls.length}`,
+    );
 
     // Step 5: Wrap with flash loan + simulate/exec (pass impact for dynamic slippage)
     try {

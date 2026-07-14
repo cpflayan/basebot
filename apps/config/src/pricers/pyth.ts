@@ -103,8 +103,7 @@ export const PYTH_TOKEN_TO_FEED: Record<number, Record<Address, `0x${string}`>> 
     "0x820C137fa70C8691f0e44Dc420a5e53c168921Dc": PYTH_FEED_IDS.USDS_USD,
     // DAI
     "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb": PYTH_FEED_IDS.DAI_USD,
-    // GHO
-    "0x6Bb7a212910682DCFdbd5BCBb3e28FB4E8da10Ee": PYTH_FEED_IDS.GHO_USD,
+    // GHO — NOT available on Base Pyth (PriceFeedNotFound), falls back to DefiLlama
     // --- BTC wrappers ---
     // tBTC
     "0x236aa50979D5f3De3Bd1Eeb40E81137F22ab794b": PYTH_FEED_IDS.TBTC_USD,
