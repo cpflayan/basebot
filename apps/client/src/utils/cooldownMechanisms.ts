@@ -50,6 +50,18 @@ const SOFT_FAIL_PATTERNS: readonly RegExp[] = [
   /below threshold/i,
   /not profitable/i,
   /Simulation failed/i,
+  /LIQUIDATE_SEIZE_TOO_MUCH/i, // Moonwell: repay > seizable collateral — amount drift
+  /BAL#528/i, // Balancer flash liquidity
+  // Empty revert / empty return — usually transient, not structural hard lock
+  /returned no data/i,
+  /empty revert/i,
+  /all borrow positions exhausted/i, // Moonwell exhaust without structural error
+  // Structured SimExecResult reasons (logs / armCooldown detail)
+  /\bsim_fail\b/i,
+  /\bprofit_fail\b/i,
+  /\bslippage_fail\b/i,
+  /\bexec_revert\b/i,
+  /\bproviders_exhausted\b/i,
 ];
 
 export function classifyLiquidationFailure(error: unknown): CooldownClass {

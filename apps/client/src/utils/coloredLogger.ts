@@ -1,10 +1,12 @@
 /**
  * Colored console logger with timestamps for bot output.
- * Also appends plain (no ANSI) lines to a fixed log file (default: logs/bot.log).
+ * Also appends plain (no ANSI) lines to a log file with size-based rotation.
  *
  * Env:
- *   LOG_FILE=logs/bot.log   — path relative to cwd or absolute (default logs/bot.log)
- *   LOG_TO_FILE=0           — disable file logging
+ *   LOG_FILE=logs/bot.log       — path relative to cwd or absolute (default logs/bot.log)
+ *   LOG_TO_FILE=0               — disable file logging
+ *   LOG_FILE_MAX_MB=20          — rotate when active file exceeds this size (default 20)
+ *   LOG_FILE_MAX_FILES=5        — keep bot.log + bot.log.1 … bot.log.(N-1) (default 5 total)
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -84,11 +86,31 @@ function colorizeProtocol(message: string): string {
   return message;
 }
 
-// ─── File sink (append, plain text) ───
+// ─── File sink (appendFileSync + size rotation; no async stream lag) ───
 
-let logStream: fs.WriteStream | null = null;
 let logFilePath: string | null = null;
 let fileLogDisabled = false;
+let fileReady = false;
+/** Bytes in the current active segment. */
+let currentFileBytes = 0;
+let rotateInProgress = false;
+
+function envPositiveInt(name: string, fallback: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.floor(n);
+}
+
+function maxFileBytes(): number {
+  return envPositiveInt("LOG_FILE_MAX_MB", 20) * 1024 * 1024;
+}
+
+/** Total segments kept including the active `bot.log` (e.g. 5 → bot.log + .1 … .4). */
+function maxFiles(): number {
+  return Math.max(1, envPositiveInt("LOG_FILE_MAX_FILES", 5));
+}
 
 function resolveLogFilePath(): string | null {
   if (process.env.LOG_TO_FILE === "0" || process.env.LOG_TO_FILE === "false") {
@@ -98,51 +120,129 @@ function resolveLogFilePath(): string | null {
   return path.isAbsolute(raw) ? raw : path.resolve(process.cwd(), raw);
 }
 
-function ensureLogStream(): fs.WriteStream | null {
-  if (fileLogDisabled) return null;
-  if (logStream) return logStream;
+/**
+ * Rotate: bot.log.(N-2) → bot.log.(N-1), …, bot.log → bot.log.1.
+ * Oldest segment beyond maxFiles is deleted.
+ */
+function rotateLogFiles(filePath: string): void {
+  const keep = maxFiles();
+  const archiveSlots = keep - 1;
+
+  if (archiveSlots >= 1) {
+    const oldest = `${filePath}.${archiveSlots}`;
+    try {
+      if (fs.existsSync(oldest)) fs.unlinkSync(oldest);
+    } catch {
+      // ignore
+    }
+  }
+
+  for (let i = archiveSlots - 1; i >= 1; i--) {
+    const from = `${filePath}.${i}`;
+    const to = `${filePath}.${i + 1}`;
+    try {
+      if (fs.existsSync(from)) fs.renameSync(from, to);
+    } catch {
+      // ignore
+    }
+  }
+
+  if (archiveSlots >= 1) {
+    try {
+      if (fs.existsSync(filePath)) fs.renameSync(filePath, `${filePath}.1`);
+    } catch {
+      // ignore
+    }
+  } else {
+    try {
+      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    } catch {
+      // ignore
+    }
+  }
+}
+
+function ensureFileReady(): boolean {
+  if (fileLogDisabled) return false;
+  if (fileReady && logFilePath) return true;
 
   const filePath = resolveLogFilePath();
   if (!filePath) {
     fileLogDisabled = true;
-    return null;
+    return false;
   }
 
   try {
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    logStream = fs.createWriteStream(filePath, { flags: "a", encoding: "utf8" });
+    let existing = 0;
+    try {
+      existing = fs.statSync(filePath).size;
+    } catch {
+      existing = 0;
+    }
     logFilePath = filePath;
-    logStream.on("error", (err) => {
-      originalConsole.error(`[Logger] Failed writing log file: ${err.message}`);
-      try {
-        logStream?.destroy();
-      } catch {
-        // ignore
-      }
-      logStream = null;
-      fileLogDisabled = true;
-    });
-    // One-time banner so operators know where file logs go
-    const banner = `${getTimestampPlain()} [Logger] File logging → ${filePath}\n`;
-    logStream.write(banner);
+    currentFileBytes = existing;
+    fileReady = true;
+
+    const maxMb = envPositiveInt("LOG_FILE_MAX_MB", 20);
+    const keep = maxFiles();
+    const banner =
+      `${getTimestampPlain()} [Logger] File logging → ${filePath}` +
+      ` (rotate @ ${maxMb}MB, keep ${keep} files)\n`;
+    fs.appendFileSync(filePath, banner, "utf8");
+    currentFileBytes += Buffer.byteLength(banner, "utf8");
     originalConsole.log(
-      `${getTimestampColored()} ${colors.dim}[Logger] File logging → ${filePath}${colors.reset}`,
+      `${getTimestampColored()} ${colors.dim}[Logger] File logging → ${filePath}` +
+        ` (rotate @ ${maxMb}MB × ${keep})${colors.reset}`,
     );
-    return logStream;
+    return true;
   } catch (err) {
     originalConsole.error(
       `[Logger] Cannot open log file ${filePath}: ${err instanceof Error ? err.message : err}`,
     );
     fileLogDisabled = true;
-    return null;
+    return false;
+  }
+}
+
+function maybeRotateBeforeWrite(lineBytes: number): void {
+  if (rotateInProgress || !logFilePath) return;
+  const limit = maxFileBytes();
+  if (currentFileBytes + lineBytes < limit) return;
+
+  rotateInProgress = true;
+  try {
+    rotateLogFiles(logFilePath);
+    currentFileBytes = 0;
+    const note = `${getTimestampPlain()} [Logger] Rotated log (max ${envPositiveInt("LOG_FILE_MAX_MB", 20)}MB)\n`;
+    fs.appendFileSync(logFilePath, note, "utf8");
+    currentFileBytes = Buffer.byteLength(note, "utf8");
+    originalConsole.log(
+      `${getTimestampColored()} ${colors.dim}[Logger] Rotated log file → ${logFilePath}${colors.reset}`,
+    );
+  } catch (err) {
+    originalConsole.error(
+      `[Logger] Log rotate failed: ${err instanceof Error ? err.message : err}`,
+    );
+  } finally {
+    rotateInProgress = false;
   }
 }
 
 function writeToFile(level: string, message: string): void {
-  const stream = ensureLogStream();
-  if (!stream) return;
+  if (!ensureFileReady() || !logFilePath) return;
   const line = `${getTimestampPlain()} [${level}] ${stripAnsi(message)}\n`;
-  stream.write(line);
+  const lineBytes = Buffer.byteLength(line, "utf8");
+  maybeRotateBeforeWrite(lineBytes);
+  try {
+    fs.appendFileSync(logFilePath, line, "utf8");
+    currentFileBytes += lineBytes;
+  } catch (err) {
+    originalConsole.error(
+      `[Logger] Failed writing log file: ${err instanceof Error ? err.message : err}`,
+    );
+    fileLogDisabled = true;
+  }
 }
 
 function formatArgs(args: unknown[]): string {

@@ -143,21 +143,23 @@ export class UniswapV4Venue implements LiquidityVenue {
     // See https://github.com/Uniswap/sdks/blob/5a1cbfb55d47625afd40f5f0f5e934ed18dfd5e4/sdks/universal-router-sdk/src/utils/routerCommands.ts#L268
     routePlanner.addCommand(CommandType.V4_SWAP, [v4Planner.finalize()], false);
 
-    // Make sure Permit2 can control our tokens
-    try {
-      const permit2Allowance = await readContract(encoder.client, {
-        abi: erc20Abi,
-        address: rawSrc,
-        functionName: "allowance",
-        args: [encoder.address, deployments.Permit2.address],
-      });
-      if (permit2Allowance < srcAmount) {
-        encoder.erc20Approve(rawSrc, deployments.Permit2.address, maxUint256);
+    // Make sure Permit2 can control our tokens (ERC-20 only — native/0x0 has no allowance)
+    if (rawSrc !== zeroAddress && rawSrc !== Native.address) {
+      try {
+        const permit2Allowance = await readContract(encoder.client, {
+          abi: erc20Abi,
+          address: rawSrc,
+          functionName: "allowance",
+          args: [encoder.address, deployments.Permit2.address],
+        });
+        if (permit2Allowance < srcAmount) {
+          encoder.erc20Approve(rawSrc, deployments.Permit2.address, maxUint256);
+        }
+      } catch (error) {
+        throw new Error(
+          `(UniswapV4) Error fetching Permit2 allowance: ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
-    } catch (error) {
-      throw new Error(
-        `(UniswapV4) Error fetching Permit2 allowance: ${error instanceof Error ? error.message : String(error)}`,
-      );
     }
 
     // Tell Permit2 that the UniversalRouter can spend our tokens

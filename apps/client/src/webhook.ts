@@ -16,7 +16,8 @@ export const MORPHO_EVENT_SIGNATURES = [
   "Withdraw(bytes32,address,address,address,uint256,uint256)",
   "SupplyCollateral(bytes32,address,address,uint256)",
   "Repay(bytes32,address,address,address,uint256,uint256)",
-  "Liquidate(bytes32,address,address,uint256,uint256,uint256,uint256)",
+  // Morpho Blue: id, caller, borrower + repaidAssets, repaidShares, seizedAssets, badDebtAssets, badDebtShares
+  "Liquidate(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)",
 ] as const;
 
 /**
@@ -86,15 +87,17 @@ const morphoEventAbi = [
     type: "event",
   },
   {
+    // Align with apps/client/src/abis/morpho/morphoBlue.ts Liquidate
     anonymous: false,
     inputs: [
       { indexed: true, name: "id", type: "bytes32" },
-      { indexed: true, name: "liquidator", type: "address" },
-      { indexed: false, name: "user", type: "address" },
-      { indexed: false, name: "repayAssets", type: "uint256" },
-      { indexed: false, name: "repayShares", type: "uint256" },
+      { indexed: true, name: "caller", type: "address" },
+      { indexed: true, name: "borrower", type: "address" },
+      { indexed: false, name: "repaidAssets", type: "uint256" },
+      { indexed: false, name: "repaidShares", type: "uint256" },
       { indexed: false, name: "seizedAssets", type: "uint256" },
-      { indexed: false, name: "seizedShares", type: "uint256" },
+      { indexed: false, name: "badDebtAssets", type: "uint256" },
+      { indexed: false, name: "badDebtShares", type: "uint256" },
     ],
     name: "Liquidate",
     type: "event",
@@ -126,14 +129,15 @@ export function decodeMorphoLog(log: {
 
     const args = decoded.args as Record<string, unknown>;
     const marketId = args.id as Hex;
-    const user = (args.onBehalf ?? args.user) as Hex;
+    // Liquidate uses `borrower`; other events use `onBehalf` / rare `user`
+    const user = (args.onBehalf ?? args.borrower ?? args.user) as Hex;
 
     return {
       eventName: decoded.eventName,
       marketId,
       user,
-      assets: args.assets as bigint | undefined,
-      shares: args.shares as bigint | undefined,
+      assets: (args.assets ?? args.seizedAssets ?? args.repaidAssets) as bigint | undefined,
+      shares: (args.shares ?? args.repaidShares) as bigint | undefined,
     };
   } catch {
     return undefined;
@@ -210,32 +214,33 @@ export class WebhookServer {
             .send({ status: "ok", triggered: false, reason: "no decodable events" });
         }
 
-        // Cooldown: avoid triggering multiple times within cooldownMs
+        // Always apply cache from events. Cooldown only throttles liquidation attempts
+        // so bursty blocks still update positions / clear husks (P1 audit).
         const now = Date.now();
-        if (now - this.lastTriggerTime < this.cooldownMs) {
-          return await reply.code(200).send({
-            status: "ok",
-            triggered: false,
-            reason: "cooldown",
-            matchingEvents: decodedEvents.length,
-          });
+        const inCooldown = now - this.lastTriggerTime < this.cooldownMs;
+        if (!inCooldown) {
+          this.lastTriggerTime = now;
         }
-        this.lastTriggerTime = now;
 
+        const attemptLiquidation = !inCooldown;
         console.log(
-          `[Webhook] ${decodedEvents.length} Morpho event(s) decoded, triggering ${this.bots.length} bot(s)`,
+          `[Webhook] ${decodedEvents.length} Morpho event(s) → ${this.bots.length} bot(s)` +
+            (attemptLiquidation ? " (cache + liq)" : " (cache only, liquidation cooldown)"),
         );
 
-        // Trigger all registered bots with decoded events (fire-and-forget)
         for (const { bot, logTag } of this.bots) {
-          bot.handleEvents(decodedEvents).catch((e: unknown) => {
+          bot.handleEvents(decodedEvents, { attemptLiquidation }).catch((e: unknown) => {
             console.error(`${logTag} event-driven handling failed:`, e);
           });
         }
 
         return await reply.code(200).send({
           status: "ok",
+          // triggered=true whenever events are applied to cache (not only when liq runs)
           triggered: true,
+          cacheApplied: true,
+          liquidationsThrottled: inCooldown,
+          reason: inCooldown ? "cooldown" : undefined,
           matchingEvents: decodedEvents.length,
         });
       } catch (error) {

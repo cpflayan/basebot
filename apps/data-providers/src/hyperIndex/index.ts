@@ -8,7 +8,11 @@ import type { Account, Address, Chain, Client, Hex, Transport } from "viem";
 import { getAddress } from "viem";
 import { readContract } from "viem/actions";
 
-import type { DataProvider, LiquidatablePositionsResult } from "../dataProvider";
+import {
+  DataProviderError,
+  type DataProvider,
+  type LiquidatablePositionsResult,
+} from "../dataProvider";
 
 const DEFAULT_HYPERINDEX_URL = "http://localhost:8080/v1/graphql";
 const HEALTH_CHECK_INTERVAL_MS = 500;
@@ -248,8 +252,12 @@ export class HyperIndexDataProvider implements DataProvider {
       );
       return [...new Set(marketIds)] as Hex[];
     } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
       console.error(`[Chain ${client.chain.id}] Error fetching markets from HyperIndex:`, error);
-      return [];
+      throw new DataProviderError(
+        `HyperIndex fetchMarkets failed (chain ${client.chain.id}): ${msg}`,
+        error,
+      );
     }
   }
 
@@ -466,11 +474,16 @@ export class HyperIndexDataProvider implements DataProvider {
 
       return { liquidatablePositions, preLiquidatablePositions };
     } catch (error) {
+      if (error instanceof DataProviderError) throw error;
+      const msg = error instanceof Error ? error.message : String(error);
       console.error(
         `[Chain ${client.chain.id}] Error fetching liquidatable positions from HyperIndex:`,
         error,
       );
-      return { liquidatablePositions: [], preLiquidatablePositions: [] };
+      throw new DataProviderError(
+        `HyperIndex fetchLiquidatablePositions failed (chain ${client.chain.id}): ${msg}`,
+        error,
+      );
     }
   }
 

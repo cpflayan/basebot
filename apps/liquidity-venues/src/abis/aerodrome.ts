@@ -49,6 +49,17 @@ export const aerodromePoolAbi = [
     type: "function",
   },
   {
+    // Solidly/Aerodrome: quote exact output for amountIn of tokenIn
+    inputs: [
+      { internalType: "uint256", name: "amountIn", type: "uint256" },
+      { internalType: "address", name: "tokenIn", type: "address" },
+    ],
+    name: "getAmountOut",
+    outputs: [{ internalType: "uint256", name: "", type: "uint256" }],
+    stateMutability: "view",
+    type: "function",
+  },
+  {
     inputs: [
       { internalType: "uint256", name: "amount0Out", type: "uint256" },
       { internalType: "uint256", name: "amount1Out", type: "uint256" },

@@ -20,6 +20,55 @@ export const AAVE_V3_POOL_ADDRESSES: Record<number, Address> = {
   1: "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2",
 } as const;
 
+/**
+ * PoolAddressesProvider — source of truth for PoolDataProvider upgrades.
+ * Prefer `fetchAaveProtocolDataProvider()` over static maps (address changes over time).
+ */
+export const AAVE_V3_ADDRESSES_PROVIDER: Record<number, Address> = {
+  // Base
+  8453: "0xe20fCBdBfFC4Dd138cE8b2E6FBb6CB49777ad64D",
+  // Ethereum mainnet
+  1: "0x2f39d218133AFaB8F2B819B1066c7E434Ad94E9e",
+} as const;
+
+/**
+ * AaveProtocolDataProvider (PoolDataProvider) — NOT the Pool.
+ * Static fallback when AddressesProvider read fails. Keep aligned with live
+ * PoolAddressesProvider.getPoolDataProvider() on each chain.
+ */
+export const AAVE_V3_PROTOCOL_DATA_PROVIDER: Record<number, Address> = {
+  // Base — live PoolDataProvider (was 0x2d8A3C…; still callable but not current)
+  8453: "0x0F43731EB8d45A581f4a36DD74F5f358bc90C73A",
+  // Ethereum mainnet
+  1: "0x7B4EB56E7CD4b454BA8ff71E4518426369a138a3",
+} as const;
+
+/** Resolve ProtocolDataProvider for a known Pool address (lowercase keys). */
+export const AAVE_V3_POOL_TO_DATA_PROVIDER: Record<string, Address> = {
+  [AAVE_V3_POOL_ADDRESSES[8453]!.toLowerCase()]: AAVE_V3_PROTOCOL_DATA_PROVIDER[8453]!,
+  [AAVE_V3_POOL_ADDRESSES[1]!.toLowerCase()]: AAVE_V3_PROTOCOL_DATA_PROVIDER[1]!,
+};
+
+export const aaveAddressesProviderAbi = [
+  {
+    inputs: [],
+    name: "getPoolDataProvider",
+    outputs: [{ name: "", type: "address" }],
+    stateMutability: "view",
+    type: "function",
+  },
+] as const;
+
+export function resolveAaveProtocolDataProvider(
+  poolAddress: Address,
+  chainId?: number,
+): Address | undefined {
+  const byPool = AAVE_V3_POOL_TO_DATA_PROVIDER[poolAddress.toLowerCase()];
+  if (byPool) return byPool;
+  if (chainId !== undefined) return AAVE_V3_PROTOCOL_DATA_PROVIDER[chainId];
+  return undefined;
+}
+
 // ─── Constants ───
 
 /** Health factor threshold — WAD-scaled 1.0 (18 decimals) */
@@ -80,9 +129,10 @@ export const aavePoolViewAbi = [
   },
 ] as const;
 
-// ─── Aave V3 Pool Reserve Data ABI (per-reserve user data) ───
+// ─── Aave V3 ProtocolDataProvider ABI (per-reserve user + config) ───
+// These views are on AaveProtocolDataProvider / PoolDataProvider, NOT on Pool.
 
-export const aavePoolReserveDataAbi = [
+export const aaveProtocolDataProviderAbi = [
   {
     inputs: [
       { name: "asset", type: "address" },
@@ -103,7 +153,29 @@ export const aavePoolReserveDataAbi = [
     stateMutability: "view",
     type: "function",
   },
+  {
+    // Official field order: decimals first, then ltv / LT / bonus / RF / flags
+    inputs: [{ name: "asset", type: "address" }],
+    name: "getReserveConfigurationData",
+    outputs: [
+      { name: "decimals", type: "uint256" },
+      { name: "ltv", type: "uint256" }, // 4 decimals (bps)
+      { name: "liquidationThreshold", type: "uint256" }, // 4 decimals (bps)
+      { name: "liquidationBonus", type: "uint256" }, // e.g. 10500 = 5% bonus
+      { name: "reserveFactor", type: "uint256" },
+      { name: "usageAsCollateralEnabled", type: "bool" },
+      { name: "borrowingEnabled", type: "bool" },
+      { name: "stableBorrowRateEnabled", type: "bool" },
+      { name: "isActive", type: "bool" },
+      { name: "isFrozen", type: "bool" },
+    ],
+    stateMutability: "view",
+    type: "function",
+  },
 ] as const;
+
+/** @deprecated Use aaveProtocolDataProviderAbi — Pool never had getUserReserveData */
+export const aavePoolReserveDataAbi = aaveProtocolDataProviderAbi;
 
 // ─── Aave V3 Pool Write ABI (liquidation + flash loan) ───
 
@@ -155,17 +227,18 @@ export const aaveFlashLoanReceiverAbi = [
   },
 ] as const;
 
-// ─── Aave V3 Reserve Configuration ABI (for liquidation bonus) ───
+// ─── Aave V3 Reserve Configuration ABI (ProtocolDataProvider) ───
+// Alias kept for call sites that only need configuration reads.
 
 export const aaveReserveConfigurationAbi = [
   {
     inputs: [{ name: "asset", type: "address" }],
-    name: "getReserveConfigurationMap",
+    name: "getReserveConfigurationData",
     outputs: [
-      { name: "ltv", type: "uint256" }, // 4 decimals (bps)
-      { name: "liquidationThreshold", type: "uint256" }, // 4 decimals (bps)
-      { name: "liquidationBonus", type: "uint256" }, // 4 decimals (bps), e.g. 10500 = 5% bonus
       { name: "decimals", type: "uint256" },
+      { name: "ltv", type: "uint256" },
+      { name: "liquidationThreshold", type: "uint256" },
+      { name: "liquidationBonus", type: "uint256" },
       { name: "reserveFactor", type: "uint256" },
       { name: "usageAsCollateralEnabled", type: "bool" },
       { name: "borrowingEnabled", type: "bool" },
@@ -179,13 +252,15 @@ export const aaveReserveConfigurationAbi = [
 ] as const;
 
 // ─── Aave V3 Event ABI (for account discovery) ───
+// Indexed flags must match official IPool (max 3 indexed topics excluding topic0).
 
 export const aaveEventAbi = [
   {
+    // Supply(address indexed reserve, address user, address indexed onBehalfOf, uint256 amount, uint16 indexed referralCode)
     anonymous: false,
     inputs: [
       { indexed: true, name: "reserve", type: "address" },
-      { indexed: true, name: "user", type: "address" },
+      { indexed: false, name: "user", type: "address" },
       { indexed: true, name: "onBehalfOf", type: "address" },
       { indexed: false, name: "amount", type: "uint256" },
       { indexed: true, name: "referralCode", type: "uint16" },
@@ -194,13 +269,15 @@ export const aaveEventAbi = [
     type: "event",
   },
   {
+    // Borrow(address indexed reserve, address user, address indexed onBehalfOf, uint256 amount,
+    //        DataTypes.InterestRateMode interestRateMode, uint256 borrowRate, uint16 indexed referralCode)
     anonymous: false,
     inputs: [
       { indexed: true, name: "reserve", type: "address" },
       { indexed: false, name: "user", type: "address" },
       { indexed: true, name: "onBehalfOf", type: "address" },
       { indexed: false, name: "amount", type: "uint256" },
-      { indexed: true, name: "interestRateMode", type: "uint8" },
+      { indexed: false, name: "interestRateMode", type: "uint8" },
       { indexed: false, name: "borrowRate", type: "uint256" },
       { indexed: true, name: "referralCode", type: "uint16" },
     ],
@@ -208,13 +285,14 @@ export const aaveEventAbi = [
     type: "event",
   },
   {
+    // Repay(address indexed reserve, address indexed user, address indexed repayer, uint256 amount, bool useATokens)
     anonymous: false,
     inputs: [
       { indexed: true, name: "reserve", type: "address" },
       { indexed: true, name: "user", type: "address" },
       { indexed: true, name: "repayer", type: "address" },
       { indexed: false, name: "amount", type: "uint256" },
-      { indexed: true, name: "useATokens", type: "bool" },
+      { indexed: false, name: "useATokens", type: "bool" },
     ],
     name: "Repay",
     type: "event",

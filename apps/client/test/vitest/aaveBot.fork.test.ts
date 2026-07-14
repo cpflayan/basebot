@@ -198,11 +198,18 @@ describe("Aave V3 Fork Integration", () => {
     expect(calculateCloseFactor(HEALTH_FACTOR_THRESHOLD)).toBe(5000n);
   });
 
-  aaveBaseForkTest.sequential("calculateCloseFactor: scales linearly", async () => {
+  aaveBaseForkTest.sequential("calculateCloseFactor: 100% when HF < 0.95 (binary)", async () => {
     const hf = (50n * HEALTH_FACTOR_THRESHOLD) / 100n; // 0.50
     const cf = calculateCloseFactor(hf);
-    expect(cf).toBeGreaterThan(5000n);
-    expect(cf).toBeLessThan(10000n);
+    // Aave V3: HF < 0.95 → 100% close factor (not linear)
+    expect(cf).toBe(10000n);
+  });
+
+  aaveBaseForkTest.sequential("calculateCloseFactor: binary boundary at 0.95", async () => {
+    const threshold = (95n * HEALTH_FACTOR_THRESHOLD) / 100n;
+    expect(calculateCloseFactor(threshold)).toBe(5000n); // HF >= 0.95 → 50%
+    expect(calculateCloseFactor(threshold - 1n)).toBe(10000n); // HF < 0.95 → 100%
+    expect(calculateCloseFactor(threshold + 1n)).toBe(5000n);
   });
 
   // ─── selectBestLiquidationPair ───
@@ -325,10 +332,14 @@ describe("Aave V3 Fork Integration", () => {
 
       const hf = accountData[5];
 
-      // Close factor should be ~100% for very low HF (integer division may give 9999)
+      // Crashed oracle → HF well below 0.95 → binary close factor is exactly 100%
       const cf = calculateCloseFactor(hf);
-      expect(cf).toBeGreaterThanOrEqual(9999n);
-      expect(cf).toBeLessThanOrEqual(10000n);
+      const threshold = (95n * HEALTH_FACTOR_THRESHOLD) / 100n;
+      if (hf < threshold) {
+        expect(cf).toBe(10000n);
+      } else {
+        expect(cf).toBe(5000n);
+      }
 
       // selectBestLiquidationPair should find a profitable pair
       const pair = await selectBestLiquidationPair(

@@ -1,3 +1,9 @@
+/**
+ * Base flash-loan path smoke test: real Morpho market + liquidatable position + Balancer encode.
+ *
+ * Uses the canonical WETH/USDC 86% market (same params as allBots.fork.test.ts).
+ * Does NOT invent oracle/IRM addresses — Morpho rejects supply on uncreated markets.
+ */
 import { MarketUtils } from "@morpho-org/blue-sdk";
 import type { AnvilTestClient } from "@morpho-org/test";
 import { testAccount } from "@morpho-org/test";
@@ -8,6 +14,7 @@ import {
   type Address,
   encodePacked,
   fromHex,
+  getAddress,
   type Hex,
   keccak256,
   maxUint128,
@@ -22,28 +29,57 @@ import { beforeEach, describe, expect } from "vitest";
 import { BALANCER_VAULT_ADDRESS } from "../../../src/abis/BalancerVault.js";
 import { morphoBlueAbi } from "../../../src/abis/morpho/morphoBlue.js";
 
-// ── Base chain constants ──
+// ── Base chain constants (real Morpho Blue market) ──
 
-const MORPHO_BASE = "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb";
-const USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
-const WETH_BASE = "0x4200000000000000000000000000000000000006";
+const MORPHO_BASE = getAddress("0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb");
+const USDC_BASE = getAddress("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+const WETH_BASE = getAddress("0x4200000000000000000000000000000000000006");
 
-// Oracle and IRM on Base (checksummed)
-const CHAINLINK_ORACLE_BASE = "0x4E2b7B6c5a8bB0E3F6aD1b3c8f0E4F7E8C9D0A1b"; // placeholder
-const ADAPTIVE_CURVE_IRM_BASE = "0x46415998764C29aB2a25CbeA6254146D50D22687";
+/** Real Chainlink oracle for WETH/USDC market on Base — not a placeholder. */
+const ORACLE_MORPHO = getAddress("0xfea2d58cefcb9fcb597723c6bae66ffe4193afe4");
+const IRM_MORPHO = getAddress("0x46415998764C29aB2a25CbeA6254146D50D22687");
+const LLTV_MORPHO = 860000000000000000n; // 0.86
 
-// Storage slot constants (same as mainnet)
+/** Known market id for USDC/WETH/oracle/IRM/86% on Base. */
+const MARKET_ID_MORPHO =
+  "0x8793cf302b8ffd655ab97bd1c695dbd967807e8367a65cb2f4edaf1380ba1bda" as Hex;
+
+const MARKET_PARAMS = {
+  loanToken: USDC_BASE,
+  collateralToken: WETH_BASE,
+  oracle: ORACLE_MORPHO,
+  irm: IRM_MORPHO,
+  lltv: LLTV_MORPHO,
+} as const;
+
+// Storage slot constants (Morpho Blue position mapping)
 const POSITION_SLOT = 3n;
 const BORROW_SHARES_AND_COLLATERAL_OFFSET = 1n;
 
-// Test borrower - use testAccount from @morpho-org/test
 const borrower = testAccount(1);
+const supplier = testAccount(2);
 
-// ── Base fork test ──
+function firstNonEmpty(...vals: (string | undefined)[]): string | undefined {
+  for (const v of vals) {
+    if (v && v.trim().length > 0) return v.trim();
+  }
+  return undefined;
+}
 
+const baseForkUrl =
+  firstNonEmpty(
+    process.env.FORK_RPC_URL,
+    process.env.RPC_URL_BASE,
+    process.env.RPC_URL_BASE2,
+    process.env.RPC_URL_8453,
+    process.env.PUBLIC_RPC_URL_BASE,
+    base.rpcUrls.default.http[0],
+  ) ?? base.rpcUrls.default.http[0];
+
+// Pin near allBots / aaveBaseFork so market + Balancer liquidity exist on fork.
 const baseTest = createViemTest(base, {
-  forkUrl: process.env.RPC_URL_8453 ?? base.rpcUrls.default.http[0],
-  forkBlockNumber: 48_000_000,
+  forkUrl: baseForkUrl,
+  forkBlockNumber: 25_000_000,
   timeout: 180_000,
 }).extend<{ encoder: ExecutorEncoder }>({
   encoder: async ({ client }, use) => {
@@ -56,7 +92,7 @@ const baseTest = createViemTest(base, {
   },
 });
 
-// ── Helper functions ──
+// ── Helpers ──
 
 async function setupPositionOnBase(
   client: AnvilTestClient,
@@ -71,22 +107,38 @@ async function setupPositionOnBase(
   borrowAmount: bigint,
 ) {
   const marketId = MarketUtils.getMarketId(marketParams);
+  expect(marketId.toLowerCase()).toBe(MARKET_ID_MORPHO.toLowerCase());
 
-  // Deal collateral tokens to borrower
+  // Ensure market has loan-side liquidity (deal + supply as a separate account)
+  await client.deal({
+    erc20: marketParams.loanToken,
+    account: supplier.address,
+    amount: borrowAmount * 3n,
+  });
+  await client.approve({
+    account: supplier.address,
+    address: marketParams.loanToken,
+    args: [MORPHO_BASE, maxUint256],
+  });
+  await client.writeContract({
+    account: supplier.address,
+    address: MORPHO_BASE,
+    abi: morphoBlueAbi,
+    functionName: "supply",
+    args: [marketParams, borrowAmount * 3n, 0n, supplier.address, "0x"],
+  });
+
+  // Borrower: collateral + borrow
   await client.deal({
     erc20: marketParams.collateralToken,
     account: borrower.address,
     amount: collateralAmount,
   });
-
-  // Approve Morpho
   await client.approve({
     account: borrower.address,
     address: marketParams.collateralToken,
     args: [MORPHO_BASE, maxUint256],
   });
-
-  // Supply collateral
   await client.writeContract({
     account: borrower.address,
     address: MORPHO_BASE,
@@ -94,8 +146,6 @@ async function setupPositionOnBase(
     functionName: "supplyCollateral",
     args: [marketParams, collateralAmount, borrower.address, "0x"],
   });
-
-  // Borrow
   await client.writeContract({
     account: borrower.address,
     address: MORPHO_BASE,
@@ -104,7 +154,7 @@ async function setupPositionOnBase(
     args: [marketParams, borrowAmount, 0n, borrower.address, borrower.address],
   });
 
-  // Reduce collateral to make position liquidatable (HF < 1)
+  // Reduce collateral → HF < 1
   await overwriteCollateral(client, marketId, borrower.address, collateralAmount / 3n);
 
   return marketId;
@@ -117,12 +167,10 @@ async function overwriteCollateral(
   amount: bigint,
 ) {
   const slot = borrowSharesAndCollateralSlot(user, marketId);
-
   const value = await getStorageAt(client, {
     address: MORPHO_BASE,
     slot,
   });
-
   await client.setStorageAt({
     address: MORPHO_BASE,
     index: slot,
@@ -172,32 +220,21 @@ describe("Base chain flash loan liquidation - full path test", () => {
   baseTest.sequential(
     "full flash loan liquidation path on Base (WETH/USDC market)",
     async ({ encoder, client }) => {
-      // Market parameters: WETH/USDC 86% LLTV
-      const marketParams = {
-        loanToken: USDC_BASE as Address,
-        collateralToken: WETH_BASE as Address,
-        oracle: CHAINLINK_ORACLE_BASE as Address,
-        irm: ADAPTIVE_CURVE_IRM_BASE as Address,
-        lltv: 860000000000000000n, // 0.86
-      };
+      // Conservative vs 86% LLTV: 5 WETH collat, borrow 5000 USDC (healthy at ~$3k ETH)
+      const collateralAmount = parseUnits("5", 18);
+      const borrowAmount = parseUnits("5000", 6);
 
-      // Set up a position: 10 WETH collateral, borrow 10000 USDC
-      // Then reduce collateral to make it liquidatable
-      const collateralAmount = parseUnits("10", 18); // 10 WETH
-      const borrowAmount = parseUnits("10000", 6); // 10000 USDC
-
-      console.log("[Base] Setting up position...");
+      console.log("[Base] Setting up liquidatable Morpho position on real market…");
 
       const marketId = await setupPositionOnBase(
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         client as any,
-        marketParams,
+        MARKET_PARAMS,
         collateralAmount,
         borrowAmount,
       );
       console.log("[Base] Market ID:", marketId);
 
-      // Read the position
       const position = await readContract(client, {
         address: MORPHO_BASE,
         abi: morphoBlueAbi,
@@ -205,12 +242,14 @@ describe("Base chain flash loan liquidation - full path test", () => {
         args: [marketId, borrower.address],
       });
 
+      expect(position[1]).toBeGreaterThan(0n); // borrowShares
+      expect(position[2]).toBeGreaterThan(0n); // collateral (reduced)
+
       console.log("[Base] Position:");
       console.log("  Supply shares:", position[0].toString());
       console.log("  Borrow shares:", position[1].toString());
       console.log("  Collateral:", position[2].toString());
 
-      // Mock the data provider response
       nock("https://api.morpho.org")
         .post("/graphql")
         .reply(200, {
@@ -222,7 +261,7 @@ describe("Base chain flash loan liquidation - full path test", () => {
                   user: { address: borrower.address },
                   market: {
                     uniqueKey: marketId,
-                    oracle: { address: marketParams.oracle },
+                    oracle: { address: MARKET_PARAMS.oracle },
                   },
                   state: {
                     borrowShares: position[1].toString(),
@@ -235,8 +274,8 @@ describe("Base chain flash loan liquidation - full path test", () => {
           },
         });
 
-      // Verify Balancer Vault has USDC
-      const vaultUsdcBalance = await readContract(client, {
+      // Ensure Balancer vault can source flash loan USDC on this fork
+      let vaultUsdcBalance = await readContract(client, {
         address: USDC_BASE,
         abi: [
           {
@@ -251,10 +290,31 @@ describe("Base chain flash loan liquidation - full path test", () => {
         args: [BALANCER_VAULT_ADDRESS],
       });
 
-      console.log("[Base] Balancer Vault USDC balance:", vaultUsdcBalance.toString());
-      expect(vaultUsdcBalance).toBeGreaterThan(0n);
+      if (vaultUsdcBalance < borrowAmount) {
+        await client.deal({
+          erc20: USDC_BASE,
+          account: BALANCER_VAULT_ADDRESS,
+          amount: borrowAmount * 2n,
+        });
+        vaultUsdcBalance = await readContract(client, {
+          address: USDC_BASE,
+          abi: [
+            {
+              inputs: [{ name: "account", type: "address" }],
+              name: "balanceOf",
+              outputs: [{ type: "uint256" }],
+              stateMutability: "view",
+              type: "function",
+            },
+          ] as const,
+          functionName: "balanceOf",
+          args: [BALANCER_VAULT_ADDRESS],
+        });
+      }
 
-      // Verify the encoder can build the flash loan call
+      console.log("[Base] Balancer Vault USDC balance:", vaultUsdcBalance.toString());
+      expect(vaultUsdcBalance).toBeGreaterThanOrEqual(borrowAmount);
+
       encoder.balancerFlashLoan(
         BALANCER_VAULT_ADDRESS,
         [{ asset: USDC_BASE, amount: borrowAmount }],
@@ -264,8 +324,6 @@ describe("Base chain flash loan liquidation - full path test", () => {
       const calls = encoder.flush();
       expect(calls.length).toBe(1);
       console.log("[Base] Flash loan call encoded successfully");
-
-      // The test passes if we reach here - the contract path is valid
       console.log("[Base] ✅ Full flash loan liquidation path verified");
     },
   );

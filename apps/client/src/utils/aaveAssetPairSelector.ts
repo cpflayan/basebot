@@ -12,12 +12,15 @@
 import type { Pricer } from "@morpho-blue-liquidation-bot/pricers";
 import type { Address, Transport, Chain, Account, Client, PublicClient, WalletClient } from "viem";
 import { formatUnits } from "viem";
-import { multicall } from "viem/actions";
+import { multicall, readContract } from "viem/actions";
 
 import {
-  aavePoolReserveDataAbi,
+  aaveAddressesProviderAbi,
+  aaveProtocolDataProviderAbi,
   aaveReserveConfigurationAbi,
+  AAVE_V3_ADDRESSES_PROVIDER,
   HEALTH_FACTOR_THRESHOLD,
+  resolveAaveProtocolDataProvider,
 } from "../abis/AaveV3.js";
 
 import { getTokenDecimals, primeTokenDecimals } from "./sharedExecution.js";
@@ -31,7 +34,10 @@ export interface LiquidationPair {
   estimatedProfit: bigint; // in USD (wei-scaled for comparison)
   seizableCollateral: bigint;
   liquidationBonus: bigint; // e.g. 10500 = 5% bonus (4 decimals bps)
-  /** True when seizable collateral value < debt to cover value (underwater position) */
+  /**
+   * True when seizable collateral USD value cannot cover debtToCover USD even with
+   * liquidation bonus (true underwater). Collateral-capped profitable partials are NOT bad debt.
+   */
   isBadDebt: boolean;
 }
 
@@ -48,37 +54,25 @@ export interface ReserveConfig {
 // ─── Dynamic Close Factor ───
 
 /**
- * Aave V3.1+ uses a dynamic close factor:
- * - When HF >= CLOSE_FACTOR_HF_THRESHOLD (0.95e18): close factor = DEFAULT_CLOSE_FACTOR (50%)
- * - When HF < CLOSE_FACTOR_HF_THRESHOLD: close factor scales up to MAX_CLOSE_FACTOR (100%)
+ * Aave V3 close factor is binary (LiquidationLogic / ValidationLogic):
+ * - When HF >= CLOSE_FACTOR_HF_THRESHOLD (0.95e18): DEFAULT_CLOSE_FACTOR (50%)
+ * - When HF <  CLOSE_FACTOR_HF_THRESHOLD: MAX_CLOSE_FACTOR (100%)
  *
- * Formula: closeFactor = max(DEFAULT_CLOSE_FACTOR,
- *   DEFAULT_CLOSE_FACTOR + (MAX_CLOSE_FACTOR - DEFAULT_CLOSE_FACTOR) * (threshold - HF) / threshold)
+ * Not a linear interpolation — matching on-chain behaviour.
  */
 const DEFAULT_CLOSE_FACTOR_BPS = 5000n; // 50% in bps
 const MAX_CLOSE_FACTOR_BPS = 10000n; // 100% in bps
 const CLOSE_FACTOR_HF_THRESHOLD = (95n * HEALTH_FACTOR_THRESHOLD) / 100n; // 0.95e18
 
 /**
- * Calculate the dynamic close factor based on the user's health factor.
+ * Calculate the close factor based on the user's health factor.
  * Returns close factor in bps (0-10000).
  */
 export function calculateCloseFactor(healthFactor: bigint): bigint {
   if (healthFactor >= CLOSE_FACTOR_HF_THRESHOLD) {
     return DEFAULT_CLOSE_FACTOR_BPS;
   }
-  if (healthFactor === 0n) {
-    return MAX_CLOSE_FACTOR_BPS;
-  }
-
-  // Linear interpolation: as HF drops below 0.95, close factor increases from 50% to 100%
-  const numerator =
-    (MAX_CLOSE_FACTOR_BPS - DEFAULT_CLOSE_FACTOR_BPS) * (CLOSE_FACTOR_HF_THRESHOLD - healthFactor);
-  const denominator = CLOSE_FACTOR_HF_THRESHOLD;
-  const additional = numerator / denominator;
-
-  const closeFactor = DEFAULT_CLOSE_FACTOR_BPS + additional;
-  return closeFactor > MAX_CLOSE_FACTOR_BPS ? MAX_CLOSE_FACTOR_BPS : closeFactor;
+  return MAX_CLOSE_FACTOR_BPS;
 }
 
 // ─── Core: select best liquidation pair ───
@@ -87,7 +81,7 @@ export function calculateCloseFactor(healthFactor: bigint): bigint {
  * For a liquidatable Aave user, find the most profitable (collateral, debt) pair.
  *
  * @param client - Wallet client for on-chain reads
- * @param poolAddress - Aave V3 Pool address
+ * @param poolAddress - Aave V3 Pool address (used to resolve ProtocolDataProvider)
  * @param user - User address to liquidate
  * @param healthFactor - User's current health factor (WAD-scaled)
  * @param reserves - List of reserve addresses (from getReservesList)
@@ -111,7 +105,38 @@ export async function selectBestLiquidationPair(
   pricers?: Pricer[],
   wNative?: Address,
   cachedReserveConfigs?: Map<string, ReserveConfig>,
+  logTag?: string,
+  /** Override ProtocolDataProvider; defaults to resolveAaveProtocolDataProvider(pool). */
+  protocolDataProvider?: Address,
 ): Promise<LiquidationPair | null> {
+  // getUserReserveData / getReserveConfigurationData live on ProtocolDataProvider, not Pool
+  const chainId = (client as { chain?: { id?: number } }).chain?.id;
+  let dataProvider = protocolDataProvider;
+  if (!dataProvider && chainId !== undefined) {
+    const addressesProvider = AAVE_V3_ADDRESSES_PROVIDER[chainId];
+    if (addressesProvider) {
+      try {
+        dataProvider = await readContract(client, {
+          address: addressesProvider,
+          abi: aaveAddressesProviderAbi,
+          functionName: "getPoolDataProvider",
+        });
+      } catch {
+        // fall through to static map
+      }
+    }
+  }
+  dataProvider ??= resolveAaveProtocolDataProvider(poolAddress, chainId);
+
+  if (!dataProvider) {
+    if (logTag) {
+      console.warn(
+        `${logTag}[Pair] No ProtocolDataProvider for pool ${poolAddress.slice(0, 10)}… — cannot enumerate pairs`,
+      );
+    }
+    return null;
+  }
+
   // Step 1: Enumerate user's collateral and debt assets via multicall
   const collateralAssets: { asset: Address; balance: bigint }[] = [];
   const debtAssets: { asset: Address; balance: bigint }[] = [];
@@ -119,8 +144,8 @@ export async function selectBestLiquidationPair(
   // Use multicall to batch all getUserReserveData calls into a single RPC request
   const reserveDataResults = await multicall(client, {
     contracts: reserves.map((asset) => ({
-      address: poolAddress,
-      abi: aavePoolReserveDataAbi,
+      address: dataProvider,
+      abi: aaveProtocolDataProviderAbi,
       functionName: "getUserReserveData" as const,
       args: [asset, user] as const,
     })),
@@ -137,9 +162,15 @@ export async function selectBestLiquidationPair(
     const currentATokenBalance = data[0]; // currentATokenBalance
     const currentStableDebt = data[1];
     const currentVariableDebt = data[2];
+    const usageAsCollateralEnabled = data[8]; // only seizeable if enabled as collateral
     const totalDebt = currentStableDebt + currentVariableDebt;
 
-    if (currentATokenBalance > 0n) {
+    // Inactive reserves: skip as collateral (cannot seize); still list debt so we can repay
+    const cfg = cachedReserveConfigs?.get(asset.toLowerCase());
+    const inactive = cfg !== undefined && !cfg.isActive;
+
+    if (currentATokenBalance > 0n && usageAsCollateralEnabled && !inactive) {
+      // Frozen collateral remains seizable on Aave; only inactive is skipped
       collateralAssets.push({ asset, balance: currentATokenBalance });
     }
     if (totalDebt > 0n) {
@@ -177,16 +208,16 @@ export async function selectBestLiquidationPair(
     }
   }
 
-  // Fetch missing configs via multicall
+  // Fetch missing configs via ProtocolDataProvider multicall
   const missingBonusAssets = collateralAssets.filter(
     ({ asset }) => !liquidationBonuses.has(asset.toLowerCase()),
   );
   if (missingBonusAssets.length > 0) {
     const bonusResults = await multicall(client, {
       contracts: missingBonusAssets.map(({ asset }) => ({
-        address: poolAddress,
+        address: dataProvider,
         abi: aaveReserveConfigurationAbi,
-        functionName: "getReserveConfigurationMap" as const,
+        functionName: "getReserveConfigurationData" as const,
         args: [asset] as const,
       })),
       allowFailure: true,
@@ -195,8 +226,10 @@ export async function selectBestLiquidationPair(
       const entry = bonusResults[i];
       if (entry?.status !== "success" || !entry?.result) continue;
       const asset = missingBonusAssets[i]!.asset;
-      const decimals = Number(entry.result[3]);
-      liquidationBonuses.set(asset.toLowerCase(), entry.result[2]); // liquidationBonus
+      // Official order: decimals, ltv, LT, liquidationBonus, ...
+      const decimals = Number(entry.result[0]);
+      const liquidationBonus = entry.result[3];
+      liquidationBonuses.set(asset.toLowerCase(), liquidationBonus);
       reserveDecimals.set(asset.toLowerCase(), decimals);
       primeTokenDecimals(asset, decimals);
     }
@@ -239,9 +272,27 @@ export async function selectBestLiquidationPair(
   // Step 5: Evaluate all pairs in pure math (no further RPCs)
   let bestPair: LiquidationPair | null = null;
   let bestProfit = 0n;
+  let pairsTried = 0;
+  let pairsNoPrice = 0;
+  let pairsNonPositive = 0;
+  let pairsOk = 0;
+  let maxDebtUsd = 0;
 
   for (const collateral of collateralAssets) {
     for (const debt of debtAssets) {
+      pairsTried++;
+      const cPrice = priceByAsset.get(collateral.asset.toLowerCase());
+      const dPrice = priceByAsset.get(debt.asset.toLowerCase());
+      if (pricers && pricers.length > 0 && (cPrice === undefined || dPrice === undefined)) {
+        pairsNoPrice++;
+      }
+      if (dPrice !== undefined) {
+        const dDec = reserveDecimals.get(debt.asset.toLowerCase()) ?? 18;
+        const debtUsd =
+          parseFloat(formatUnits((debt.balance * closeFactorBps) / 10000n, dDec)) * dPrice;
+        if (debtUsd > maxDebtUsd) maxDebtUsd = debtUsd;
+      }
+
       const pair = evaluatePair(
         collateral,
         debt,
@@ -252,17 +303,60 @@ export async function selectBestLiquidationPair(
         priceByAsset,
       );
 
-      if (pair && pair.estimatedProfit > bestProfit) {
+      if (!pair) {
+        pairsNonPositive++;
+        continue;
+      }
+      pairsOk++;
+      if (pair.estimatedProfit > bestProfit) {
         bestProfit = pair.estimatedProfit;
         bestPair = pair;
       }
     }
   }
 
+  // Diagnose large underwater positions that still yield no pair (helps ops)
+  if (!bestPair && logTag && maxDebtUsd >= 50) {
+    console.log(
+      `${logTag}[PairDebug] no pair user=${user.slice(0, 10)}… HF=${Number(healthFactor) / 1e18} ` +
+        `collats=${collateralAssets.length} debts=${debtAssets.length} tried=${pairsTried} ` +
+        `noPrice=${pairsNoPrice} nonPos=${pairsNonPositive} ok=${pairsOk} maxDebtUsd≈${maxDebtUsd.toFixed(2)}`,
+    );
+  }
+
   return bestPair;
 }
 
 // ─── Evaluate a single (collateral, debt) pair ───
+
+/** Convert float USD price to 8-decimal fixed-point for pure bigint math. */
+function toPriceScaled(priceUsd: number): bigint {
+  if (!Number.isFinite(priceUsd) || priceUsd <= 0) return 0n;
+  return BigInt(Math.floor(priceUsd * 1e8));
+}
+
+/**
+ * seizableCollateral (raw) for Aave V3:
+ *   debtToCover * debtPrice * liquidationBonus * 10^cDec
+ *   / (collateralPrice * 10000 * 10^dDec)
+ * Rounded down (conservative for swap sizing).
+ */
+function computeSeizableCollateral(
+  debtToCover: bigint,
+  debtPriceScaled: bigint,
+  collateralPriceScaled: bigint,
+  liquidationBonus: bigint,
+  debtDecimals: number,
+  collateralDecimals: number,
+): bigint {
+  if (debtToCover === 0n || debtPriceScaled === 0n || collateralPriceScaled === 0n) return 0n;
+  const cScale = 10n ** BigInt(collateralDecimals);
+  const dScale = 10n ** BigInt(debtDecimals);
+  return (
+    (debtToCover * debtPriceScaled * liquidationBonus * cScale) /
+    (collateralPriceScaled * 10000n * dScale)
+  );
+}
 
 function evaluatePair(
   collateral: { asset: Address; balance: bigint },
@@ -274,7 +368,7 @@ function evaluatePair(
   priceByAsset: Map<string, number>,
 ): LiquidationPair | null {
   // debtToCover = closeFactor * debtBalance (close factor caps it)
-  const debtToCover = (debt.balance * closeFactorBps) / 10000n;
+  let debtToCover = (debt.balance * closeFactorBps) / 10000n;
   if (debtToCover === 0n) return null;
 
   // Liquidation bonus for this collateral (default 10000 = no bonus if not found)
@@ -283,7 +377,13 @@ function evaluatePair(
   // ── Without pricers: rough estimation only (same-token approximation) ──
   if (!pricers || pricers.length === 0) {
     // Cannot convert across tokens without prices — use raw approximation
-    const seizableCollateral = (debtToCover * liquidationBonus) / 10000n;
+    let seizableCollateral = (debtToCover * liquidationBonus) / 10000n;
+    if (seizableCollateral > collateral.balance && seizableCollateral > 0n) {
+      // Scale debt down to available collateral (mirrors protocol behaviour)
+      debtToCover = (debtToCover * collateral.balance) / seizableCollateral;
+      seizableCollateral = collateral.balance;
+    }
+    const isBadDebt = seizableCollateral <= debtToCover;
     return {
       collateralAsset: collateral.asset,
       debtAsset: debt.asset,
@@ -291,7 +391,7 @@ function evaluatePair(
       estimatedProfit: seizableCollateral > debtToCover ? seizableCollateral - debtToCover : 0n,
       seizableCollateral,
       liquidationBonus,
-      isBadDebt: false, // Cannot determine without prices
+      isBadDebt,
     };
   }
 
@@ -304,49 +404,72 @@ function evaluatePair(
   const collateralDecimals = reserveDecimals.get(collateral.asset.toLowerCase()) ?? 18;
   const debtDecimals = reserveDecimals.get(debt.asset.toLowerCase()) ?? 18;
 
-  // ── Correct seizable collateral formula (Aave V3 protocol logic): ──
-  // seizableCollateral = debtToCover * (debtPrice / collateralPrice)
-  //                      * (10^collateralDecimals / 10^debtDecimals)
-  //                      * liquidationBonus / 10000
-  //
-  // debtToCover is in debt token units (debtDecimals precision).
-  // Result is in collateral token units (collateralDecimals precision).
-  // The price ratio converts debt USD value → collateral USD value,
-  // then the decimal adjustment converts to collateral token raw units.
-  const debtToCoverUsd = parseFloat(formatUnits(debtToCover, debtDecimals)) * debtPrice;
-  const seizableCollateralUsd = debtToCoverUsd * (Number(liquidationBonus) / 10000);
-  const seizableCollateralFloat = seizableCollateralUsd / collateralPrice;
+  const debtPriceScaled = toPriceScaled(debtPrice);
+  const collateralPriceScaled = toPriceScaled(collateralPrice);
+  if (debtPriceScaled === 0n || collateralPriceScaled === 0n) return null;
 
-  // Convert back to collateral token raw units
-  const seizableCollateral = BigInt(Math.floor(seizableCollateralFloat * 10 ** collateralDecimals));
+  // ── Pure bigint seizable (Aave V3 protocol logic, round down) ──
+  let seizableCollateral = computeSeizableCollateral(
+    debtToCover,
+    debtPriceScaled,
+    collateralPriceScaled,
+    liquidationBonus,
+    debtDecimals,
+    collateralDecimals,
+  );
 
   if (seizableCollateral === 0n) return null;
 
-  // Cap at available collateral balance
-  const actualSeizable =
-    seizableCollateral > collateral.balance ? collateral.balance : seizableCollateral;
+  // Cap at available collateral: scale debtToCover down so swap/repay stay consistent.
+  // Collateral-capped is NOT automatically bad debt — only true underwater after bonus is.
+  if (seizableCollateral > collateral.balance) {
+    debtToCover = (debtToCover * collateral.balance) / seizableCollateral;
+    if (debtToCover === 0n) return null;
+    seizableCollateral = computeSeizableCollateral(
+      debtToCover,
+      debtPriceScaled,
+      collateralPriceScaled,
+      liquidationBonus,
+      debtDecimals,
+      collateralDecimals,
+    );
+    if (seizableCollateral > collateral.balance) {
+      seizableCollateral = collateral.balance;
+    }
+    if (seizableCollateral === 0n) return null;
+  }
 
-  // Profit = seizable collateral USD value - debt to cover USD value
-  const actualSeizableUsd =
-    parseFloat(formatUnits(actualSeizable, collateralDecimals)) * collateralPrice;
-  const profitUsd = actualSeizableUsd - debtToCoverUsd;
-  if (profitUsd <= 0) return null;
+  // Apply a small haircut (1%) so swap amount never exceeds actual seize under oracle drift
+  const seizableForSwap = (seizableCollateral * 99n) / 100n;
+  if (seizableForSwap === 0n) return null;
 
-  // Convert profit to a comparable bigint (scaled by 1e18 for precision)
-  const estimatedProfit = BigInt(Math.floor(profitUsd * 1e18));
+  // Profit in micro-USD (1e8): seizable USD - debt USD
+  // seizableUsd = seizable * collPrice / 10^cDec
+  // debtUsd     = debtToCover * debtPrice / 10^dDec
+  const seizableUsdScaled =
+    (seizableForSwap * collateralPriceScaled) / 10n ** BigInt(collateralDecimals);
+  const debtUsdScaled = (debtToCover * debtPriceScaled) / 10n ** BigInt(debtDecimals);
 
-  // Bad debt: seizable collateral capped at available balance means we can't cover the debt
-  // This happens when the user's collateral is insufficient even with the liquidation bonus
-  const isBadDebt = actualSeizable < seizableCollateral;
+  // True bad debt: even with liquidation bonus, seizable value cannot cover debt
+  const isBadDebt = seizableUsdScaled <= debtUsdScaled;
+  if (isBadDebt) {
+    // Underwater after scale-down — skip (caller may still force via alwaysRealizeBadDebt
+    // only when a pair is returned; returning null keeps ranking clean)
+    return null;
+  }
+
+  const profitUsdScaled = seizableUsdScaled - debtUsdScaled;
+  // estimatedProfit: scale micro-USD (1e8) to 1e18 for ranking compatibility
+  const estimatedProfit = profitUsdScaled * 10n ** 10n;
 
   return {
     collateralAsset: collateral.asset,
     debtAsset: debt.asset,
     debtToCover,
     estimatedProfit,
-    seizableCollateral: actualSeizable,
+    seizableCollateral: seizableForSwap,
     liquidationBonus,
-    isBadDebt,
+    isBadDebt: false,
   };
 }
 

@@ -148,12 +148,14 @@ export const comptrollerAbi = [
 // ─── MToken (CErc20) ABI ───
 
 export const mTokenAbi = [
-  // Liquidation
+  // Liquidation — Compound V2 / Moonwell order (NOT collateral-first):
+  //   liquidateBorrow(address borrower, uint repayAmount, address mTokenCollateral)
+  // Wrong order produced selector 0x7ad8d1cc → empty revert on mToken contracts.
   {
     inputs: [
-      { name: "mTokenCollateral", type: "address" },
       { name: "borrower", type: "address" },
       { name: "repayAmount", type: "uint256" },
+      { name: "mTokenCollateral", type: "address" },
     ],
     name: "liquidateBorrow",
     outputs: [{ name: "", type: "uint256" }],

@@ -139,7 +139,10 @@ export class LiquidationEncoder<
    * Call MToken.liquidateBorrow() — repay a borrower's debt and seize their collateral.
    * The protocol automatically transfers seized mToken collateral to the liquidator (executor).
    *
-   * @param mTokenBorrow - the mToken contract where the borrower has debt
+   * On-chain signature (Compound V2 / Moonwell):
+   *   liquidateBorrow(address borrower, uint repayAmount, address mTokenCollateral)
+   *
+   * @param mTokenBorrow - the mToken contract where the borrower has debt (msg.sender target)
    * @param mTokenCollateral - the mToken contract of the collateral to seize
    * @param borrower - the underwater borrower address
    * @param repayAmount - amount of underlying to repay (in underlying token units)
@@ -156,7 +159,8 @@ export class LiquidationEncoder<
       encodeFunctionData({
         abi: mTokenAbi,
         functionName: "liquidateBorrow",
-        args: [mTokenCollateral, borrower, repayAmount],
+        // Must match Compound V2 order — collateral-first ABI was wrong (empty revert)
+        args: [borrower, repayAmount, mTokenCollateral],
       }),
     );
   }

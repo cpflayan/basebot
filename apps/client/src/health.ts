@@ -12,6 +12,10 @@ export interface BotHealthStatus {
   rpcErrorRate: number;
   lastError?: string;
   isHealthy: boolean;
+  /** Morpho: data provider (API/indexer) hard failure — not the same as idle empty. */
+  providerError?: boolean;
+  lastProviderError?: string;
+  lastProviderOkAt?: number;
 }
 
 type StatusFn = () => BotHealthStatus;
@@ -62,7 +66,8 @@ class HealthServer {
         return reply.code(200).send({ status: "ok" });
       }
 
-      return reply.code(200).send({
+      // 503 when any bot is degraded (provider outage / high RPC errors) so probes fail closed
+      return reply.code(allHealthy ? 200 : 503).send({
         status: allHealthy ? "healthy" : "degraded",
         bots,
       });
@@ -76,7 +81,8 @@ class HealthServer {
         return reply.code(404).send({ error: `Bot '${name}' not found` });
       }
       try {
-        return await reply.code(200).send(statusFn());
+        const status = statusFn();
+        return await reply.code(status.isHealthy ? 200 : 503).send(status);
       } catch (e) {
         return reply.code(500).send({ error: String(e) });
       }

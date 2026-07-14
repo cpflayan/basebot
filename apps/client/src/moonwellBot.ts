@@ -75,6 +75,26 @@ const MANTISSA = 10n ** 18n;
 const MAX_SIMULATION_FAILURES = 3;
 const SIMULATION_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
 
+/** Skip repay amounts too small to cover swap minOut + gas (underlying units). */
+function isMoonwellDustRepay(amount: bigint, underlying: Address): boolean {
+  if (amount === 0n) return true;
+  const t = underlying.toLowerCase();
+  // USDC / USDbC / EURC-style 6 decimals: under $0.01
+  if (
+    t === "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" ||
+    t === "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca" ||
+    t === "0x60a3e35cc302bfa44cb288bc5a4f316fdb1adb42"
+  ) {
+    return amount < 10_000n;
+  }
+  // 8-dec (cbBTC etc.): under 0.000001
+  if (t === "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf") {
+    return amount < 100n;
+  }
+  // 18-dec: under 1e12 wei
+  return amount < 10n ** 12n;
+}
+
 export interface MoonwellLiquidationBotInputs {
   logTag: string;
   client: WalletClient<Transport, Chain, Account>;
@@ -132,10 +152,15 @@ export class MoonwellLiquidationBot {
   /** Cached Comptroller params */
   private closeFactor = 0n;
 
-  /** Cached mToken → reserveFactor (for pre-filtering unprofitable markets) */
+  /** Cached mToken → reserveFactor (diagnostics / soft preference) */
   private reserveFactors = new Map<Address, bigint>();
-  /** mTokens excluded due to RF >= 99% — almost all liquidation bonus goes to protocol reserves */
+  /** mTokens with RF >= 99% (still scanned; prefer non-high-RF collateral when both exist) */
   private highRfMarkets = new Set<Address>();
+  /**
+   * Full watchlist snapshot at init (same as mTokenList after P1 — RF no longer strips markets).
+   * Kept for collateral discovery that previously scanned markets filtered out of mTokenList.
+   */
+  private allMTokenList: { address: Address; underlying: Address; deployBlock: number }[] = [];
 
   /** Oracle feed timestamps — tracked to detect recent price updates */
   private lastOracleUpdates = new Map<Address, bigint>();
@@ -186,6 +211,7 @@ export class MoonwellLiquidationBot {
       underlying: m.underlying,
       deployBlock: m.deployBlock,
     }));
+    this.allMTokenList = [...this.mTokenList];
 
     ensureRegistryDataDir();
     const registryPath =
@@ -373,9 +399,11 @@ export class MoonwellLiquidationBot {
   }
 
   /**
-   * Cache reserveFactorMantissa for each mToken.
-   * Markets with RF >= 99% send nearly all liquidation rewards to protocol reserves,
-   * making them unprofitable for the bot. These are moved to highRfMarkets.
+   * Cache reserveFactorMantissa for each mToken (diagnostics / soft preference only).
+   *
+   * P1: do NOT drop high-RF markets from discovery or the watchlist — RF is not the
+   * liquidation bonus. Profit gate at sim time decides whether a path is worth sending.
+   * highRfMarkets still marks markets for logging / collateral preference.
    */
   private async cacheReserveFactors(): Promise<void> {
     const RF_THRESHOLD = 99n * 10n ** 16n; // 0.99e18 = 99%
@@ -400,17 +428,15 @@ export class MoonwellLiquidationBot {
       if (rf >= RF_THRESHOLD) {
         this.highRfMarkets.add(mToken);
         console.log(
-          `${this.logTag}⏭️ ${mToken.slice(0, 10)}... excluded (RF=${Number(rf) / 1e16}%) — nearly all rewards go to reserves`,
+          `${this.logTag}ℹ️ ${mToken.slice(0, 10)}... high RF=${Number(rf) / 1e16}% — kept in discovery (profit gate at attempt)`,
         );
       }
     }
 
-    // Filter mTokenList to only active (profitable) markets
-    const originalCount = this.mTokenList.length;
-    this.mTokenList = this.mTokenList.filter((m) => !this.highRfMarkets.has(m.address));
-
+    // Keep full mTokenList for event scan + shortfall watch (allMTokenList stays in sync)
     console.log(
-      `${this.logTag}📊 Reserve factors: ${this.mTokenList.length}/${originalCount} markets active, ${this.highRfMarkets.size} excluded (RF≥99%)`,
+      `${this.logTag}📊 Reserve factors: ${this.mTokenList.length} markets watched, ` +
+        `${this.highRfMarkets.size} high-RF (not excluded from discovery)`,
     );
   }
 
@@ -582,6 +608,8 @@ export class MoonwellLiquidationBot {
 
   private async liquidateAccount(account: Address): Promise<void> {
     const tTotal = nowMs();
+    // Per-account error state — never inherit the previous account's _lastError (P0 ops)
+    let accountError: string | undefined;
 
     // Peek only — arm after real attempt (graded)
     if (this.cooldown?.isCoolingDown(this.comptroller, account)) {
@@ -637,7 +665,8 @@ export class MoonwellLiquidationBot {
 
     this._liquidationsAttempted++;
 
-    const { borrowPositions, collateralMToken } = await this.findBorrowAndCollateral(account);
+    const { borrowPositions, collateralMToken, collateralBalance, collateralIsHighRf } =
+      await this.findBorrowAndCollateral(account);
 
     if (borrowPositions.length === 0) {
       this.raceMetrics.recordOutcome("skip_no_pair");
@@ -654,7 +683,7 @@ export class MoonwellLiquidationBot {
       return;
     }
 
-    if (!collateralMToken) {
+    if (!collateralMToken || collateralBalance === 0n) {
       this.raceMetrics.recordOutcome("skip_no_pair");
       logLiquidationDebug({
         protocol: this.logTag,
@@ -664,11 +693,19 @@ export class MoonwellLiquidationBot {
         details: {
           comptroller: this.comptroller,
           borrowPositionsCount: borrowPositions.length,
-          note: "Account has borrows but no collateral to seize",
+          note: "Account has borrows but no mToken supply on any watchlist market",
         },
       });
       return;
     }
+
+    // High RF is informational only — still attempt; simulateAndExec profit gate decides.
+    if (collateralIsHighRf) {
+      console.log(
+        `${this.logTag}ℹ️ account=${account.slice(0, 10)}… only high-RF collateral ${collateralMToken.slice(0, 10)}… — attempting with profit gate`,
+      );
+    }
+
     const collateralUnderlying = this.getUnderlying(collateralMToken);
 
     if (TOKEN_BLACKLIST.has(collateralUnderlying.toLowerCase())) {
@@ -695,8 +732,30 @@ export class MoonwellLiquidationBot {
       if (TOKEN_BLACKLIST.has(borrowUnderlying.toLowerCase())) continue;
       if (borrowMToken.toLowerCase() === collateralMToken.toLowerCase()) continue;
 
-      const maxRepay = (borrowBalance * this.closeFactor) / MANTISSA;
-      if (maxRepay === 0n) continue;
+      // closeFactor cap (e.g. 50% of one borrow)
+      let repayAmount = (borrowBalance * this.closeFactor) / MANTISSA;
+      if (repayAmount === 0n) continue;
+
+      // Cap so seizeTokens <= borrower mToken collateral (avoids LIQUIDATE_SEIZE_TOO_MUCH)
+      repayAmount = await this.capRepayToSeizableCollateral(
+        borrowMToken,
+        collateralMToken,
+        repayAmount,
+        collateralBalance,
+      );
+      if (repayAmount === 0n) {
+        console.log(
+          `${this.logTag}  ${account} repay capped to 0 vs collateral ${collateralMToken.slice(0, 10)}… — skip pair`,
+        );
+        continue;
+      }
+
+      if (isMoonwellDustRepay(repayAmount, borrowUnderlying)) {
+        console.log(
+          `${this.logTag}  ${account} dust repay ${repayAmount} via ${borrowMToken.slice(0, 10)}… — skip`,
+        );
+        continue;
+      }
 
       try {
         const ok = this.useFlashLoan
@@ -706,7 +765,7 @@ export class MoonwellLiquidationBot {
               collateralMToken,
               borrowUnderlying,
               collateralUnderlying,
-              maxRepay,
+              repayAmount,
             )
           : await this.liquidateDirect(
               account,
@@ -714,7 +773,7 @@ export class MoonwellLiquidationBot {
               collateralMToken,
               borrowUnderlying,
               collateralUnderlying,
-              maxRepay,
+              repayAmount,
             );
 
         if (ok) {
@@ -724,24 +783,26 @@ export class MoonwellLiquidationBot {
           this.raceMetrics.recordStage("totalLiq", elapsedMs(tTotal));
           return;
         }
-        // soft fail (not profitable / no route) — try next borrow market
+        // soft fail (sim/profit/route) — try next borrow market; do not poison accountError
       } catch (error) {
         console.warn(
           `${this.logTag}  ⚠️ Liquidation via ${borrowMToken.slice(0, 10)}... failed, trying next borrow...: ${error instanceof Error ? error.message : error}`,
         );
-        // Keep last error for graded cooldown after all attempts
-        this._lastError = String(error);
+        // Scoped to this account only
+        accountError = error instanceof Error ? error.message : String(error);
+        this._lastError = accountError; // health lastError = most recent attempt
       }
     }
 
-    // All borrow positions exhausted
+    // All borrow positions exhausted — grade cooldown from THIS account's error only
     this._liquidationsFailed++;
-    if (this._lastError) {
-      this.armCooldownFromError(account, this._lastError);
+    if (accountError) {
+      this.armCooldownFromError(account, accountError);
     } else {
       this.armCooldown(account, "soft", "all borrow positions exhausted");
     }
-    this._lastError = this._lastError ?? "all borrow positions exhausted";
+    // Do not leave a sticky string that classify() would map to hard for the next account
+    this._lastError = accountError;
 
     const failures = (this.simulationFailures.get(accountKey) ?? 0) + 1;
     this.simulationFailures.set(accountKey, failures);
@@ -759,21 +820,16 @@ export class MoonwellLiquidationBot {
   }
 
   /**
-   * Estimate the underlying collateral amount that `liquidateBorrow` + `redeem(maxUint256)`
-   * will actually produce, so the DEX swap step can be given a real amount instead of a
-   * literal 0 (which every liquidity venue would otherwise try to swap and revert on).
-   *
-   * Mirrors the on-chain math exactly (liquidateCalculateSeizeTokens is the same view
-   * function the Comptroller uses internally), so this is subject to the same
-   * between-read-and-execution price drift as any other pre-computed liquidation amount
-   * (e.g. Aave's `seizableCollateral`) — simulation still guards against a stale value.
+   * Comptroller seize math: mToken amount seized for a given repay.
+   * Returns 0n on error.
    */
-  private async estimateSeizedUnderlying(
+  private async estimateSeizeMTokens(
     borrowMToken: Address,
     collateralMToken: Address,
     repayAmount: bigint,
   ): Promise<bigint> {
     try {
+      this._rpcTotal++;
       const [error, seizeTokens] = await readContract(this.client, {
         address: this.comptroller,
         abi: comptrollerAbi,
@@ -781,7 +837,37 @@ export class MoonwellLiquidationBot {
         args: [borrowMToken, collateralMToken, repayAmount],
       });
       if (error !== 0n) return 0n;
+      return seizeTokens;
+    } catch (error) {
+      this._rpcErrors++;
+      console.warn(
+        `${this.logTag}⚠️ liquidateCalculateSeizeTokens failed: ${error instanceof Error ? error.message : error}`,
+      );
+      return 0n;
+    }
+  }
 
+  /**
+   * Estimate the underlying collateral amount that `liquidateBorrow` + `redeem(seizeTokens)`
+   * will produce, so the DEX swap can use a real amount.
+   *
+   * Do NOT redeem(maxUint256): on Compound V2 forks, amount * exchangeRate can overflow
+   * and the call fails (or redeems nothing useful).
+   */
+  private async estimateSeizedUnderlying(
+    borrowMToken: Address,
+    collateralMToken: Address,
+    repayAmount: bigint,
+  ): Promise<{ seizeMTokens: bigint; underlying: bigint }> {
+    try {
+      const seizeMTokens = await this.estimateSeizeMTokens(
+        borrowMToken,
+        collateralMToken,
+        repayAmount,
+      );
+      if (seizeMTokens === 0n) return { seizeMTokens: 0n, underlying: 0n };
+
+      this._rpcTotal++;
       const exchangeRate = await readContract(this.client, {
         address: collateralMToken,
         abi: mTokenAbi,
@@ -789,13 +875,49 @@ export class MoonwellLiquidationBot {
       });
 
       // underlying = seizeTokens * exchangeRate / 1e18 (Compound V2 exchange rate scaling)
-      return (seizeTokens * exchangeRate) / 10n ** 18n;
+      const underlying = (seizeMTokens * exchangeRate) / 10n ** 18n;
+      return { seizeMTokens, underlying };
     } catch (error) {
       console.warn(
         `${this.logTag}⚠️ Failed to estimate seized collateral for ${collateralMToken.slice(0, 10)}...: ${error instanceof Error ? error.message : error}`,
       );
-      return 0n;
+      return { seizeMTokens: 0n, underlying: 0n };
     }
+  }
+
+  /**
+   * Scale repay down so seizeTokens <= borrower collateral mToken balance.
+   * Prevents Comptroller LIQUIDATE_SEIZE_TOO_MUCH (closeFactor on a large borrow
+   * can demand more collateral mTokens than the borrower still holds).
+   * Uses a 1% safety buffer for oracle / accrual drift before execution.
+   */
+  private async capRepayToSeizableCollateral(
+    borrowMToken: Address,
+    collateralMToken: Address,
+    repayAmount: bigint,
+    collateralBalance: bigint,
+  ): Promise<bigint> {
+    if (repayAmount === 0n || collateralBalance === 0n) return 0n;
+
+    const seizeTokens = await this.estimateSeizeMTokens(
+      borrowMToken,
+      collateralMToken,
+      repayAmount,
+    );
+    if (seizeTokens === 0n) return 0n;
+
+    if (seizeTokens <= collateralBalance) {
+      return repayAmount;
+    }
+
+    // seize ∝ repay → repay' = repay * collateralBalance / seizeTokens
+    // 99/100 buffer so slight price move doesn't re-hit SEIZE_TOO_MUCH
+    const capped = (repayAmount * collateralBalance * 99n) / (seizeTokens * 100n);
+    console.log(
+      `${this.logTag}  📉 Cap repay ${repayAmount} → ${capped} ` +
+        `(seize ${seizeTokens} > collatBal ${collateralBalance})`,
+    );
+    return capped;
   }
 
   /**
@@ -828,25 +950,37 @@ export class MoonwellLiquidationBot {
       callbackEncoder.erc20Approve(borrowUnderlying, borrowMToken, maxUint256);
     }
 
+    const { seizeMTokens, underlying: expectedCollateral } = await this.estimateSeizedUnderlying(
+      borrowMToken,
+      collateralMToken,
+      repayAmount,
+    );
+    if (seizeMTokens === 0n || expectedCollateral === 0n) {
+      console.log(`${this.logTag}  ${account} could not estimate seized collateral, skipping`);
+      return false;
+    }
+
+    // Conservative haircut so redeem/swap never try to move more tokens than we get
+    // (oracle drift / rounding). Keep enough headroom that swap output can cover flash repay.
+    const SEIZE_BPS = 97n; // 97% of estimated seize
+    const seizeForRedeem = (seizeMTokens * SEIZE_BPS) / 100n;
+    const swapSrcAmount = (expectedCollateral * SEIZE_BPS) / 100n;
+    if (seizeForRedeem === 0n || swapSrcAmount === 0n) {
+      console.log(`${this.logTag}  ${account} seize too small after haircut, skipping`);
+      return false;
+    }
+
     callbackEncoder.moonwellLiquidateBorrow(borrowMToken, collateralMToken, account, repayAmount);
-    callbackEncoder.moonwellRedeem(collateralMToken, maxUint256);
+    // Redeem haircut seize (not maxUint256 — overflow; not 100% — leave dust mToken ok)
+    callbackEncoder.moonwellRedeem(collateralMToken, seizeForRedeem);
 
     let venueImpactBps: bigint | undefined;
     if (collateralUnderlying.toLowerCase() !== borrowUnderlying.toLowerCase()) {
-      const expectedCollateral = await this.estimateSeizedUnderlying(
-        borrowMToken,
-        collateralMToken,
-        repayAmount,
-      );
-      if (expectedCollateral === 0n) {
-        console.log(`${this.logTag}  ${account} could not estimate seized collateral, skipping`);
-        return false;
-      }
       const swap = await convertCollateralToLoan(
         this.sharedDeps,
         collateralUnderlying,
         borrowUnderlying,
-        expectedCollateral,
+        swapSrcAmount,
         callbackEncoder,
         { preferLocalDex: true },
       );
@@ -862,12 +996,13 @@ export class MoonwellLiquidationBot {
       venueImpactBps = swap.impactBps;
     }
 
-    callbackEncoder.erc20Skim(borrowUnderlying, this.treasuryAddress);
+    // Do NOT erc20Skim here — flash repay is appended AFTER callbacks and needs the
+    // full repay balance on the executor. Profit stays on executor (skim later / separate tx).
     const callbackCalls = callbackEncoder.flush();
 
     try {
       const tSim = nowMs();
-      const success = await simulateAndExecFlashLoanWithFallback(
+      const execResult = await simulateAndExecFlashLoanWithFallback(
         this.sharedDeps,
         callbackCalls,
         borrowUnderlying,
@@ -880,16 +1015,17 @@ export class MoonwellLiquidationBot {
       const simMs = elapsedMs(tSim);
       this.raceMetrics.recordStage("simExec", simMs);
       console.log(
-        `${this.logTag}[LiqTiming] flash account=${account.slice(0, 10)}… simExecMs=${simMs} ok=${success}`,
+        `${this.logTag}[LiqTiming] flash account=${account.slice(0, 10)}… simExecMs=${simMs} ok=${execResult.success}` +
+          (execResult.reason ? ` reason=${execResult.reason}` : ""),
       );
 
-      if (success) {
+      if (execResult.success) {
         const collateralUsd =
-          (await priceAsset(this.sharedDeps, collateralUnderlying, repayAmount)) ?? 0;
+          (await priceAsset(this.sharedDeps, collateralUnderlying, swapSrcAmount)) ?? 0;
         liquidationTracker.report({
           protocol: this.logTag,
           collateralToken: collateralUnderlying,
-          collateralAmount: repayAmount,
+          collateralAmount: swapSrcAmount,
           collateralUsdEstimate: collateralUsd,
           timestamp: Date.now(),
         });
@@ -898,7 +1034,9 @@ export class MoonwellLiquidationBot {
         );
         return true;
       }
-      console.log(`${this.logTag}[FlashLoan] Skipped ${account} (not profitable)`);
+      console.log(
+        `${this.logTag}[FlashLoan] Skipped ${account} (${execResult.reason ?? "sim_or_profit_fail"})`,
+      );
       return false;
     } catch (error) {
       console.error(
@@ -932,19 +1070,20 @@ export class MoonwellLiquidationBot {
       encoder.erc20Approve(borrowUnderlying, borrowMToken, maxUint256);
     }
 
+    const { seizeMTokens, underlying: expectedCollateral } = await this.estimateSeizedUnderlying(
+      borrowMToken,
+      collateralMToken,
+      repayAmount,
+    );
+    if (seizeMTokens === 0n || expectedCollateral === 0n) {
+      console.log(`${this.logTag}  ${account} could not estimate seized collateral, skipping`);
+      return false;
+    }
+
     encoder.moonwellLiquidateBorrow(borrowMToken, collateralMToken, account, repayAmount);
-    encoder.moonwellRedeem(collateralMToken, maxUint256);
+    encoder.moonwellRedeem(collateralMToken, seizeMTokens);
 
     if (collateralUnderlying.toLowerCase() !== borrowUnderlying.toLowerCase()) {
-      const expectedCollateral = await this.estimateSeizedUnderlying(
-        borrowMToken,
-        collateralMToken,
-        repayAmount,
-      );
-      if (expectedCollateral === 0n) {
-        console.log(`${this.logTag}  ${account} could not estimate seized collateral, skipping`);
-        return false;
-      }
       const swap = await convertCollateralToLoan(
         this.sharedDeps,
         collateralUnderlying,
@@ -968,7 +1107,7 @@ export class MoonwellLiquidationBot {
 
     try {
       const tSim = nowMs();
-      const success = await simulateAndExec(
+      const execResult = await simulateAndExec(
         this.sharedDeps,
         encoder,
         calls,
@@ -981,16 +1120,17 @@ export class MoonwellLiquidationBot {
       const simMs = elapsedMs(tSim);
       this.raceMetrics.recordStage("simExec", simMs);
       console.log(
-        `${this.logTag}[LiqTiming] direct account=${account.slice(0, 10)}… simExecMs=${simMs} ok=${success}`,
+        `${this.logTag}[LiqTiming] direct account=${account.slice(0, 10)}… simExecMs=${simMs} ok=${execResult.success}` +
+          (execResult.reason ? ` reason=${execResult.reason}` : ""),
       );
 
-      if (success) {
+      if (execResult.success) {
         const collateralUsd =
-          (await priceAsset(this.sharedDeps, collateralUnderlying, repayAmount)) ?? 0;
+          (await priceAsset(this.sharedDeps, collateralUnderlying, expectedCollateral)) ?? 0;
         liquidationTracker.report({
           protocol: this.logTag,
           collateralToken: collateralUnderlying,
-          collateralAmount: repayAmount,
+          collateralAmount: expectedCollateral,
           collateralUsdEstimate: collateralUsd,
           timestamp: Date.now(),
         });
@@ -999,7 +1139,9 @@ export class MoonwellLiquidationBot {
         );
         return true;
       }
-      console.log(`${this.logTag}Skipped ${account} (not profitable)`);
+      console.log(
+        `${this.logTag}Skipped ${account} (${execResult.reason ?? "sim_or_profit_fail"})`,
+      );
       return false;
     } catch (error) {
       console.error(
@@ -1063,19 +1205,28 @@ export class MoonwellLiquidationBot {
   private async findBorrowAndCollateral(account: Address): Promise<{
     borrowPositions: { borrowMToken: Address; borrowBalance: bigint }[];
     collateralMToken: Address | null;
+    /** mToken balance of collateralMToken (for SEIZE_TOO_MUCH cap). */
+    collateralBalance: bigint;
+    /** True if only collateral found is on RF≥99% markets (usually unprofitable). */
+    collateralIsHighRf: boolean;
   }> {
-    const n = this.mTokenList.length;
+    // Borrows: active (non-high-RF) markets only — we repay these underlyings.
+    // Collateral: scan ALL markets so we don't miss supply only on high-RF mTokens.
+    const borrowMarkets = this.mTokenList;
+    const collateralMarkets = this.allMTokenList;
+    const nB = borrowMarkets.length;
+    const nC = collateralMarkets.length;
     try {
-      this._rpcTotal += n * 2;
+      this._rpcTotal += nB + nC;
       const results = await multicall(this.paidReadPool.next(), {
         contracts: [
-          ...this.mTokenList.map((mToken) => ({
+          ...borrowMarkets.map((mToken) => ({
             address: mToken.address,
             abi: mTokenAbi,
             functionName: "borrowBalanceStored" as const,
             args: [account] as const,
           })),
-          ...this.mTokenList.map((mToken) => ({
+          ...collateralMarkets.map((mToken) => ({
             address: mToken.address,
             abi: mTokenAbi,
             functionName: "balanceOf" as const,
@@ -1086,7 +1237,7 @@ export class MoonwellLiquidationBot {
       });
 
       const borrowPositions: { borrowMToken: Address; borrowBalance: bigint }[] = [];
-      for (let i = 0; i < n; i++) {
+      for (let i = 0; i < nB; i++) {
         const r = results[i]!;
         if (r.status !== "success") {
           this._rpcErrors++;
@@ -1094,7 +1245,7 @@ export class MoonwellLiquidationBot {
         }
         if (r.result > 0n) {
           borrowPositions.push({
-            borrowMToken: this.mTokenList[i]!.address,
+            borrowMToken: borrowMarkets[i]!.address,
             borrowBalance: r.result,
           });
         }
@@ -1103,28 +1254,58 @@ export class MoonwellLiquidationBot {
         b.borrowBalance > a.borrowBalance ? 1 : b.borrowBalance < a.borrowBalance ? -1 : 0,
       );
 
+      // Prefer non-high-RF collateral; fall back to largest high-RF supply for diagnostics
       let collateralMToken: Address | null = null;
       let maxBalance = 0n;
-      for (let i = 0; i < n; i++) {
-        const r = results[n + i]!;
+      let highRfMToken: Address | null = null;
+      let highRfBal = 0n;
+      for (let i = 0; i < nC; i++) {
+        const r = results[nB + i]!;
         if (r.status !== "success") {
           this._rpcErrors++;
           continue;
         }
-        if (r.result > maxBalance) {
-          maxBalance = r.result;
-          collateralMToken = this.mTokenList[i]!.address;
+        const addr = collateralMarkets[i]!.address;
+        const bal = r.result;
+        if (bal === 0n) continue;
+        if (this.highRfMarkets.has(addr)) {
+          if (bal > highRfBal) {
+            highRfBal = bal;
+            highRfMToken = addr;
+          }
+        } else if (bal > maxBalance) {
+          maxBalance = bal;
+          collateralMToken = addr;
         }
       }
 
-      return { borrowPositions, collateralMToken };
+      let collateralIsHighRf = false;
+      if (!collateralMToken && highRfMToken) {
+        // Only high-RF collateral — still return it so we can log accurately;
+        // caller may skip as unprofitable dust / high RF.
+        collateralMToken = highRfMToken;
+        maxBalance = highRfBal;
+        collateralIsHighRf = true;
+      }
+
+      return {
+        borrowPositions,
+        collateralMToken,
+        collateralBalance: maxBalance,
+        collateralIsHighRf,
+      };
     } catch (e) {
-      this._rpcErrors += n * 2;
+      this._rpcErrors += nB + nC;
       this._lastError = String(e);
       console.warn(
         `${this.logTag}⚠️ findBorrowAndCollateral multicall failed: ${e instanceof Error ? e.message : e}`,
       );
-      return { borrowPositions: [], collateralMToken: null };
+      return {
+        borrowPositions: [],
+        collateralMToken: null,
+        collateralBalance: 0n,
+        collateralIsHighRf: false,
+      };
     }
   }
 

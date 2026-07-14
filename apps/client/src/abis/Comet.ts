@@ -18,7 +18,8 @@ export const BASE_TOKENS = {
   AERO: "0x940181a94A35A4569E4529A3CDfB74e38FD98631",
   cbBTC: "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",
   cbETH: "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22",
-  wstETH: "0xc1CBa3fCea344f92D9239c08C0f2487b61DE718D",
+  // Base Lido wstETH (must match apps/config + Moonwell underlying)
+  wstETH: "0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452",
 } as const;
 
 // ─── 每個 Comet 的部署區塊（用於歷史掃描起點）───
@@ -37,20 +38,20 @@ export const COMET_COLLATERAL_ASSETS: Record<Address, Address[]> = {
   "0xb125E6687d4313864e53df431d5425969c15Eb2F": [
     "0x4200000000000000000000000000000000000006", // WETH
     "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22", // cbETH
-    "0xc1CBa3fCea344f92D9239c08C0f2487b61DE718D", // wstETH
+    "0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452", // wstETH
     "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf", // cbBTC
     "0x940181a94A35A4569E4529A3CDfB74e38FD98631", // AERO
   ],
   // WETH Comet: cbBTC, wstETH
   "0x46e6b214b524310239732D51387075E0e70970bf": [
     "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf", // cbBTC
-    "0xc1CBa3fCea344f92D9239c08C0f2487b61DE718D", // wstETH
+    "0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452", // wstETH
   ],
   // USDbC Comet: WETH, cbETH, wstETH
   "0x9c4ec768c28520B50860ea7a15bd7213a9fF58bf": [
     "0x4200000000000000000000000000000000000006", // WETH
     "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22", // cbETH
-    "0xc1CBa3fCea344f92D9239c08C0f2487b61DE718D", // wstETH
+    "0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452", // wstETH
   ],
   // AERO Comet: WETH
   "0x784efeB622244d2348d4F2522f8860B96fbEcE89": [
@@ -170,15 +171,29 @@ export const cometViewAbi = [
     type: "function",
   },
   {
+    // Official TotalsBasic field order (Compound III Comet):
+    // baseSupplyIndex, baseBorrowIndex, trackingSupplyIndex, trackingBorrowIndex,
+    // totalSupplyBase, totalBorrowBase, lastAccrualTime, pauseFlags
     inputs: [],
     name: "totalsBasic",
     outputs: [
-      { name: "totalSupplyBase", type: "int104" },
-      { name: "totalBorrowBase", type: "int104" },
       { name: "baseSupplyIndex", type: "uint64" },
       { name: "baseBorrowIndex", type: "uint64" },
-      { name: "lastAccrualTime", type: "uint64" },
+      { name: "trackingSupplyIndex", type: "uint64" },
+      { name: "trackingBorrowIndex", type: "uint64" },
+      { name: "totalSupplyBase", type: "uint104" },
+      { name: "totalBorrowBase", type: "uint104" },
+      { name: "lastAccrualTime", type: "uint40" },
+      { name: "pauseFlags", type: "uint8" },
     ],
+    stateMutability: "view",
+    type: "function",
+  },
+  {
+    // Prefer this over manual principal * baseBorrowIndex / BASE_INDEX_SCALE
+    inputs: [{ name: "account", type: "address" }],
+    name: "borrowBalanceOf",
+    outputs: [{ name: "", type: "uint256" }],
     stateMutability: "view",
     type: "function",
   },

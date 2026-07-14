@@ -59,6 +59,21 @@ import {
   warmVenueRouteCache,
 } from "./utils/sharedExecution.js";
 
+/** Dust debt that cannot cover swap minOut + gas (base-asset units). */
+function isCometDustDebt(amount: bigint, baseAsset: Address): boolean {
+  if (amount === 0n) return true;
+  const t = baseAsset.toLowerCase();
+  // USDC / USDbC (6 decimals): skip under $0.01
+  if (
+    t === "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" ||
+    t === "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca"
+  ) {
+    return amount < 10_000n;
+  }
+  // WETH / AERO / other 18-dec: skip under 1e12 wei
+  return amount < 10n ** 12n;
+}
+
 export interface CometLiquidationBotInputs {
   logTag: string;
   client: WalletClient<Transport, Chain, Account>;
@@ -516,7 +531,24 @@ export class CometLiquidationBot {
     // Estimate flash loan amount: read user's borrow balance
     const flashLoanAmount = await this.estimateDebt(comet.address, account);
     if (flashLoanAmount === 0n) {
-      console.log(`${this.logTag}  ${account} has no debt, skipping`);
+      // Race / already repaid — short cooldown so we don't re-poll every block
+      this.armCooldown(comet.address, account, "race", "no debt", "fail_race");
+      console.log(`${this.logTag}  ${account} has no debt, skipping (race cooldown)`);
+      return;
+    }
+
+    // Dust debt → swap minOut (InsufficientOutputAmount) always fails; soft cooldown
+    if (isCometDustDebt(flashLoanAmount, comet.baseAsset)) {
+      this.armCooldown(
+        comet.address,
+        account,
+        "soft",
+        `dust debt flashLoanAmount=${flashLoanAmount}`,
+        "fail_soft_profit",
+      );
+      console.log(
+        `${this.logTag}  ${account} dust debt (${flashLoanAmount} base units) — skip flash loan`,
+      );
       return;
     }
 
@@ -537,19 +569,32 @@ export class CometLiquidationBot {
     callbackEncoder.cometAbsorb(comet.address, [account]);
 
     // Step 3: Buy collateral from Comet using base asset
-    // Batch-read all collateral reserves via multicall (1 RPC instead of N)
+    // Post-absorb reserves ≈ currentReserves + userCollateral (user collateral
+    // only enters protocol reserves AFTER absorb). Reading only pre-absorb
+    // reserves would skip accounts whose assets are not yet in the pool.
     const filteredCollaterals = collateralAssets.filter(
       (c) => !TOKEN_BLACKLIST.has(c.toLowerCase()),
     );
-    const reserveResults = await multicall(this.paidReadPool.next(), {
-      contracts: filteredCollaterals.map((collateral) => ({
-        address: comet.address,
-        abi: cometViewAbi,
-        functionName: "getCollateralReserves" as const,
-        args: [collateral] as const,
-      })),
-      allowFailure: true,
-    });
+    const [reserveResults, userCollateralResults] = await Promise.all([
+      multicall(this.paidReadPool.next(), {
+        contracts: filteredCollaterals.map((collateral) => ({
+          address: comet.address,
+          abi: cometViewAbi,
+          functionName: "getCollateralReserves" as const,
+          args: [collateral] as const,
+        })),
+        allowFailure: true,
+      }),
+      multicall(this.paidReadPool.next(), {
+        contracts: filteredCollaterals.map((collateral) => ({
+          address: comet.address,
+          abi: cometViewAbi,
+          functionName: "userCollateral" as const,
+          args: [account, collateral] as const,
+        })),
+        allowFailure: true,
+      }),
+    ]);
 
     // BUGFIX: 之前每一種 collateral 都把 flashLoanAmount(全部閃電貸金額)當作各自的
     // spend cap 傳給 buyCollateral。Compound III 的 buyCollateral 會真的把 baseAmount
@@ -558,14 +603,21 @@ export class CometLiquidationBot {
     // 第二筆呼叫的 transferFrom 會失敗 → 整筆交易 revert。
     // 現在改成:先用 USD 價值估算每種 collateral 儲備值多少 base asset,按比例分配
     // flashLoanAmount 的預算,並確保所有 buyCollateral 呼叫加總不超過 flashLoanAmount。
-    //
-    // Efficiency: price all collaterals in parallel, then multicall quoteCollateral —
-    // previously each collateral did sequential price + quote RPCs.
     const candidates: { collateral: Address; reserveAmount: bigint }[] = [];
-    for (let i = 0; i < reserveResults.length; i++) {
-      const result = reserveResults[i]!;
-      if (result.status !== "success" || result.result <= 0n) continue;
-      candidates.push({ collateral: filteredCollaterals[i]!, reserveAmount: result.result });
+    for (let i = 0; i < filteredCollaterals.length; i++) {
+      const reserveResult = reserveResults[i]!;
+      const userResult = userCollateralResults[i]!;
+      const currentReserves =
+        reserveResult.status === "success" && reserveResult.result > 0n ? reserveResult.result : 0n;
+      // userCollateral returns [balance, reserved]
+      const userBal =
+        userResult.status === "success" && userResult.result ? userResult.result[0] : 0n;
+      const expectedReserves = currentReserves + userBal;
+      if (expectedReserves <= 0n) continue;
+      candidates.push({
+        collateral: filteredCollaterals[i]!,
+        reserveAmount: expectedReserves,
+      });
     }
 
     const [flashLoanValueUsd, ...reserveValuesUsd] = await Promise.all([
@@ -581,20 +633,25 @@ export class CometLiquidationBot {
     const expectedCollateralOut = new Map<Address, bigint>();
     const buyPlans: { collateral: Address; reserveAmount: bigint; baseAmount: bigint }[] = [];
 
+    // Pre-scale USD to micro-USD integers for bigint budget math (avoid float ratio)
+    const flashUsdScaled =
+      flashLoanValueUsd !== undefined && flashLoanValueUsd > 0
+        ? BigInt(Math.floor(flashLoanValueUsd * 1e6))
+        : 0n;
+
     for (let i = 0; i < candidates.length; i++) {
       if (remainingBudget <= 0n) break;
       const { collateral, reserveAmount } = candidates[i]!;
       const reserveValueUsd = reserveValuesUsd[i];
 
       let baseAmountForThisCollateral = remainingBudget;
-      if (flashLoanValueUsd && flashLoanValueUsd > 0) {
-        if (reserveValueUsd !== undefined && reserveValueUsd > 0) {
-          // 用美元價值比例換算成 base asset 數量,並保留 5% 安全邊際避免價格微幅誤差仍超支
-          const ratio = reserveValueUsd / flashLoanValueUsd;
-          const proportional = (flashLoanAmount * BigInt(Math.floor(ratio * 9500))) / 10000n;
-          if (proportional > 0n && proportional < remainingBudget) {
-            baseAmountForThisCollateral = proportional;
-          }
+      if (flashUsdScaled > 0n && reserveValueUsd !== undefined && reserveValueUsd > 0) {
+        const reserveUsdScaled = BigInt(Math.floor(reserveValueUsd * 1e6));
+        // 95% safety margin so price micro-errors don't overspend budget
+        const proportional =
+          (flashLoanAmount * reserveUsdScaled * 9500n) / (flashUsdScaled * 10000n);
+        if (proportional > 0n && proportional < remainingBudget) {
+          baseAmountForThisCollateral = proportional;
         }
       }
       if (baseAmountForThisCollateral <= 0n) continue;
@@ -687,9 +744,7 @@ export class CometLiquidationBot {
       return;
     }
 
-    // Step 5: Skim profit to treasury
-    callbackEncoder.erc20Skim(comet.baseAsset, this.treasuryAddress);
-
+    // Do NOT erc20Skim before flash repay (appended after callbacks).
     const callbackCalls = callbackEncoder.flush();
 
     const primaryCollateral = collateralAssets.find(
@@ -700,7 +755,7 @@ export class CometLiquidationBot {
     // Step 7: flash loan sim + exec
     try {
       const tSim = nowMs();
-      const success = await simulateAndExecFlashLoanWithFallback(
+      const execResult = await simulateAndExecFlashLoanWithFallback(
         this.sharedDeps,
         callbackCalls,
         comet.baseAsset,
@@ -713,19 +768,23 @@ export class CometLiquidationBot {
       const simMs = elapsedMs(tSim);
       this.raceMetrics.recordStage("simExec", simMs);
       console.log(
-        `${this.logTag}[LiqTiming] flash account=${account.slice(0, 10)}… simExecMs=${simMs} ok=${success}`,
+        `${this.logTag}[LiqTiming] flash account=${account.slice(0, 10)}… simExecMs=${simMs} ok=${execResult.success}` +
+          (execResult.reason ? ` reason=${execResult.reason}` : ""),
       );
 
-      if (success) {
+      if (execResult.success) {
         this._liquidationsSucceeded++;
         this.armCooldown(comet.address, account, "success");
         if (primaryCollateral) {
+          const seizedAmount = expectedCollateralOut.get(primaryCollateral) ?? 0n;
           const collateralUsd =
-            (await priceAsset(this.sharedDeps, primaryCollateral, flashLoanAmount)) ?? 0;
+            seizedAmount > 0n
+              ? ((await priceAsset(this.sharedDeps, primaryCollateral, seizedAmount)) ?? 0)
+              : 0;
           liquidationTracker.report({
             protocol: this.logTag,
             collateralToken: primaryCollateral,
-            collateralAmount: flashLoanAmount,
+            collateralAmount: seizedAmount,
             collateralUsdEstimate: collateralUsd,
             timestamp: Date.now(),
           });
@@ -735,9 +794,10 @@ export class CometLiquidationBot {
         );
       } else {
         this._liquidationsFailed++;
-        this.armCooldown(comet.address, account, "soft", "not profitable");
+        const why = execResult.reason ?? "sim_or_profit_fail";
+        this.armCooldown(comet.address, account, "soft", why);
         console.log(
-          `${this.logTag}[FlashLoan] Skipped ${account} on Comet ${comet.address.slice(0, 10)}... (not profitable)`,
+          `${this.logTag}[FlashLoan] Skipped ${account} on Comet ${comet.address.slice(0, 10)}... (${why})`,
         );
       }
     } catch (error) {
@@ -757,44 +817,60 @@ export class CometLiquidationBot {
     const collateralAssets = comet.collateralAssets ?? [];
     const encoder = new LiquidationEncoder(this.executorAddress, this.client);
 
-    // Approve Comet — only if allowance insufficient
+    // Approve Comet when allowance may be insufficient for buyCollateral pulls
     const currentAllowance = await readContract(this.client, {
       address: comet.baseAsset,
       abi: erc20Abi,
       functionName: "allowance",
       args: [this.executorAddress, comet.address],
     });
-    if (currentAllowance === 0n) {
+    // maxUint256 approve when any shortfall is possible (not only zero)
+    if (currentAllowance < maxUint256 / 2n) {
       encoder.erc20Approve(comet.baseAsset, comet.address, maxUint256);
     }
 
     // Absorb
     encoder.cometAbsorb(comet.address, [account]);
 
-    // Buy collateral — batch-read reserves via multicall
+    // Buy collateral — post-absorb expected reserves = current + userCollateral
     const filteredCollaterals = collateralAssets.filter(
       (c) => !TOKEN_BLACKLIST.has(c.toLowerCase()),
     );
-    const reserveResults = await multicall(this.paidReadPool.next(), {
-      contracts: filteredCollaterals.map((collateral) => ({
-        address: comet.address,
-        abi: cometViewAbi,
-        functionName: "getCollateralReserves" as const,
-        args: [collateral] as const,
-      })),
-      allowFailure: true,
-    });
+    const [reserveResults, userCollateralResults] = await Promise.all([
+      multicall(this.paidReadPool.next(), {
+        contracts: filteredCollaterals.map((collateral) => ({
+          address: comet.address,
+          abi: cometViewAbi,
+          functionName: "getCollateralReserves" as const,
+          args: [collateral] as const,
+        })),
+        allowFailure: true,
+      }),
+      multicall(this.paidReadPool.next(), {
+        contracts: filteredCollaterals.map((collateral) => ({
+          address: comet.address,
+          abi: cometViewAbi,
+          functionName: "userCollateral" as const,
+          args: [account, collateral] as const,
+        })),
+        allowFailure: true,
+      }),
+    ]);
 
-    // buyCollateral is called with an unbounded base budget below, so it pulls in the
-    // entire available reserve for each collateral — that reserve amount is exactly what
-    // Step "DEX swap" will need to convert.
+    // buyCollateral with unbounded base budget pulls available reserve for each collateral.
     const expectedCollateralOut = new Map<Address, bigint>();
 
-    for (let i = 0; i < reserveResults.length; i++) {
-      const result = reserveResults[i]!;
-      if (result.status !== "success" || result.result <= 0n) continue;
+    for (let i = 0; i < filteredCollaterals.length; i++) {
+      const reserveResult = reserveResults[i]!;
+      const userResult = userCollateralResults[i]!;
+      const currentReserves =
+        reserveResult.status === "success" && reserveResult.result > 0n ? reserveResult.result : 0n;
+      const userBal =
+        userResult.status === "success" && userResult.result ? userResult.result[0] : 0n;
+      const expectedReserves = currentReserves + userBal;
+      if (expectedReserves <= 0n) continue;
       const collateral = filteredCollaterals[i]!;
-      expectedCollateralOut.set(collateral, result.result);
+      expectedCollateralOut.set(collateral, expectedReserves);
       encoder.cometBuyCollateral(comet.address, collateral, 0n, maxUint256);
     }
 
@@ -842,7 +918,7 @@ export class CometLiquidationBot {
 
     try {
       const tSim = nowMs();
-      const success = await simulateAndExec(
+      const execResult = await simulateAndExec(
         this.sharedDeps,
         encoder,
         calls,
@@ -855,19 +931,23 @@ export class CometLiquidationBot {
       const simMs = elapsedMs(tSim);
       this.raceMetrics.recordStage("simExec", simMs);
       console.log(
-        `${this.logTag}[LiqTiming] direct account=${account.slice(0, 10)}… simExecMs=${simMs} ok=${success}`,
+        `${this.logTag}[LiqTiming] direct account=${account.slice(0, 10)}… simExecMs=${simMs} ok=${execResult.success}` +
+          (execResult.reason ? ` reason=${execResult.reason}` : ""),
       );
 
-      if (success) {
+      if (execResult.success) {
         this._liquidationsSucceeded++;
         this.armCooldown(comet.address, account, "success");
         if (primaryCollateral) {
+          const seizedAmount = expectedCollateralOut.get(primaryCollateral) ?? 0n;
           const collateralUsd =
-            (await priceAsset(this.sharedDeps, primaryCollateral, maxUint256)) ?? 0;
+            seizedAmount > 0n
+              ? ((await priceAsset(this.sharedDeps, primaryCollateral, seizedAmount)) ?? 0)
+              : 0;
           liquidationTracker.report({
             protocol: this.logTag,
             collateralToken: primaryCollateral,
-            collateralAmount: 0n,
+            collateralAmount: seizedAmount,
             collateralUsdEstimate: collateralUsd,
             timestamp: Date.now(),
           });
@@ -877,9 +957,10 @@ export class CometLiquidationBot {
         );
       } else {
         this._liquidationsFailed++;
-        this.armCooldown(comet.address, account, "soft", "not profitable");
+        const why = execResult.reason ?? "sim_or_profit_fail";
+        this.armCooldown(comet.address, account, "soft", why);
         console.log(
-          `${this.logTag}Skipped ${account} on Comet ${comet.address.slice(0, 10)}... (not profitable)`,
+          `${this.logTag}Skipped ${account} on Comet ${comet.address.slice(0, 10)}... (${why})`,
         );
       }
     } catch (error) {
@@ -951,43 +1032,54 @@ export class CometLiquidationBot {
   }
 
   /**
-   * Estimate a user's debt in a Comet by reading userBasic and computing borrow balance.
-   * Returns the estimated debt amount in base asset units.
+   * Estimate a user's debt in a Comet (base asset units).
+   * Prefer on-chain borrowBalanceOf (accrued); fallback to principal × baseBorrowIndex.
    */
   private async estimateDebt(comet: Address, account: Address): Promise<bigint> {
     try {
-      const [userBasic, totalsBasic] = await Promise.all([
-        readContract(this.client, {
-          address: comet,
-          abi: cometViewAbi,
-          functionName: "userBasic",
-          args: [account],
-        }),
-        readContract(this.client, {
-          address: comet,
-          abi: cometViewAbi,
-          functionName: "totalsBasic",
-        }),
-      ]);
+      // Primary: protocol-computed borrow balance (matches fork tests / production accuracy)
+      const direct = await readContract(this.client, {
+        address: comet,
+        abi: cometViewAbi,
+        functionName: "borrowBalanceOf",
+        args: [account],
+      });
+      return direct;
+    } catch (primaryErr) {
+      // Fallback: manual accrual from userBasic + totalsBasic (corrected ABI field order)
+      try {
+        const [userBasic, totalsBasic] = await Promise.all([
+          readContract(this.client, {
+            address: comet,
+            abi: cometViewAbi,
+            functionName: "userBasic",
+            args: [account],
+          }),
+          readContract(this.client, {
+            address: comet,
+            abi: cometViewAbi,
+            functionName: "totalsBasic",
+          }),
+        ]);
 
-      const principal = userBasic[0]; // principal (int104)
-      const baseBorrowIndex = totalsBasic[3]; // baseBorrowIndex
+        const principal = userBasic[0]; // principal (int104)
+        // Official TotalsBasic: [0]=baseSupplyIndex, [1]=baseBorrowIndex, ...
+        const baseBorrowIndex = totalsBasic[1];
 
-      // principal > 0 means supply, principal < 0 means borrow
-      if (principal >= 0n) return 0n; // No debt
+        // principal > 0 means supply, principal < 0 means borrow
+        if (principal >= 0n) return 0n;
 
-      // Borrow balance = |principal| * baseBorrowIndex / 1e15 (BASE_INDEX_SCALE)
-      const absPrincipal = -principal;
-      const borrowBalance = (absPrincipal * baseBorrowIndex) / 1_000_000_000_000_000n;
-
-      return borrowBalance;
-    } catch (e) {
-      this._rpcErrors++;
-      this._lastError = String(e);
-      console.warn(
-        `${this.logTag}Failed to estimate debt for ${account} on ${comet.slice(0, 10)}...: ${e instanceof Error ? e.message : e}`,
-      );
-      return 0n;
+        // Borrow balance = |principal| * baseBorrowIndex / 1e15 (BASE_INDEX_SCALE)
+        const absPrincipal = -principal;
+        return (absPrincipal * baseBorrowIndex) / 1_000_000_000_000_000n;
+      } catch (e) {
+        this._rpcErrors++;
+        this._lastError = String(e);
+        console.warn(
+          `${this.logTag}Failed to estimate debt for ${account} on ${comet.slice(0, 10)}...: ${e instanceof Error ? e.message : e} (primary: ${primaryErr instanceof Error ? primaryErr.message : primaryErr})`,
+        );
+        return 0n;
+      }
     }
   }
 

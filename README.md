@@ -118,7 +118,25 @@ pnpm backfill:aave
 pnpm skim --chainId 8453 --token 0x... --recipient 0x...
 ```
 
-Logs: colored console + `logs/bot.log` (directory gitignored).
+### Tests
+
+```bash
+# All client tests (unit + Base + mainnet forks)
+pnpm test:client
+
+# Base only (8453) — unit + Aave/Comet/Moonwell/Morpho Base forks
+pnpm test:client:base
+# same as:
+pnpm test:client -- --chainId 8453
+
+# Ethereum mainnet fork tests only (needs RPC_URL_1)
+pnpm test:client -- --chainId 1
+
+# Multi-protocol Base fork suite only
+pnpm test:fork-suite
+```
+
+Logs: colored console + `logs/bot.log` (gitignored). Size rotation by default (`LOG_FILE_MAX_MB=20`, keep `LOG_FILE_MAX_FILES=5` → `bot.log`, `bot.log.1`, …).
 
 ## Liquidation process
 

@@ -25,6 +25,7 @@ import {
   getGasPrice,
   readContract,
   simulateCalls,
+  waitForTransactionReceipt,
   watchBlocks,
   writeContract,
 } from "viem/actions";
@@ -35,6 +36,100 @@ import { BALANCER_FLASH_LOAN_FEE_BPS, BALANCER_VAULT_ADDRESS } from "../abis/Bal
 import { Flashbots } from "./flashbots.js";
 import { LiquidationEncoder } from "./LiquidationEncoder.js";
 import { liquidationTracker } from "./liquidationState.js";
+
+/** Wait for inclusion before counting liquidationsSucceeded / arming success cooldown. */
+const TX_RECEIPT_TIMEOUT_MS = 90_000;
+
+/**
+ * Structured sim/exec outcome so bots do not log every false as "not profitable".
+ * success=true only after receipt (or Flashbots send).
+ */
+export type SimExecFailReason =
+  | "sim_fail"
+  | "profit_fail"
+  | "slippage_fail"
+  | "exec_revert"
+  | "providers_exhausted";
+
+export interface SimExecResult {
+  success: boolean;
+  reason?: SimExecFailReason;
+  detail?: string;
+}
+
+export function simExecOk(): SimExecResult {
+  return { success: true };
+}
+
+export function simExecFail(reason: SimExecFailReason, detail?: string): SimExecResult {
+  return { success: false, reason, detail };
+}
+
+/**
+ * Common custom-error selectors seen in flash-loan sim reverts.
+ * Viem cannot decode these against executor ABI alone → noisy "Unable to decode signature".
+ * Map selector → human name for logs (keccak256("Name()")[0:4]).
+ */
+const KNOWN_REVERT_SELECTORS: Record<string, string> = {
+  "0x42301c23": "InsufficientOutputAmount()", // Aerodrome / UniV2-style swap minOut
+  "0x08c379a0": "Error(string)", // standard Solidity Error
+  "0x4e487b71": "Panic(uint256)",
+};
+
+/** Balancer V2 string reasons that show up as Error(string) after decode, or raw in logs. */
+const KNOWN_BALANCER_CODES: Record<string, string> = {
+  "BAL#528": "INSUFFICIENT_FLASH_LOAN_BALANCE (vault lacks token for flash loan)",
+  "BAL#519": "INVALID_FLASH_LOAN_TOKEN_BALANCE",
+};
+
+/** Compound V2 / Moonwell failure strings (Error(string) reason). */
+const KNOWN_COMPOUND_REASONS: Record<string, string> = {
+  LIQUIDATE_SEIZE_TOO_MUCH: "repay too large vs borrower collateral mToken balance (cap repay)",
+  LIQUIDATE_LIQUIDATOR_IS_BORROWER: "cannot liquidate self",
+  LIQUIDATE_CLOSE_AMOUNT_IS_UINT_MAX: "invalid repay amount",
+  LIQUIDATE_CLOSE_AMOUNT_IS_ZERO: "zero repay",
+  LIQUIDATE_SEIZE_LIQUIDATOR_IS_BORROWER: "seize liquidator is borrower",
+  TOKEN_INSUFFICIENT_ALLOWANCE: "need approve underlying to mToken",
+  TOKEN_INSUFFICIENT_BALANCE: "executor missing repay tokens (flash loan path)",
+};
+
+/** Short, readable sim failure line (selector decoded when known). */
+function formatSimError(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  const firstLine = raw.split("\n")[0] ?? raw;
+
+  for (const [code, meaning] of Object.entries(KNOWN_BALANCER_CODES)) {
+    if (raw.includes(code)) {
+      return `${firstLine} → ${code} ${meaning}`;
+    }
+  }
+
+  for (const [code, meaning] of Object.entries(KNOWN_COMPOUND_REASONS)) {
+    if (raw.includes(code)) {
+      return `${firstLine} → ${code}: ${meaning}`;
+    }
+  }
+
+  // Empty revert / empty return — common when an inner call fails without a custom error
+  // (e.g. wrong function selector on mToken → no matching ABI → 0x)
+  if (/returned no data\s*\("0x"\)/i.test(raw) || /returned no data/i.test(raw)) {
+    return (
+      `${firstLine} → empty revert/return (inner call failed without error selector; ` +
+      `often wrong liquidateBorrow args, redeem/swap fail, or flash-loan callback).`
+    );
+  }
+
+  const selMatch =
+    /signature:\s*(0x[0-9a-fA-F]{8})\b/i.exec(raw) ?? /\b(0x[0-9a-fA-F]{8})\b/.exec(raw);
+  const sel = selMatch?.[1]?.toLowerCase();
+  if (sel && KNOWN_REVERT_SELECTORS[sel]) {
+    const name = KNOWN_REVERT_SELECTORS[sel];
+    return `${firstLine} → ${name} [${sel}]`;
+  }
+  // Truncate multi-line viem dumps (args / docs walls)
+  if (raw.length > 400) return `${raw.slice(0, 400)}…`;
+  return raw;
+}
 
 const BPS_DENOMINATOR = 10_000n;
 
@@ -663,6 +758,8 @@ export async function convertCollateralToLoan(
  * Uses a tiny sample amount so we only discover routes / fill cache — not real sizes.
  * Failures are logged and ignored (pair simply stays cold until first live convert).
  */
+const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
+
 export async function warmVenueRouteCache(
   deps: SharedExecutionDeps,
   pairs: { src: Address; dst: Address }[],
@@ -673,7 +770,14 @@ export async function warmVenueRouteCache(
   const seen = new Set<string>();
 
   for (const { src, dst } of pairs) {
-    if (src.toLowerCase() === dst.toLowerCase()) continue;
+    // Morpho can list native-ETH markets as collateral 0x0 — not an ERC-20; skip warm probe.
+    if (
+      src.toLowerCase() === ZERO_ADDR ||
+      dst.toLowerCase() === ZERO_ADDR ||
+      src.toLowerCase() === dst.toLowerCase()
+    ) {
+      continue;
+    }
     const key = pairCacheKey(src, dst);
     if (seen.has(key) || knownVenueForPair.has(key)) {
       if (knownVenueForPair.has(key)) warmed++;
@@ -718,12 +822,19 @@ export async function simulateAndExecFlashLoan(
   cachedGasPrice?: bigint,
   collateralToken?: Address,
   venueImpactBps?: bigint,
-): Promise<boolean> {
+): Promise<SimExecResult> {
   const functionData = {
     abi: executorAbi,
     functionName: "exec_606BaXt",
     args: [calls],
   } as const;
+
+  // Measure profit on the EXECUTOR, not treasury.
+  // Flash callbacks must NOT erc20Skim before repay: Balancer/Morpho/Aave append the
+  // repay transfer AFTER user callbacks; skimming full balance makes repay fail with
+  // "transfer amount exceeds balance". Leftover baseAsset on the executor after repay
+  // is true net profit (flash fee already paid inside the tx).
+  const profitHolder = deps.executorAddress;
 
   const [{ results }, gasPrice] = await Promise.all([
     simulateCalls(deps.client, {
@@ -733,14 +844,14 @@ export async function simulateAndExecFlashLoan(
           to: baseAsset,
           abi: erc20Abi,
           functionName: "balanceOf",
-          args: [deps.treasuryAddress],
+          args: [profitHolder],
         },
         { to: encoder.address, ...functionData },
         {
           to: baseAsset,
           abi: erc20Abi,
           functionName: "balanceOf",
-          args: [deps.treasuryAddress],
+          args: [profitHolder],
         },
       ],
     }),
@@ -749,18 +860,18 @@ export async function simulateAndExecFlashLoan(
 
   if (results[1].status !== "success") {
     const simErr = results[1].error;
-    console.warn(`${deps.logTag}[FlashLoan] Simulation failed: ${simErr}`);
+    console.warn(`${deps.logTag}[FlashLoan] Simulation failed: ${formatSimError(simErr)}`);
     const raceReason = isNonRecoverableRevert(simErr);
     if (raceReason !== undefined) {
       throw new LiquidationRaceLostError(raceReason);
     }
-    return false;
+    return simExecFail("sim_fail", formatSimError(simErr));
   }
 
   // DEBUG: Log simulation results
   const simulatedProfit = (results[2].result ?? 0n) - (results[0].result ?? 0n);
   console.log(
-    `${deps.logTag}[Sim Debug] balanceBefore=${results[0].result}, balanceAfter=${results[2].result}, simulatedProfit=${simulatedProfit}, gasUsed=${results[1].gasUsed}, gasPrice=${gasPrice}`,
+    `${deps.logTag}[Sim Debug] executorBalBefore=${results[0].result}, executorBalAfter=${results[2].result}, simulatedProfit=${simulatedProfit}, gasUsed=${results[1].gasUsed}, gasPrice=${gasPrice}`,
   );
 
   if (
@@ -776,64 +887,38 @@ export async function simulateAndExecFlashLoan(
         price: gasPrice,
       },
       badDebtPosition,
-      flashLoanAmount,
+      // Flash fee already settled in the simulated exec; do not subtract again.
+      undefined,
       collateralToken,
     ))
   ) {
     console.log(`${deps.logTag}[Sim Debug] Profit check failed — skipping execution`);
-    return false;
+    return simExecFail("profit_fail");
   }
 
-  // Slippage safety margin
+  // Slippage safety margin in loan-token raw units only.
+  // Gas is already accounted for in checkProfit (USD). Do NOT mix gas wei
+  // into this comparison — estimatedGasCost is native wei (18 dec) while
+  // simulatedProfit / slippageMargin are loan-token units (e.g. USDC 6 dec).
   const dynamicSlippageBps = computeDynamicSlippageBps(venueImpactBps);
   const slippageMargin = (flashLoanAmount * dynamicSlippageBps) / BPS_DENOMINATOR;
-  const estimatedGasCost = results[1].gasUsed * gasPrice;
-  const minProfitThreshold = slippageMargin > estimatedGasCost ? slippageMargin : estimatedGasCost;
 
   console.log(
-    `${deps.logTag}[Sim Debug] dynamicSlippageBps=${dynamicSlippageBps} (venueImpactBps=${venueImpactBps ?? "n/a — protected route"})`,
+    `${deps.logTag}[Sim Debug] dynamicSlippageBps=${dynamicSlippageBps} (venueImpactBps=${venueImpactBps ?? "n/a — protected route"}) slippageMargin=${slippageMargin} gasUsed=${results[1].gasUsed} gasPrice=${gasPrice}`,
   );
 
-  if (simulatedProfit < minProfitThreshold) {
+  if (simulatedProfit < slippageMargin) {
     console.warn(
-      `${deps.logTag}[FlashLoan] Simulated profit (${simulatedProfit}) below threshold (${minProfitThreshold}), skipping`,
+      `${deps.logTag}[FlashLoan] Simulated profit (${simulatedProfit}) below slippage margin (${slippageMargin}), skipping`,
     );
-    return false;
+    return simExecFail("slippage_fail", `profit=${simulatedProfit} margin=${slippageMargin}`);
   }
 
-  // Execute
+  // Execute — only return success after on-chain receipt (or Flashbots send, best-effort)
   console.log(
     `${deps.logTag}[Exec Debug] Passing profit check — executing via ${deps.flashbotAccount ? "Flashbots" : "direct writeContract"}`,
   );
-  try {
-    if (deps.flashbotAccount) {
-      const signedBundle = await Flashbots.signBundle([
-        {
-          transaction: { to: encoder.address, ...functionData },
-          client: deps.client,
-        },
-      ]);
-      await Flashbots.sendRawBundle(
-        signedBundle,
-        (await getBlockNumber(deps.client)) + 1n,
-        deps.flashbotAccount,
-      );
-      console.log(`${deps.logTag}[Exec Debug] Flashbots bundle sent`);
-    } else {
-      const txHash = await writeContract(deps.client, {
-        address: encoder.address,
-        ...functionData,
-      });
-      console.log(`${deps.logTag}[Exec Debug] Transaction sent: ${txHash}`);
-    }
-  } catch (e) {
-    console.error(
-      `${deps.logTag}[Exec Debug] Execution failed: ${e instanceof Error ? e.message : e}`,
-    );
-    throw e;
-  }
-
-  return true;
+  return await submitAndConfirm(deps, encoder.address, functionData);
 }
 
 // ─── Flash Loan Wrapper Helper ───
@@ -939,11 +1024,13 @@ export async function simulateAndExecFlashLoanWithFallback(
   collateralToken?: Address,
   cachedGasPrice?: bigint,
   venueImpactBps?: bigint,
-): Promise<boolean> {
+): Promise<SimExecResult> {
   const providers = [deps.flashLoanProvider, ...deps.flashLoanFallbackProviders];
   console.log(
     `${deps.logTag}[FlashLoan Debug] Trying ${providers.length} provider(s): ${providers.join(", ")}, flashLoanAmount=${flashLoanAmount}`,
   );
+
+  let lastFail: SimExecResult | undefined;
 
   for (let i = 0; i < providers.length; i++) {
     const provider = providers[i]!;
@@ -959,7 +1046,7 @@ export async function simulateAndExecFlashLoanWithFallback(
       const calls = wrapWithFlashLoan(deps, provider, baseAsset, flashLoanAmount, callbackCalls);
       const encoder = new LiquidationEncoder(deps.executorAddress, deps.client);
 
-      const success = await simulateAndExecFlashLoan(
+      const result = await simulateAndExecFlashLoan(
         { ...deps, flashLoanProvider: provider },
         encoder,
         calls,
@@ -971,14 +1058,15 @@ export async function simulateAndExecFlashLoanWithFallback(
         venueImpactBps,
       );
 
-      if (success) {
+      if (result.success) {
         if (isFallback) {
           console.log(
             `${deps.logTag}[FlashLoanFallback] ✓ Succeeded with fallback provider: ${provider}`,
           );
         }
-        return true;
+        return result;
       }
+      lastFail = result;
     } catch (error) {
       const nonRecoverableReason = isNonRecoverableRevert(error);
       if (nonRecoverableReason !== undefined) {
@@ -992,11 +1080,17 @@ export async function simulateAndExecFlashLoanWithFallback(
       console.warn(
         `${deps.logTag}[FlashLoanFallback] Provider ${provider} failed: ${error instanceof Error ? error.message : error}`,
       );
+      lastFail = simExecFail("sim_fail", error instanceof Error ? error.message : String(error));
     }
   }
 
   console.warn(`${deps.logTag}[FlashLoanFallback] All providers exhausted, skipping liquidation`);
-  return false;
+  return lastFail?.reason
+    ? simExecFail(
+        "providers_exhausted",
+        `${lastFail.reason}${lastFail.detail ? `: ${lastFail.detail}` : ""}`,
+      )
+    : simExecFail("providers_exhausted");
 }
 
 // ─── Simulation + Execution (non-flash-loan path) ───
@@ -1010,12 +1104,16 @@ export async function simulateAndExec(
   flashLoanAmount?: bigint,
   cachedGasPrice?: bigint,
   collateralToken?: Address,
-): Promise<boolean> {
+): Promise<SimExecResult> {
   const functionData = {
     abi: executorAbi,
     functionName: "exec_606BaXt",
     args: [calls],
   } as const;
+
+  // Direct path bots erc20Skim profit to treasury before flush — measure treasury,
+  // not the EOA (which would show ~0 delta and false-negative profitable liquidations).
+  const profitHolder = deps.treasuryAddress;
 
   const [{ results }, gasPrice] = await Promise.all([
     simulateCalls(deps.client, {
@@ -1025,14 +1123,14 @@ export async function simulateAndExec(
           to: loanToken,
           abi: erc20Abi,
           functionName: "balanceOf",
-          args: [deps.client.account.address],
+          args: [profitHolder],
         },
         { to: encoder.address, ...functionData },
         {
           to: loanToken,
           abi: erc20Abi,
           functionName: "balanceOf",
-          args: [deps.client.account.address],
+          args: [profitHolder],
         },
       ],
     }),
@@ -1041,12 +1139,12 @@ export async function simulateAndExec(
 
   if (results[1].status !== "success") {
     const simErr = results[1].error;
-    console.warn(`${deps.logTag}Transaction failed in simulation: ${simErr}`);
+    console.warn(`${deps.logTag}Transaction failed in simulation: ${formatSimError(simErr)}`);
     const raceReason = isNonRecoverableRevert(simErr);
     if (raceReason !== undefined) {
       throw new LiquidationRaceLostError(raceReason);
     }
-    return false;
+    return simExecFail("sim_fail", formatSimError(simErr));
   }
 
   if (
@@ -1066,17 +1164,32 @@ export async function simulateAndExec(
       collateralToken,
     ))
   )
-    return false;
+    return simExecFail("profit_fail");
 
-  // Execute
+  // Execute — only return success after on-chain receipt (or Flashbots send, best-effort)
   console.log(
     `${deps.logTag}[Exec Debug] Passing profit check — executing via ${deps.flashbotAccount ? "Flashbots" : "direct writeContract"}`,
   );
+  return await submitAndConfirm(deps, encoder.address, functionData);
+}
+
+/**
+ * Submit liquidation tx and confirm success before callers arm "success" cooldown
+ * or increment liquidationsSucceeded. Hash-only success previously locked positions 1h
+ * even when the tx never landed or reverted.
+ */
+
+async function submitAndConfirm(
+  deps: SharedExecutionDeps,
+  executorAddress: Address,
+  functionData: any,
+): Promise<SimExecResult> {
   try {
     if (deps.flashbotAccount) {
+      // Bundle inclusion is not a single receipt path; keep fire-and-forget semantics.
       const signedBundle = await Flashbots.signBundle([
         {
-          transaction: { to: encoder.address, ...functionData },
+          transaction: { to: executorAddress, ...functionData },
           client: deps.client,
         },
       ]);
@@ -1085,20 +1198,38 @@ export async function simulateAndExec(
         (await getBlockNumber(deps.client)) + 1n,
         deps.flashbotAccount,
       );
-      console.log(`${deps.logTag}[Exec Debug] Flashbots bundle sent`);
-    } else {
-      const txHash = await writeContract(deps.client, {
-        address: encoder.address,
-        ...functionData,
-      });
-      console.log(`${deps.logTag}[Exec Debug] Transaction sent: ${txHash}`);
+      console.log(
+        `${deps.logTag}[Exec Debug] Flashbots bundle sent (receipt not awaited — treat as tentative success)`,
+      );
+      return simExecOk();
     }
+
+    const txHash = await writeContract(deps.client, {
+      address: executorAddress,
+      ...functionData,
+    });
+    console.log(`${deps.logTag}[Exec Debug] Transaction sent: ${txHash} — waiting for receipt…`);
+
+    const receipt = await waitForTransactionReceipt(deps.client, {
+      hash: txHash,
+      timeout: TX_RECEIPT_TIMEOUT_MS,
+    });
+
+    if (receipt.status !== "success") {
+      console.error(
+        `${deps.logTag}[Exec Debug] Transaction mined but REVERTED: ${txHash} status=${receipt.status}`,
+      );
+      return simExecFail("exec_revert", `tx=${txHash}`);
+    }
+
+    console.log(
+      `${deps.logTag}[Exec Debug] Transaction confirmed: ${txHash} block=${receipt.blockNumber}`,
+    );
+    return simExecOk();
   } catch (e) {
     console.error(
       `${deps.logTag}[Exec Debug] Execution failed: ${e instanceof Error ? e.message : e}`,
     );
     throw e;
   }
-
-  return true;
 }

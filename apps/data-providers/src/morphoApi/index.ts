@@ -5,7 +5,11 @@ import { Time } from "@morpho-org/morpho-ts";
 import type { Account, Address, Chain, Client, Hex, Transport } from "viem";
 import { readContract } from "viem/actions";
 
-import type { DataProvider, LiquidatablePositionsResult } from "../dataProvider";
+import {
+  DataProviderError,
+  type DataProvider,
+  type LiquidatablePositionsResult,
+} from "../dataProvider";
 
 import { apiSdk } from "./api/index";
 
@@ -18,9 +22,12 @@ export class MorphoApiDataProvider implements DataProvider {
 
       return [...new Set(vaultMarkets.flat())];
     } catch (error) {
-      const msg = error instanceof Error ? error.message : error;
+      const msg = error instanceof Error ? error.message : String(error);
       console.error(`[Chain ${client.chain.id}] Error fetching markets for vaults: ${msg}`);
-      return [];
+      throw new DataProviderError(
+        `Morpho API fetchMarkets failed (chain ${client.chain.id}): ${msg}`,
+        error,
+      );
     }
   }
 
@@ -126,9 +133,13 @@ export class MorphoApiDataProvider implements DataProvider {
         preLiquidatablePositions: [],
       };
     } catch (error) {
-      const msg = error instanceof Error ? error.message : error;
+      if (error instanceof DataProviderError) throw error;
+      const msg = error instanceof Error ? error.message : String(error);
       console.error(`[Chain ${client.chain.id}] Error fetching liquidatable positions: ${msg}`);
-      return { liquidatablePositions: [], preLiquidatablePositions: [] };
+      throw new DataProviderError(
+        `Morpho API fetchLiquidatablePositions failed (chain ${client.chain.id}): ${msg}`,
+        error,
+      );
     }
   }
 
@@ -157,11 +168,15 @@ export class MorphoApiDataProvider implements DataProvider {
         }),
       );
     } catch (error) {
-      const msg = error instanceof Error ? error.message : error;
+      const msg = error instanceof Error ? error.message : String(error);
       console.error(
         `[Chain ${client.chain.id}] Error fetching vault markets for ${vaultAddress}: ${msg}`,
       );
-      return [];
+      // Per-vault failure: rethrow so fetchMarkets surfaces provider error (not silent empty)
+      throw new DataProviderError(
+        `Morpho API vault markets failed for ${vaultAddress}: ${msg}`,
+        error,
+      );
     }
   }
 }

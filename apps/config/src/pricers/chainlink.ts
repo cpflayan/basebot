@@ -38,7 +38,9 @@ export const CHAINLINK_PROXY: Record<number, Record<Address, Address>> = {
     "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913": "0x7e860098F58bBFC8648a4311b374B1D669a2bc6B",
     // USDbC → USDC/USD proxy (same feed, pegged stable)
     "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA": "0x7e860098F58bBFC8648a4311b374B1D669a2bc6B",
-    // cbBTC → BTC/USD proxy
-    "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf": "0x07D51B655d438A8d14c9A76a5d07b0240CF4639B",
+    // cbBTC → dedicated cbBTC/USD AggregatorV3 (same feed Comet USDC uses on Base)
+    // Verified on-chain: description()="cbBTC / USD", decimals=8, latestRoundData OK.
+    // Old value 0x07D51B655d438A8d14c9A76a5d07b0240CF4639B had no code (invalid).
+    "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf": "0x8D38A3d6B3c3B7d96D6536DA7Eef94A9d7dbC991",
   },
 };

@@ -40,28 +40,46 @@ export class AerodromeVenue implements LiquidityVenue {
     try {
       const pool = poolInfo.address;
 
-      // SECURITY (C2): pool.swap() below passes amount0Out=0, amount1Out=0 — no
-      // protocol-level minAmountOut. Fetch reserves as a proxy for price impact so
-      // the caller can size a dynamic slippage margin instead of a flat guess.
-      // NOTE: this is a constant-product (x*y=k) approximation. Aerodrome "stable"
-      // pools use a different curve (x^3*y + y^3*x = k), which has lower slippage
-      // near the peg — so for stable pools this over-estimates impact. That's the
-      // safe direction to be wrong in (bigger margin, not a false sense of safety).
+      // Solidly/Aerodrome swap requires amount0Out or amount1Out > 0.
+      // Passing (0,0) reverts or is a no-op — never treat it as a successful conversion
+      // (that dead-ends the venue chain and caches a broken route).
+      const [token0, amountOut] = await Promise.all([
+        readContract(encoder.client, {
+          address: pool,
+          abi: aerodromePoolAbi,
+          functionName: "token0",
+        }),
+        readContract(encoder.client, {
+          address: pool,
+          abi: aerodromePoolAbi,
+          functionName: "getAmountOut",
+          args: [srcAmount, src],
+        }),
+      ]);
+
+      if (amountOut === 0n) {
+        this.lastImpactBps = undefined;
+        // Fail closed: leave toConvert unchanged so hop continues to next venue
+        return toConvert;
+      }
+
+      // SECURITY (C2): no protocol-level minAmountOut on swap(). Use reserves as a
+      // proxy for price impact so the caller can size a dynamic slippage margin.
+      // Constant-product approximation over-estimates impact on stable pools (safe).
       const [reserve0, reserve1] = await readContract(encoder.client, {
         address: pool,
         abi: aerodromePoolAbi,
         functionName: "getReserves",
       });
-      const token0 = await readContract(encoder.client, {
-        address: pool,
-        abi: aerodromePoolAbi,
-        functionName: "token0",
-      });
-      const srcReserve = src.toLowerCase() === token0.toLowerCase() ? reserve0 : reserve1;
+      const srcIsToken0 = src.toLowerCase() === token0.toLowerCase();
+      const srcReserve = srcIsToken0 ? reserve0 : reserve1;
       this.lastImpactBps =
         srcReserve > 0n ? (srcAmount * BPS_DENOMINATOR) / (srcReserve + srcAmount) : undefined;
 
-      // Step 1: Transfer collateral to the pool
+      const amount0Out = srcIsToken0 ? 0n : amountOut;
+      const amount1Out = srcIsToken0 ? amountOut : 0n;
+
+      // Step 1: Transfer input token to the pool
       encoder.pushCall(
         src,
         0n,
@@ -72,25 +90,21 @@ export class AerodromeVenue implements LiquidityVenue {
         }),
       );
 
-      // Step 2: Call pool.swap — Solidly style
-      // swap(uint256 amount0Out, uint256 amount1Out, address to, bytes data)
-      // Pass 0, 0 — pool calculates output automatically based on AMM formula
-      // (balance0 * balance1 >= reserve0 * reserve1) after the input transfer above.
+      // Step 2: swap(amount0Out, amount1Out, to, data) — exact Solidly style
       encoder.pushCall(
         pool,
         0n,
         encodeFunctionData({
           abi: aerodromePoolAbi,
           functionName: "swap",
-          args: [0n, 0n, encoder.address, "0x"],
+          args: [amount0Out, amount1Out, encoder.address, "0x"],
         }),
       );
 
-      // Assumed to be the last liquidity venue
       return {
         src: dst,
         dst: dst,
-        srcAmount: 0n,
+        srcAmount: amountOut,
       };
     } catch (error) {
       throw new Error(

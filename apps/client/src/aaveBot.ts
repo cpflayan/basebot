@@ -35,9 +35,12 @@ import { base } from "viem/chains";
 
 import { AaveAccountRegistry } from "./aaveAccountRegistry.js";
 import {
+  aaveAddressesProviderAbi,
   aavePoolViewAbi,
   aaveReserveConfigurationAbi,
+  AAVE_V3_ADDRESSES_PROVIDER,
   HEALTH_FACTOR_THRESHOLD,
+  resolveAaveProtocolDataProvider,
 } from "./abis/AaveV3.js";
 import {
   selectBestLiquidationPair,
@@ -405,15 +408,40 @@ export class AaveLiquidationBot {
    * Pre-cache reserve configurations (liquidationBonus, decimals, etc.) via multicall.
    * Called once during initialization — avoids repeated RPC calls during liquidation evaluation.
    */
+  private async resolveProtocolDataProvider(): Promise<Address | undefined> {
+    const addressesProvider = AAVE_V3_ADDRESSES_PROVIDER[this.chainId];
+    if (addressesProvider) {
+      try {
+        return await readContract(this.paidReadPool.next(), {
+          address: addressesProvider,
+          abi: aaveAddressesProviderAbi,
+          functionName: "getPoolDataProvider",
+        });
+      } catch {
+        // fall through
+      }
+    }
+    return resolveAaveProtocolDataProvider(this.poolAddress, this.chainId);
+  }
+
   private async cacheReserveConfigs(): Promise<void> {
     if (this.cachedReserves.length === 0) return;
 
+    const dataProvider = await this.resolveProtocolDataProvider();
+    if (!dataProvider) {
+      console.warn(
+        `${this.logTag}⚠️ No ProtocolDataProvider for pool ${this.poolAddress} — reserve config cache skipped`,
+      );
+      return;
+    }
+
     try {
+      // getReserveConfigurationData is on ProtocolDataProvider, not Pool
       const results = await multicall(this.paidReadPool.next(), {
         contracts: this.cachedReserves.map((asset) => ({
-          address: this.poolAddress,
+          address: dataProvider,
           abi: aaveReserveConfigurationAbi,
-          functionName: "getReserveConfigurationMap" as const,
+          functionName: "getReserveConfigurationData" as const,
           args: [asset] as const,
         })),
         allowFailure: true,
@@ -423,14 +451,16 @@ export class AaveLiquidationBot {
         const result = results[i]!;
         if (result.status !== "success") continue;
         const asset = this.cachedReserves[i]!;
+        // Official order: decimals, ltv, LT, liquidationBonus, RF, flags...
         const [
+          decimals,
           ltv,
           liquidationThreshold,
           liquidationBonus,
-          decimals,
           _reserveFactor,
           _usageAsCollateralEnabled,
           _borrowingEnabled,
+          _stableBorrowRateEnabled,
           isActive,
           isFrozen,
         ] = result.result;
@@ -449,7 +479,7 @@ export class AaveLiquidationBot {
       }
 
       console.log(
-        `${this.logTag}📊 Cached ${this.cachedReserveConfigs.size} reserve configs via multicall`,
+        `${this.logTag}📊 Cached ${this.cachedReserveConfigs.size} reserve configs via ProtocolDataProvider`,
       );
     } catch (e) {
       console.warn(
@@ -700,6 +730,8 @@ export class AaveLiquidationBot {
       this.pricers,
       this.wNative,
       this.cachedReserveConfigs.size > 0 ? this.cachedReserveConfigs : undefined,
+      this.logTag,
+      await this.resolveProtocolDataProvider(),
     );
     const pairMs = elapsedMs(tPair);
     this.raceMetrics.recordStage("pair", pairMs);
@@ -904,7 +936,7 @@ export class AaveLiquidationBot {
 
     try {
       const tSim = nowMs();
-      const success = await simulateAndExec(
+      const execResult = await simulateAndExec(
         this.sharedDeps,
         encoder,
         calls,
@@ -917,10 +949,11 @@ export class AaveLiquidationBot {
       const simMs = elapsedMs(tSim);
       this.raceMetrics.recordStage("simExec", simMs);
       console.log(
-        `${this.logTag}[LiqTiming] direct account=${account.slice(0, 10)}… simExecMs=${simMs} ok=${success}`,
+        `${this.logTag}[LiqTiming] direct account=${account.slice(0, 10)}… simExecMs=${simMs} ok=${execResult.success}` +
+          (execResult.reason ? ` reason=${execResult.reason}` : ""),
       );
 
-      if (success) {
+      if (execResult.success) {
         this._liquidationsSucceeded++;
         this.armCooldown(account, "success");
         const collateralUsd =
@@ -935,8 +968,9 @@ export class AaveLiquidationBot {
         console.log(`${this.logTag}Liquidated ${account} on Aave Pool (direct)`);
       } else {
         this._liquidationsFailed++;
-        this.armCooldown(account, "soft", "not profitable / sim soft-fail");
-        console.log(`${this.logTag}Skipped ${account} on Aave Pool (direct, not profitable)`);
+        const why = execResult.reason ?? "sim_or_profit_fail";
+        this.armCooldown(account, "soft", why);
+        console.log(`${this.logTag}Skipped ${account} on Aave Pool (direct, ${why})`);
       }
     } catch (error) {
       this._liquidationsFailed++;
@@ -1006,15 +1040,13 @@ export class AaveLiquidationBot {
       venueImpactBps = swap.impactBps;
     }
 
-    // Step 4: Skim profit to treasury
-    callbackEncoder.erc20Skim(pair.debtAsset, this.treasuryAddress);
-
+    // Do NOT erc20Skim before flash repay (appended after callbacks).
     const callbackCalls = callbackEncoder.flush();
 
     // Step 5: Wrap with flash loan + simulate/exec (pass impact for dynamic slippage)
     try {
       const tSim = nowMs();
-      const success = await simulateAndExecFlashLoanWithFallback(
+      const execResult = await simulateAndExecFlashLoanWithFallback(
         this.sharedDeps,
         callbackCalls,
         pair.debtAsset,
@@ -1027,10 +1059,11 @@ export class AaveLiquidationBot {
       const simMs = elapsedMs(tSim);
       this.raceMetrics.recordStage("simExec", simMs);
       console.log(
-        `${this.logTag}[LiqTiming] flash account=${account.slice(0, 10)}… simExecMs=${simMs} ok=${success}`,
+        `${this.logTag}[LiqTiming] flash account=${account.slice(0, 10)}… simExecMs=${simMs} ok=${execResult.success}` +
+          (execResult.reason ? ` reason=${execResult.reason}` : ""),
       );
 
-      if (success) {
+      if (execResult.success) {
         this._liquidationsSucceeded++;
         this.armCooldown(account, "success");
         const collateralUsd =
@@ -1045,8 +1078,9 @@ export class AaveLiquidationBot {
         console.log(`${this.logTag}[FlashLoan] Liquidated ${account} on Aave Pool`);
       } else {
         this._liquidationsFailed++;
-        this.armCooldown(account, "soft", "not profitable / providers exhausted");
-        console.log(`${this.logTag}[FlashLoan] Skipped ${account} on Aave Pool (not profitable)`);
+        const why = execResult.reason ?? "providers_exhausted";
+        this.armCooldown(account, "soft", why);
+        console.log(`${this.logTag}[FlashLoan] Skipped ${account} on Aave Pool (${why})`);
       }
     } catch (error) {
       this._liquidationsFailed++;

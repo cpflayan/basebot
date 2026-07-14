@@ -67,14 +67,12 @@ const MARKET_PARAMS_MORPHO = [USDC, WETH, ORACLE_MORPHO, IRM_MORPHO, LLTV_MORPHO
 
 // Computed from the same signatures webhook.ts uses to build its topic0 filter set,
 // so these can never drift from the real event selectors.
-const [
-  BORROW_TOPIC0,
-  WITHDRAW_COLLATERAL_TOPIC0,
-  ,
-  SUPPLY_COLLATERAL_TOPIC0,
-  REPAY_TOPIC0,
-  LIQUIDATE_TOPIC0,
-] = MORPHO_EVENT_SIGNATURES.map((sig) => toEventSelector(sig));
+const morphoTopic0s = MORPHO_EVENT_SIGNATURES.map((sig) => toEventSelector(sig));
+const BORROW_TOPIC0 = morphoTopic0s[0]!;
+const WITHDRAW_COLLATERAL_TOPIC0 = morphoTopic0s[1]!;
+const SUPPLY_COLLATERAL_TOPIC0 = morphoTopic0s[3]!;
+const REPAY_TOPIC0 = morphoTopic0s[4]!;
+const LIQUIDATE_TOPIC0 = morphoTopic0s[5]!;
 
 // ─── Mock Bytecodes ────────────────────────────────────────────────────────────
 
@@ -1127,10 +1125,11 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
     }
   });
 
-  aaveBaseForkTest.sequential("5.6 Aave: Dynamic close factor", () => {
+  aaveBaseForkTest.sequential("5.6 Aave: Binary close factor", () => {
     try {
+      // Aave V3: HF < 0.95 → 100%, HF >= 0.95 → 50%
       const cfLow = calculateCloseFactor(500000000000000000n);
-      expect(cfLow).toBeGreaterThan(5000n);
+      expect(cfLow).toBe(10000n);
       const cfHigh = calculateCloseFactor(980000000000000000n);
       expect(cfHigh).toBe(5000n);
       const cfMax = calculateCloseFactor(0n);
@@ -1246,26 +1245,28 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
 
   aaveBaseForkTest.sequential("6.5 Webhook: Liquidate decode", () => {
     try {
-      // Liquidate only has 2 indexed params (id, liquidator) per the ABI, so only 3 topics total.
+      // Morpho Blue Liquidate: id, caller, borrower indexed → 4 topics; 5×uint256 in data
       const d = decodeMorphoLog({
         topics: [
           LIQUIDATE_TOPIC0,
           MARKET_ID_MORPHO,
-          "0x000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+          "0x000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266", // caller
+          "0x000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266", // borrower
         ],
-        // 5 non-indexed params: user, repayAssets, repayShares, seizedAssets, seizedShares
+        // repaidAssets, repaidShares, seizedAssets, badDebtAssets, badDebtShares
         data: encodeAbiParameters(
           [
-            { type: "address" },
+            { type: "uint256" },
             { type: "uint256" },
             { type: "uint256" },
             { type: "uint256" },
             { type: "uint256" },
           ],
-          [SAFE_USER, 1000000n, 1000000n, 500000000000000000n, 500000000000000000n],
+          [1000000n, 1000000n, 500000000000000000n, 0n, 0n],
         ),
       });
       expect(d?.eventName).toBe("Liquidate");
+      expect(d?.user?.toLowerCase()).toBe(SAFE_USER.toLowerCase());
       recordResult("6.5 Liquidate decode", "PASS", `event=${d?.eventName}`);
     } catch (e: any) {
       recordResult("6.5 Liquidate decode", "FAIL", e.message);
@@ -1395,11 +1396,16 @@ describe("Multi-Protocol Liquidation Bot Fork Test Suite", () => {
       });
       const j2 = (await r2.json()) as any;
 
+      // Both deliveries apply cache; only 1st runs liquidations (2nd is cache-only cooldown)
       expect(j1.triggered).toBe(true);
-      expect(j2.triggered).toBe(false);
+      expect(j1.cacheApplied).toBe(true);
+      expect(j1.liquidationsThrottled).toBe(false);
+      expect(j2.triggered).toBe(true);
+      expect(j2.cacheApplied).toBe(true);
+      expect(j2.liquidationsThrottled).toBe(true);
       expect(j2.reason).toBe("cooldown");
       await server.stop();
-      recordResult("6.10 Cooldown", "PASS", "1st=true, 2nd=cooldown");
+      recordResult("6.10 Cooldown", "PASS", "1st=liq, 2nd=cache-only cooldown");
     } catch (e: any) {
       recordResult("6.10 Cooldown", "FAIL", e.message);
       throw e;
