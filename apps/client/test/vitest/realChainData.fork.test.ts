@@ -165,7 +165,7 @@ describe("5. config.ts 內關鍵地址部署 code 檢查", () => {
       label: "moonwellWatchlist.comptroller",
       address: options.moonwellWatchlist?.comptroller ?? "",
     },
-    { label: "treasuryAddress", address: options.treasuryAddress ?? "" },
+    // treasuryAddress is an EOA (receiving wallet), not a contract — skip code check
     ...(options.cometWatchlist?.comets ?? []).map((c) => ({
       label: `cometWatchlist market ${c.baseAsset}`,
       address: c.address,

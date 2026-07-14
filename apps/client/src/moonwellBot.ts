@@ -75,6 +75,17 @@ const MANTISSA = 10n ** 18n;
 const MAX_SIMULATION_FAILURES = 3;
 const SIMULATION_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
 
+/** True when accountError is a real sim/exec simulation failure (not soft exhaust). */
+function isMoonwellSimFailureMessage(msg: string): boolean {
+  return (
+    /\bsim_fail\b/i.test(msg) ||
+    /Simulation failed/i.test(msg) ||
+    /returned no data/i.test(msg) ||
+    /empty revert/i.test(msg) ||
+    /Transaction failed in simulation/i.test(msg)
+  );
+}
+
 /** Skip repay amounts too small to cover swap minOut + gas (underlying units). */
 function isMoonwellDustRepay(amount: bigint, underlying: Address): boolean {
   if (amount === 0n) return true;
@@ -730,7 +741,8 @@ export class MoonwellLiquidationBot {
       const borrowUnderlying = this.getUnderlying(borrowMToken);
 
       if (TOKEN_BLACKLIST.has(borrowUnderlying.toLowerCase())) continue;
-      if (borrowMToken.toLowerCase() === collateralMToken.toLowerCase()) continue;
+      // Same mToken is valid on Moonwell/Compound V2 (seize collateral of same market;
+      // underlying identical → convert is same-token, no DEX hop).
 
       // closeFactor cap (e.g. 50% of one borrow)
       let repayAmount = (borrowBalance * this.closeFactor) / MANTISSA;
@@ -804,15 +816,18 @@ export class MoonwellLiquidationBot {
     // Do not leave a sticky string that classify() would map to hard for the next account
     this._lastError = accountError;
 
-    const failures = (this.simulationFailures.get(accountKey) ?? 0) + 1;
-    this.simulationFailures.set(accountKey, failures);
+    // N3: only count true simulation failures — not dust/soft exhaust without throw
+    if (accountError && isMoonwellSimFailureMessage(accountError)) {
+      const failures = (this.simulationFailures.get(accountKey) ?? 0) + 1;
+      this.simulationFailures.set(accountKey, failures);
 
-    if (failures >= MAX_SIMULATION_FAILURES) {
-      const cooldownUntil = Date.now() + SIMULATION_COOLDOWN_MS;
-      this.simulationCooldowns.set(accountKey, cooldownUntil);
-      console.warn(
-        `${this.logTag}  ⏸️ ${account} — ${failures} consecutive simulation failures, cooling down for ${SIMULATION_COOLDOWN_MS / 1000}s`,
-      );
+      if (failures >= MAX_SIMULATION_FAILURES) {
+        const cooldownUntil = Date.now() + SIMULATION_COOLDOWN_MS;
+        this.simulationCooldowns.set(accountKey, cooldownUntil);
+        console.warn(
+          `${this.logTag}  ⏸️ ${account} — ${failures} consecutive simulation failures, cooling down for ${SIMULATION_COOLDOWN_MS / 1000}s`,
+        );
+      }
     }
 
     console.log(`${this.logTag}  ${account} — all borrow positions exhausted, skipping`);

@@ -14,7 +14,12 @@ import { decodeEventLog, type Address } from "viem";
 import { getLogs } from "viem/actions";
 
 import { mTokenEventAbi } from "./abis/Moonwell.js";
-import { BaseAccountRegistry, isRateLimitError, sleep, type ScanClient } from "./utils/baseAccountRegistry.js";
+import {
+  BaseAccountRegistry,
+  isRateLimitError,
+  sleep,
+  type ScanClient,
+} from "./utils/baseAccountRegistry.js";
 
 export class MoonwellAccountRegistry extends BaseAccountRegistry {
   protected readonly logPrefix = "[MoonwellRegistry]";
@@ -125,10 +130,17 @@ export class MoonwellAccountRegistry extends BaseAccountRegistry {
         }
       }
     } catch (e2) {
+      // CRITICAL C2: must throw so baseAccountRegistry does NOT advance lastScanned
+      // past this range (returning 0 after total failure permanently skips blocks).
       console.error(
         `${logTag}Broad log scan failed for ${mTokenAddress.slice(0, 10)}... blocks ${fromBlock}-${toBlock}:`,
         e2,
       );
+      throw e2 instanceof Error
+        ? e2
+        : new Error(
+            `Moonwell log scan failed ${mTokenAddress.slice(0, 10)}… blocks ${fromBlock}-${toBlock}: ${String(e2)}`,
+          );
     }
 
     return newAccounts;

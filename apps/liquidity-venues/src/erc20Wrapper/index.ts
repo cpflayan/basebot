@@ -28,7 +28,9 @@ export class Erc20Wrapper implements LiquidityVenue {
       return toConvert;
     }
 
-    encoder.erc20WrapperWithdrawTo(src, encoder.address, srcAmount);
+    // Use WithdrawAllTo: framework reads actual balance at execution time,
+    // avoids MustNotLeaveDust() revert from wrapper contracts that require full unwrap.
+    encoder.erc20WrapperWithdrawAllTo(src, encoder.address);
 
     return { src: underlying, dst, srcAmount };
   }

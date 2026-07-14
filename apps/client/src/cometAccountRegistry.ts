@@ -9,7 +9,12 @@ import { decodeEventLog, type Address } from "viem";
 import { getLogs } from "viem/actions";
 
 import { cometEventAbi } from "./abis/Comet.js";
-import { BaseAccountRegistry, isRateLimitError, sleep, type ScanClient } from "./utils/baseAccountRegistry.js";
+import {
+  BaseAccountRegistry,
+  isRateLimitError,
+  sleep,
+  type ScanClient,
+} from "./utils/baseAccountRegistry.js";
 
 export class CometAccountRegistry extends BaseAccountRegistry {
   protected readonly logPrefix = "[CometRegistry]";
@@ -114,10 +119,17 @@ export class CometAccountRegistry extends BaseAccountRegistry {
         }
       }
     } catch (e2) {
+      // CRITICAL C2: must throw so baseAccountRegistry does NOT advance lastScanned
+      // past this range (returning 0 after total failure permanently skips blocks).
       console.error(
         `${logTag}Broad log scan failed for ${cometAddress.slice(0, 10)}... blocks ${fromBlock}-${toBlock}:`,
         e2,
       );
+      throw e2 instanceof Error
+        ? e2
+        : new Error(
+            `Comet log scan failed ${cometAddress.slice(0, 10)}… blocks ${fromBlock}-${toBlock}: ${String(e2)}`,
+          );
     }
 
     return newAccounts;

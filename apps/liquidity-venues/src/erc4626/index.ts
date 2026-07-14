@@ -45,7 +45,9 @@ export class Erc4626 implements LiquidityVenue {
       });
       if (withdrawAmount === 0n) return toConvert;
 
-      encoder.erc4626Redeem(src, srcAmount, encoder.address, encoder.address);
+      // Use RedeemAll: framework reads actual share balance at execution time,
+      // avoids ExceededMaxRedeem / MustNotLeaveDust reverts from estimated amounts.
+      encoder.erc4626RedeemAll(src, encoder.address, encoder.address);
       return { src: underlying, dst, srcAmount: withdrawAmount };
     } catch (error) {
       throw new Error(

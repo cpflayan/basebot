@@ -59,7 +59,7 @@ describe("#5 SimExecResult outcomes", () => {
       resolve(process.cwd(), "apps/client/src/utils/sharedExecution.ts"),
       "utf8",
     );
-    expect(src).toContain("export type SimExecResult");
+    expect(src).toMatch(/export (type|interface) SimExecResult/);
     expect(src).toContain('simExecFail("sim_fail"');
     expect(src).toContain('simExecFail("profit_fail")');
     expect(src).toContain('simExecFail("slippage_fail"');

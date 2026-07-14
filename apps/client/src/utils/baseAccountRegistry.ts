@@ -434,13 +434,27 @@ export abstract class BaseAccountRegistry {
 
     const batchSize = this.scanBatchSize;
     let newAccounts = 0;
-    for (let start = fromBlock; start <= currentBlock; start += batchSize) {
-      const end = Math.min(start + batchSize - 1, currentBlock);
-      const added = await this.scanRange(client, contractAddress, start, end, logTag);
-      newAccounts += added;
+    // Advance cursor only after each successful batch (scanRange throws on total RPC failure)
+    let lastOkEnd = lastScanned;
+    try {
+      for (let start = fromBlock; start <= currentBlock; start += batchSize) {
+        const end = Math.min(start + batchSize - 1, currentBlock);
+        const added = await this.scanRange(client, contractAddress, start, end, logTag);
+        newAccounts += added;
+        lastOkEnd = end;
+        this.lastScannedBlock.set(key, end);
+      }
+    } catch (e) {
+      // Keep cursor at last successful batch — do not jump to tip
+      this.lastScannedBlock.set(key, lastOkEnd);
+      if (newAccounts > 0) this.accountsDirty = true;
+      if (persist) this.saveToFile();
+      console.error(
+        `${logTag}❌ Incremental scan aborted @ lastOk=${lastOkEnd} tip=${currentBlock} ` +
+          `(will retry gap on next tick): ${e instanceof Error ? e.message : e}`,
+      );
+      throw e;
     }
-
-    this.lastScannedBlock.set(key, currentBlock);
     if (newAccounts > 0) this.accountsDirty = true;
 
     // New accounts → flush both files. Empty progress → tiny checkpoint only.

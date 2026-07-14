@@ -518,10 +518,17 @@ export class LiquidationBot {
     await Promise.allSettled(
       [...affectedMarkets].map(async (marketId) => {
         try {
-          const cachedMarket = this.positionCache.getMarket(marketId);
+          // N1: if market missing from cache, load it then continue HF/liq — do not early-return
+          let cachedMarket = this.positionCache.getMarket(marketId);
           if (!cachedMarket) {
             await this.refreshMarketInCache(marketId);
-            return;
+            cachedMarket = this.positionCache.getMarket(marketId);
+            if (!cachedMarket) {
+              console.warn(
+                `${this.logTag}  Market ${marketId.slice(0, 10)}… still missing after refresh — skip`,
+              );
+              return;
+            }
           }
 
           const freshPrice = await readContract(this.client, {

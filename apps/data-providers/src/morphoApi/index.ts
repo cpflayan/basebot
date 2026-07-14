@@ -127,8 +127,10 @@ export class MorphoApiDataProvider implements DataProvider {
         .filter((position) => position !== undefined);
 
       return {
+        // Align with HyperIndex: drop dust / undefined seizable (cannot size a swap)
         liquidatablePositions: accruedPositions.filter(
-          (position) => position.seizableCollateral !== undefined,
+          (position) =>
+            position.seizableCollateral !== undefined && position.seizableCollateral > 0n,
         ),
         preLiquidatablePositions: [],
       };

@@ -60,12 +60,13 @@ export class PositionCache {
   // ─── Position operations ───
 
   set(pos: CachedPosition): void {
-    const key = this.key(pos.marketId, pos.user);
+    const mid = pos.marketId.toLowerCase() as Hex;
+    const key = this.key(mid, pos.user);
     this.positions.set(key, pos);
-    let set = this.marketPositions.get(pos.marketId);
+    let set = this.marketPositions.get(mid);
     if (!set) {
       set = new Set();
-      this.marketPositions.set(pos.marketId, set);
+      this.marketPositions.set(mid, set);
     }
     set.add(key);
   }
@@ -76,7 +77,7 @@ export class PositionCache {
   }
 
   get(marketId: Hex, user: Address): CachedPosition | undefined {
-    return this.positions.get(this.key(marketId, user));
+    return this.positions.get(this.key(marketId.toLowerCase() as Hex, user));
   }
 
   /**
@@ -88,7 +89,8 @@ export class PositionCache {
     user: Address,
     state: Partial<Omit<CachedPosition, "user" | "marketId">>,
   ): CachedPosition {
-    const key = this.key(marketId, user);
+    const mid = marketId.toLowerCase() as Hex;
+    const key = this.key(mid, user);
     const existing = this.positions.get(key);
     const updated: CachedPosition = {
       user,
@@ -100,10 +102,10 @@ export class PositionCache {
     };
     this.positions.set(key, updated);
 
-    let set = this.marketPositions.get(marketId);
+    let set = this.marketPositions.get(mid);
     if (!set) {
       set = new Set();
-      this.marketPositions.set(marketId, set);
+      this.marketPositions.set(mid, set);
     }
     set.add(key);
 
@@ -111,13 +113,14 @@ export class PositionCache {
   }
 
   remove(marketId: Hex, user: Address): void {
-    const key = this.key(marketId, user);
+    const mid = marketId.toLowerCase() as Hex;
+    const key = this.key(mid, user);
     this.positions.delete(key);
-    this.marketPositions.get(marketId)?.delete(key);
+    this.marketPositions.get(mid)?.delete(key);
   }
 
   getPositionsForMarket(marketId: Hex): CachedPosition[] {
-    const keys = this.marketPositions.get(marketId);
+    const keys = this.marketPositions.get(marketId.toLowerCase() as Hex);
     if (!keys) return [];
     return [...keys].map((k) => this.positions.get(k)!).filter(Boolean);
   }
@@ -129,16 +132,16 @@ export class PositionCache {
   // ─── Market operations ───
 
   setMarket(state: CachedMarketState): void {
-    this.markets.set(state.marketId, state);
+    this.markets.set(state.marketId.toLowerCase() as Hex, state);
   }
 
   getMarket(marketId: Hex): CachedMarketState | undefined {
-    return this.markets.get(marketId);
+    return this.markets.get(marketId.toLowerCase() as Hex);
   }
 
   /** Update just the oracle price for a market */
   updateOraclePrice(marketId: Hex, price: bigint): void {
-    const m = this.markets.get(marketId);
+    const m = this.markets.get(marketId.toLowerCase() as Hex);
     if (m) {
       m.price = price;
       m.fetchedAt = Date.now();
@@ -146,7 +149,7 @@ export class PositionCache {
   }
 
   isMarketStale(marketId: Hex, maxAgeMs = 120_000): boolean {
-    const m = this.markets.get(marketId);
+    const m = this.markets.get(marketId.toLowerCase() as Hex);
     if (!m) return true;
     return Date.now() - m.fetchedAt > maxAgeMs;
   }
@@ -162,8 +165,9 @@ export class PositionCache {
     user: Address,
     freshPrice?: bigint,
   ): AccrualPosition | undefined {
-    const pos = this.positions.get(this.key(marketId, user));
-    const mkt = this.markets.get(marketId);
+    const mid = marketId.toLowerCase() as Hex;
+    const pos = this.positions.get(this.key(mid, user));
+    const mkt = this.markets.get(mid);
     if (!pos || !mkt) return undefined;
     if (pos.borrowShares === 0n) return undefined; // No debt
 
@@ -230,7 +234,8 @@ export class PositionCache {
     threshold = 1,
     freshPrice?: bigint,
   ): { position: CachedPosition; hf: number }[] {
-    const mkt = this.markets.get(marketId);
+    const mid = marketId.toLowerCase() as Hex;
+    const mkt = this.markets.get(mid);
     if (!mkt) return [];
 
     const price = freshPrice ?? mkt.price;
@@ -252,7 +257,7 @@ export class PositionCache {
     const timestamp = now > market.lastUpdate ? now : market.lastUpdate;
     const accruedMarket = market.accrueInterest(timestamp);
 
-    const positions = this.getPositionsForMarket(marketId);
+    const positions = this.getPositionsForMarket(mid);
     const atRisk: { position: CachedPosition; hf: number }[] = [];
 
     for (const pos of positions) {

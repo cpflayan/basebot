@@ -32,7 +32,7 @@ export const COMET_DEPLOY_BLOCKS: Record<Address, number> = {
 };
 
 // ─── 每個 Comet 的 Collateral Assets（hardcode fallback）───
-// 當 numCollateralAssets() revert 時使用
+// Hardcoded fallback when numAssets/getAssetInfo RPC fails
 export const COMET_COLLATERAL_ASSETS: Record<Address, Address[]> = {
   // USDC Comet: WETH, cbETH, wstETH, cbBTC, AERO
   "0xb125E6687d4313864e53df431d5425969c15Eb2F": [
@@ -132,17 +132,28 @@ export const cometViewAbi = [
     stateMutability: "view",
     type: "function",
   },
+  // Compound III: collaterals via numAssets() + getAssetInfo(i).asset
+  // (numCollateralAssets / getCollateralAsset do NOT exist — call reverts on-chain)
   {
     inputs: [],
-    name: "numCollateralAssets",
+    name: "numAssets",
     outputs: [{ name: "", type: "uint8" }],
     stateMutability: "view",
     type: "function",
   },
   {
     inputs: [{ name: "i", type: "uint8" }],
-    name: "getCollateralAsset",
-    outputs: [{ name: "", type: "address" }],
+    name: "getAssetInfo",
+    outputs: [
+      { name: "offset", type: "uint8" },
+      { name: "asset", type: "address" },
+      { name: "priceFeed", type: "address" },
+      { name: "scale", type: "uint64" },
+      { name: "borrowCollateralFactor", type: "uint64" },
+      { name: "liquidateCollateralFactor", type: "uint64" },
+      { name: "liquidationFactor", type: "uint64" },
+      { name: "supplyCap", type: "uint128" },
+    ],
     stateMutability: "view",
     type: "function",
   },

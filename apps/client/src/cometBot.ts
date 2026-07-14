@@ -275,31 +275,33 @@ export class CometLiquidationBot {
   }
 
   /**
-   * Cache the collateral assets for a Comet by reading numCollateralAssets + getCollateralAsset.
+   * Cache collateral assets via Compound III official views:
+   *   numAssets() + getAssetInfo(i).asset  (i = 0 .. numAssets-1)
    * Falls back to hardcoded list if on-chain call fails.
    */
   private async cacheCollateralAssets(comet: CometInfo): Promise<void> {
     try {
-      const numCollateral = await readContract(this.client, {
+      const numAssets = await readContract(this.client, {
         address: comet.address,
         abi: cometViewAbi,
-        functionName: "numCollateralAssets",
+        functionName: "numAssets",
       });
 
       const assets: Address[] = [];
-      for (let i = 0; i < numCollateral; i++) {
-        const asset = await readContract(this.client, {
+      for (let i = 0; i < numAssets; i++) {
+        const info = await readContract(this.client, {
           address: comet.address,
           abi: cometViewAbi,
-          functionName: "getCollateralAsset",
+          functionName: "getAssetInfo",
           args: [i],
         });
-        assets.push(asset);
+        // AssetInfo tuple: [offset, asset, priceFeed, scale, ...]
+        assets.push(info[1]);
       }
 
       comet.collateralAssets = assets;
       console.log(
-        `${this.logTag}📋 ${comet.address.slice(0, 10)}... has ${assets.length} collateral asset(s) (on-chain)`,
+        `${this.logTag}📋 ${comet.address.slice(0, 10)}... has ${assets.length} collateral asset(s) (numAssets/getAssetInfo)`,
       );
     } catch (e) {
       // Fallback to hardcoded list
@@ -682,6 +684,7 @@ export class CometLiquidationBot {
       for (let i = 0; i < buyPlans.length; i++) {
         const plan = buyPlans[i]!;
         const quoteResult = quoteResults[i]!;
+        let baseAmount = plan.baseAmount;
         let quotedOut = 0n;
         if (quoteResult.status === "success") {
           quotedOut = quoteResult.result;
@@ -690,15 +693,28 @@ export class CometLiquidationBot {
             `${this.logTag}⚠️ quoteCollateral failed for ${plan.collateral.slice(0, 10)}...`,
           );
         }
-        // buyCollateral can never return more than what's actually in reserve
-        if (quotedOut > plan.reserveAmount) quotedOut = plan.reserveAmount;
+        // M1: Comet reverts if quoteCollateral(baseAmount) > getCollateralReserves.
+        // Scale baseAmount down so collateral out fits post-absorb reserves.
+        if (quotedOut > plan.reserveAmount && quotedOut > 0n && plan.reserveAmount > 0n) {
+          baseAmount = (baseAmount * plan.reserveAmount) / quotedOut;
+          quotedOut = plan.reserveAmount;
+          if (baseAmount === 0n) {
+            console.warn(
+              `${this.logTag}⚠️ buyCollateral base scaled to 0 for ${plan.collateral.slice(0, 10)}… — skip`,
+            );
+            continue;
+          }
+        } else if (quotedOut > plan.reserveAmount) {
+          quotedOut = plan.reserveAmount;
+        }
+        if (baseAmount === 0n) continue;
         expectedCollateralOut.set(plan.collateral, quotedOut);
 
         callbackEncoder.cometBuyCollateral(
           comet.address,
           plan.collateral,
           0n, // minAmount = 0 (we rely on simulation for safety)
-          plan.baseAmount,
+          baseAmount,
         );
       }
     }
@@ -857,8 +873,9 @@ export class CometLiquidationBot {
       }),
     ]);
 
-    // buyCollateral with unbounded base budget pulls available reserve for each collateral.
+    // M1: never pass maxUint256 — quote first and size baseAmount so collat out ≤ reserves.
     const expectedCollateralOut = new Map<Address, bigint>();
+    const debtHint = await this.estimateDebt(comet.address, account);
 
     for (let i = 0; i < filteredCollaterals.length; i++) {
       const reserveResult = reserveResults[i]!;
@@ -870,8 +887,36 @@ export class CometLiquidationBot {
       const expectedReserves = currentReserves + userBal;
       if (expectedReserves <= 0n) continue;
       const collateral = filteredCollaterals[i]!;
-      expectedCollateralOut.set(collateral, expectedReserves);
-      encoder.cometBuyCollateral(comet.address, collateral, 0n, maxUint256);
+
+      // Start from debt-sized base budget (or remaining allowance), then scale to reserves
+      let baseAmount = debtHint > 0n ? debtHint : 0n;
+      if (baseAmount === 0n) {
+        // No debt estimate — skip rather than unbounded buy
+        continue;
+      }
+
+      try {
+        let quotedOut = await readContract(this.client, {
+          address: comet.address,
+          abi: cometViewAbi,
+          functionName: "quoteCollateral",
+          args: [collateral, baseAmount],
+        });
+        if (quotedOut > expectedReserves && quotedOut > 0n) {
+          baseAmount = (baseAmount * expectedReserves) / quotedOut;
+          quotedOut = expectedReserves;
+        }
+        if (baseAmount === 0n || quotedOut === 0n) continue;
+        expectedCollateralOut.set(
+          collateral,
+          quotedOut > expectedReserves ? expectedReserves : quotedOut,
+        );
+        encoder.cometBuyCollateral(comet.address, collateral, 0n, baseAmount);
+      } catch (e) {
+        console.warn(
+          `${this.logTag}⚠️ direct buyCollateral plan skipped for ${collateral.slice(0, 10)}…: ${e instanceof Error ? e.message : e}`,
+        );
+      }
     }
 
     // DEX swap collateral → base asset (local AMM first)

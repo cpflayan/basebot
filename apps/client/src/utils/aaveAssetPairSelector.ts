@@ -272,6 +272,7 @@ export async function selectBestLiquidationPair(
   // Step 5: Evaluate all pairs in pure math (no further RPCs)
   let bestPair: LiquidationPair | null = null;
   let bestProfit = 0n;
+  let badDebtPair: LiquidationPair | null = null; // fallback when no profitable pair exists
   let pairsTried = 0;
   let pairsNoPrice = 0;
   let pairsNonPositive = 0;
@@ -308,6 +309,12 @@ export async function selectBestLiquidationPair(
         continue;
       }
       pairsOk++;
+
+      // N7: track first bad-debt pair as fallback (alwaysRealizeBadDebt can use it)
+      if (pair.isBadDebt && !badDebtPair) {
+        badDebtPair = pair;
+      }
+
       if (pair.estimatedProfit > bestProfit) {
         bestProfit = pair.estimatedProfit;
         bestPair = pair;
@@ -316,7 +323,7 @@ export async function selectBestLiquidationPair(
   }
 
   // Diagnose large underwater positions that still yield no pair (helps ops)
-  if (!bestPair && logTag && maxDebtUsd >= 50) {
+  if (!bestPair && !badDebtPair && logTag && maxDebtUsd >= 50) {
     console.log(
       `${logTag}[PairDebug] no pair user=${user.slice(0, 10)}… HF=${Number(healthFactor) / 1e18} ` +
         `collats=${collateralAssets.length} debts=${debtAssets.length} tried=${pairsTried} ` +
@@ -324,7 +331,8 @@ export async function selectBestLiquidationPair(
     );
   }
 
-  return bestPair;
+  // N7: prefer profitable pair; fall back to bad-debt pair so alwaysRealizeBadDebt works
+  return bestPair ?? badDebtPair;
 }
 
 // ─── Evaluate a single (collateral, debt) pair ───
@@ -450,12 +458,20 @@ function evaluatePair(
     (seizableForSwap * collateralPriceScaled) / 10n ** BigInt(collateralDecimals);
   const debtUsdScaled = (debtToCover * debtPriceScaled) / 10n ** BigInt(debtDecimals);
 
-  // True bad debt: even with liquidation bonus, seizable value cannot cover debt
+  // True bad debt: even with liquidation bonus, seizable value cannot cover debt.
+  // N7: still return the pair with isBadDebt=true so alwaysRealizeBadDebt can force it.
+  // Ranked after profitable pairs (estimatedProfit = 0).
   const isBadDebt = seizableUsdScaled <= debtUsdScaled;
   if (isBadDebt) {
-    // Underwater after scale-down — skip (caller may still force via alwaysRealizeBadDebt
-    // only when a pair is returned; returning null keeps ranking clean)
-    return null;
+    return {
+      collateralAsset: collateral.asset,
+      debtAsset: debt.asset,
+      debtToCover,
+      estimatedProfit: 0n,
+      seizableCollateral: seizableForSwap,
+      liquidationBonus,
+      isBadDebt: true,
+    };
   }
 
   const profitUsdScaled = seizableUsdScaled - debtUsdScaled;

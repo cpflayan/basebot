@@ -101,18 +101,19 @@ export class PositionLiquidationCooldownMechanism {
 
   /** Legacy Morpho/Comet/Moonwell: peek + arm hard cooldown in one call. */
   isPositionReady(marketId: Hex, account: Address) {
-    if (this.isCoolingDown(marketId, account)) {
+    const mid = marketId.toLowerCase() as Hex;
+    if (this.isCoolingDown(mid, account)) {
       return false;
     }
-    this.markAttempted(marketId, account, "hard");
+    this.markAttempted(mid, account, "hard");
     return true;
   }
 
   /** Peek only — does not arm the timer. */
   isCoolingDown(marketId: Hex, account: Address): boolean {
-    const byMarket = this.positionReadyAt[marketId];
+    const byMarket = this.positionReadyAt[marketId.toLowerCase() as Hex];
     if (!byMarket) return false;
-    const readyAt = byMarket[account];
+    const readyAt = byMarket[account.toLowerCase() as Address];
     if (readyAt === undefined) return false;
     return readyAt > Math.floor(Date.now() / 1000);
   }
@@ -126,17 +127,19 @@ export class PositionLiquidationCooldownMechanism {
     account: Address,
     classOrSeconds: CooldownClass | number = "hard",
   ): void {
+    const mid = marketId.toLowerCase() as Hex;
+    const addr = account.toLowerCase() as Address;
     const seconds =
       typeof classOrSeconds === "number" ? classOrSeconds : this.secondsForClass(classOrSeconds);
 
-    if (this.positionReadyAt[marketId] === undefined) {
-      this.positionReadyAt[marketId] = {};
+    if (this.positionReadyAt[mid] === undefined) {
+      this.positionReadyAt[mid] = {};
     }
-    this.positionReadyAt[marketId][account] = Math.floor(Date.now() / 1000) + Math.max(0, seconds);
+    this.positionReadyAt[mid][addr] = Math.floor(Date.now() / 1000) + Math.max(0, seconds);
   }
 
   markClass(marketId: Hex, account: Address, cls: CooldownClass): number {
-    this.markAttempted(marketId, account, cls);
+    this.markAttempted(marketId.toLowerCase() as Hex, account, cls);
     return this.secondsForClass(cls);
   }
 
@@ -155,7 +158,8 @@ export class PositionLiquidationCooldownMechanism {
 
   /** Seconds remaining, or 0 if ready. */
   remainingSeconds(marketId: Hex, account: Address): number {
-    const readyAt = this.positionReadyAt[marketId]?.[account];
+    const readyAt =
+      this.positionReadyAt[marketId.toLowerCase() as Hex]?.[account.toLowerCase() as Address];
     if (readyAt === undefined) return 0;
     return Math.max(0, readyAt - Math.floor(Date.now() / 1000));
   }

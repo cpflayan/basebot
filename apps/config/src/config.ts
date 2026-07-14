@@ -273,12 +273,12 @@ export const chainConfigs: Record<number, Config> = {
           "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf", // cbBTC
           "0x2416092f143378750bb29b79eD961ab195CcEea5", // ezETH
           "0x6Bb7a212910682DCFdbd5BCBb3e28FB4E8da10Ee", // GHO
-          "0xEDfa23602D0EC14714057867A78d01e94176BEA0", // lbtc
-          "0xecAc9C5F704e954931349Da37F60E39f515c11c1", // rETH
+          "0xEDfa23602D0EC14714057867A78d01e94176BEA0", // wrsETH (was mislabeled lbtc)
+          "0xecAc9C5F704e954931349Da37F60E39f515c11c1", // LBTC (was mislabeled rETH)
           "0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42", // EURC
-          "0x63706e401c06ac8513145b7687A14804d17f814b", // tBTC
-          "0x236aa50979D5f3De3Bd1Eeb40E81137F22ab794b", // xETH
-          "0x660975730059246A68521a3e2FBD4740173100f5", // rgUSD
+          "0x63706e401c06ac8513145b7687A14804d17f814b", // AAVE (was mislabeled tBTC)
+          "0x236aa50979D5f3De3Bd1Eeb40E81137F22ab794b", // tBTC (was mislabeled xETH)
+          "0x660975730059246A68521a3e2FBD4740173100f5", // syrupUSDC (was mislabeled rgUSD)
         ],
         // Race: every block hot set; full registry less often to cut 429 bursts
         // (hot path still catches near-liq; full only refreshes membership)
